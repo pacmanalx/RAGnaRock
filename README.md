@@ -6,7 +6,7 @@ que envelhecem, sem caixa-preta. Roda em qualquer hardware e dá pra inspecionar
 
 > **O nome tem camadas.** `RAG` + `Ragnarök` + `Rock` (rock'n'roll) + **Rock = pedra**: um RAG sobre
 > **base sólida**. Construído na rocha, não na areia (Mt 7:24-27) — enquanto os RAGs "SOTA" precisam
-> de GPU e embeddings que desatualizam, este fica de pé em um Raspberry Pi.
+> de GPU e embeddings que desatualizam, este fica de pé em hardware modesto — um Raspberry Pi, por exemplo.
 
 ---
 
@@ -15,8 +15,9 @@ que envelhecem, sem caixa-preta. Roda em qualquer hardware e dá pra inspecionar
 A maioria dos RAGs depende de GPU, modelos de embedding de gigabytes e bancos vetoriais pesados —
 o que **exclui quem não tem hardware bom**. O RAGnaRock vai pelo caminho oposto:
 
-- **Roda em qualquer lugar** — é um binário pequeno (Rust, ~2 MB). CPU + RAM, sem GPU. Pi 3,
-  Optiplex de 2012, Mac, Windows, Linux.
+- **Roda em qualquer lugar** — é um binário pequeno (Rust, ~2 MB). CPU + RAM, sem GPU. Funciona
+  em hardware modesto (**por exemplo**, um Raspberry Pi 3 ou um Optiplex de 2012) e também em
+  Mac, Windows e Linux.
 - **Inspecionável** — o "embedding" é um histograma de sílabas em JSON legível; dá pra ver o vetor,
   o `idf`, a árvore da busca. Nada de mágica.
 - **Ensinável** — vem com uma trilha didática (`logic_path/`) que reconstrói cada princípio de RAG,
