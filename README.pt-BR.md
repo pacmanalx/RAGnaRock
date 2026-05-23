@@ -63,7 +63,7 @@ A mesma lib (`sylkit`) existe em três encarnações que produzem **resultados i
 | `logic_path/`     | Trilha didática **00 → 10** (memorial congelado) que ensina cada princípio de RAG. | ✅ feito |
 
 > 📐 **Especificação completa** (os três daemons em detalhe, contratos JSON, estratégias de memória/disco,
-> concorrência, modos de falha e roadmap): **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
+> concorrência, modos de falha e roadmap): **[`ARCHITECTURE.pt-BR.md`](ARCHITECTURE.pt-BR.md)**.
 
 ---
 
@@ -79,7 +79,7 @@ leitor é o humano), com quatro níveis — do índice **sem IA** (nível 0, o R
 > cadência); a inteligência por nível (1–3, **opt-in** e com IA) está em desenvolvimento. O desenho
 > completo (hierarquia dos níveis, artefatos versionados, gate de aceite, grafo de IAs, prompt por nível
 > e questões em aberto) está em
-> [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
+> [`ARCHITECTURE.pt-BR.md`](ARCHITECTURE.pt-BR.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
 

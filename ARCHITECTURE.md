@@ -1,566 +1,567 @@
-# RAGnaRock — Arquitetura & Especificação
+> 🌐 **Language.** English version · 🇧🇷 Versão em português: **[ARCHITECTURE.pt-BR.md](ARCHITECTURE.pt-BR.md)**
+> *(the pt-BR version is the canonical source; this English version is a translation kept in sync).*
 
-> **Norte de implementação.** Este documento descreve a solução **inteira** — inclusive o que
-> ainda não foi construído. É a referência para evoluir o projeto sem perder coerência.
+# RAGnaRock — Architecture & Specification
+
+> **Implementation North Star.** This document describes the **whole** solution — including what hasn't
+> been built yet. It is the reference for evolving the project without losing coherence.
 >
-> Marcação de status em cada item: **[FEITO]** · **[PARCIAL]** (esqueleto/stub) · **[FUTURO]** (planejado).
+> Status marker on each item: **[DONE]** · **[PARTIAL]** (skeleton/stub) · **[FUTURE]** (planned).
 >
-> **Filtro de toda decisão** (vale pra qualquer linha abaixo): *isto mantém o RAGnaRock simples,
-> transparente, rodando em qualquer hardware e ensinável?* Se exige caixa-preta, GPU ou complexidade
-> que afasta o iniciante → é **opcional/opt-in ou fica de fora**, por melhor que seja tecnicamente.
+> **Filter for every decision** (applies to any line below): *does this keep RAGnaRock simple,
+> transparent, running on any hardware and teachable?* If it requires a black box, a GPU, or complexity
+> that scares away the beginner → it's **optional/opt-in or stays out**, however good it is technically.
 
 ---
 
-## 1. Visão geral & invariantes
+## 1. Overview & invariants
 
-RAGnaRock é um RAG **sem rede neural**: token = **sílaba** (PT), embedding = **histograma esparso**
-(bag of syllables), busca = **cosseno tf-idf** (recall) + **matched filter fonético** (rerank).
-Tudo inspecionável (JSON legível), roda em **CPU + RAM, sem GPU**.
+RAGnaRock is a RAG **with no neural network**: token = **syllable** (PT), embedding = **sparse histogram**
+(bag of syllables), search = **tf-idf cosine** (recall) + **phonetic matched filter** (rerank).
+Everything is inspectable (readable JSON), runs on **CPU + RAM, no GPU**.
 
-**Três daemons**, processos independentes que conversam por **HTTP JSON**:
+**Three daemons**, independent processes that talk over **HTTP JSON**:
 
-| Daemon | Porta | Papel | Status |
+| Daemon | Port | Role | Status |
 |---|---|---|---|
-| `ragd` | **11499** (API) | Motor: segura N bases em RAM, busca/ingestão | [FEITO] |
-| **ValHalla** (no `ragd`) | **11498** (console) | Console web supervisório | [FEITO] |
-| `nidhoggd` (Níðhöggr) | **11497** (módulos) | Camada de **inteligência**: destila conhecimento | [PARCIAL] |
+| `ragd` | **11499** (API) | Engine: holds N bases in RAM, search/ingestion | [DONE] |
+| **ValHalla** (in `ragd`) | **11498** (console) | Supervisory web console | [DONE] |
+| `nidhoggd` (Níðhöggr) | **11497** (modules) | **Intelligence** layer: distills knowledge | [PARTIAL] |
 
-**Invariantes (não quebrar):**
-1. **JSON é o contrato e a persistência.** Cada base é um JSON legível em disco; a RAM é só um cache
-   reconstruível. Mata o ragd → sobe de novo → recarrega de `ragfiles/`. (Responde "perde no crash?":
-   não — o que está no disco é a verdade; ingestão grava o JSON **antes** de carregar em RAM.)
-2. **Mesma ordem de chaves no JSON** (serde `preserve_order`) — garante equivalência byte-a-byte entre
-   as três encarnações da lib (`python_concept`, `rust_concept`, `ragd`).
-3. **`nidhoggd` lê o corpus SEMPRE pela API do `ragd`, nunca do disco** — independe de onde os dados moram.
-4. **Inteligência (IA) é sempre opt-in e nasce desligada.** O núcleo do RAG não depende de IA nenhuma.
+**Invariants (don't break):**
+1. **JSON is the contract and the persistence.** Each base is a readable JSON on disk; RAM is just a
+   rebuildable cache. Kill `ragd` → start it again → it reloads from `ragfiles/`. (Answers "do I lose data
+   on a crash?": no — what's on disk is the truth; ingestion writes the JSON **before** loading into RAM.)
+2. **Same key order in the JSON** (serde `preserve_order`) — guarantees byte-for-byte equivalence across
+   the three incarnations of the library (`python_concept`, `rust_concept`, `ragd`).
+3. **`nidhoggd` always reads the corpus through the `ragd` API, never from disk** — independent of where the data lives.
+4. **Intelligence (AI) is always opt-in and starts off.** The RAG core depends on no AI whatsoever.
 
 ---
 
-## 2. Modelo de dados
+## 2. Data model
 
-Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<name>-tokenized.json`.
+A **base** = `{ meta, idf, chunks }`, persisted at `ragfiles/<collection>/<name>-tokenized.json`.
 
 ```jsonc
 {
   "meta": {
-    "corpus": "MeuController.cs",                   // nome do arquivo (com extensão)
-    "source_file": "<upload:...>",                  // origem (path ou rótulo de upload)
+    "corpus": "MyController.cs",                    // file name (with extension)
+    "source_file": "<upload:...>",                  // origin (path or upload label)
     "bytes": 12345, "chunk_size": 2048, "n_chunks": 117,
     "vocab_size": 1956, "vocab_used": 312,
     "tokens_total": 9001, "oov_total": 42, "coverage": 0.9953,
-    "with_text": true,                              // chunks guardam o texto?
+    "with_text": true,                              // do chunks keep the text?
     "generator": "ragd-ingest", "tokens_file": "tokens_CSharp_PTBR.drv",
     "language": "CSharp", "matched_by_ext": true,
-    "built_at": "2026-05-23T...", "vocab": ["ca","sa",...]   // vocabulário do driver (ordem fixa)
+    "built_at": "2026-05-23T...", "vocab": ["ca","sa",...]   // driver vocabulary (fixed order)
   },
-  "idf": { "<dim>": 0.693147, ... },                // idf por dimensão (sílaba)
+  "idf": { "<dim>": 0.693147, ... },                // idf per dimension (syllable)
   "chunks": [
     {
-      "id": 0, "start": 0, "len": 2034,             // offset/len em chars no corpus
+      "id": 0, "start": 0, "len": 2034,             // offset/len in chars within the corpus
       "tokens": 410, "oov": 3,
-      "vec": { "<dim>": <count>, ... },             // tf esparso (histograma de sílabas)
-      "norm": 16.374664,                            // norma L2 do vetor tf-idf (p/ cosseno)
-      "text": "...",                                // o texto do chunk (se with_text)
-      "words": [["fro","do"],["bol","sei","ro"]]    // [FEITO, em RAM] sílabas por palavra (cache do rerank)
+      "vec": { "<dim>": <count>, ... },             // sparse tf (syllable histogram)
+      "norm": 16.374664,                            // L2 norm of the tf-idf vector (for cosine)
+      "text": "...",                                // the chunk's text (if with_text)
+      "words": [["fro","do"],["bol","sei","ro"]]    // [DONE, in RAM] syllables per word (rerank cache)
     }
   ]
 }
 ```
 
-- **`idf` suavizado:** `idf(dim) = ln((N + 1) / df)` onde `N` = nº de chunks, `df` = nº de chunks que
-  contêm a dim. O `+1` evita o colapso pra 0 numa base de **1 chunk** (com `ln(N/df)`, df=N=1 → idf=0
-  → vetor nulo → base invisível). [FEITO]
-- **`vec` é tf cru** (independente por chunk). Só `idf` (global da base) e `norm` (por chunk) dependem
-  do corpus inteiro → por isso append recomputa só esses dois. [FEITO]
-- **`words`** (sílabas por palavra) não é serializado: é derivável de `text` e cacheado em RAM no modo
-  `memory`; no modo `hybrid` é recomputado sob demanda no rerank. [FEITO]
+- **Smoothed `idf`:** `idf(dim) = ln((N + 1) / df)` where `N` = number of chunks, `df` = number of chunks
+  that contain the dim. The `+1` avoids collapsing to 0 in a **single-chunk** base (with `ln(N/df)`,
+  df=N=1 → idf=0 → null vector → invisible base). [DONE]
+- **`vec` is raw tf** (independent per chunk). Only `idf` (global to the base) and `norm` (per chunk) depend
+  on the whole corpus → that's why append recomputes only those two. [DONE]
+- **`words`** (syllables per word) is not serialized: it's derivable from `text` and cached in RAM in
+  `memory` mode; in `hybrid` mode it's recomputed on demand during rerank. [DONE]
 
-### 2.1 Silabificação — o algoritmo do token [FEITO]
+### 2.1 Syllabification — the token's algorithm [DONE]
 
-O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em `ragd/src/tokenizer.rs`
-(`syllabify`, `syllable_seq`, `normalize`). Regras efetivas:
+The token is the **syllable**, produced by a deterministic PT-BR syllabifier in `ragd/src/tokenizer.rs`
+(`syllabify`, `syllable_seq`, `normalize`). Effective rules:
 
-- **Vogais/semivogais:** vogais `a e i o u` (+ acentuadas); fracas `i u` formam **ditongo**; `í ú`
-  acentuados **quebram** o ditongo (forçam hiato).
-- **Núcleos:** vogal forte + forte → **hiato** (separa: "co-a-lha"); fraca + forte ou inverso → **ditongo**
-  (junta: "pou-so", "coi-sa").
-- **Onsets:** dígrafos `ch lh nh` = **um** som; `qu`/`gu` + vogal alta → `u` mudo; encontros muta+líquida
-  (`bl br cl cr dl dr fl fr gl gr pl pr tl tr vl vr`) ficam juntos no onset.
-- **Coda × onset:** consoante isolada entre núcleos vira coda da anterior + onset da próxima; em grupo, as
-  **2 últimas** vão pro onset seguinte **se** formam encontro válido, senão só a última.
-- **Normalização = chave canônica:** minúsculas → Unicode NFD → remove diacríticos. "Narnia"→"narnia",
-  "Élrond"→"elrond" — acento **não** cria dimensão distinta.
+- **Vowels/semivowels:** vowels `a e i o u` (+ accented ones); weak `i u` form a **diphthong**; accented
+  `í ú` **break** the diphthong (force a hiatus).
+- **Nuclei:** strong vowel + strong → **hiatus** (split: "co-a-lha"); weak + strong or vice versa →
+  **diphthong** (join: "pou-so", "coi-sa").
+- **Onsets:** digraphs `ch lh nh` = **one** sound; `qu`/`gu` + high vowel → silent `u`; mute+liquid clusters
+  (`bl br cl cr dl dr fl fr gl gr pl pr tl tr vl vr`) stay together in the onset.
+- **Coda × onset:** a single consonant between nuclei becomes the coda of the previous one + the onset of
+  the next; in a cluster, the **last two** go to the next onset **if** they form a valid cluster, otherwise
+  only the last one.
+- **Normalization = canonical key:** lowercase → Unicode NFD → strip diacritics. "Narnia"→"narnia",
+  "Élrond"→"elrond" — an accent does **not** create a distinct dimension.
 
-> As PoCs `python_concept/` e `rust_concept/` são **referência congelada** (validação histórica); a spec
-> viva é a do `ragd`. **[FUTURO]** casos-de-ouro (palavras com silabação consensual) pra blindar o
-> silabador contra regressão.
+> The PoCs `python_concept/` and `rust_concept/` are a **frozen reference** (historical validation); the
+> living spec is `ragd`'s. **[FUTURE]** golden cases (words with consensus syllabification) to harden the
+> syllabifier against regression.
 
 ---
 
-## 3. `ragd` — o daemon de produção
+## 3. `ragd` — the production daemon
 
-### 3.1 Processo, portas, estado, config
+### 3.1 Process, ports, state, config
 
-- Um processo Rust serve **duas portas** via `Arc<Mutex<State>>`: **11499** (API JSON) e **11498**
-  (ValHalla, thread separada). [FEITO]
-- `State` = bases em memória (`HashMap<collection, HashMap<name, RagBase>>`), drivers_dir, ragfiles_dir,
-  config, sessões do console. [FEITO]
-- **Auto-load no boot:** varre `ragfiles_dir` (cada subdir = coleção, cada `*-tokenized.json` = base). [FEITO]
-- **Config `ragnarock.cfg`** (chaves):
+- A single Rust process serves **two ports** via `Arc<Mutex<State>>`: **11499** (JSON API) and **11498**
+  (ValHalla, separate thread). [DONE]
+- `State` = bases in memory (`HashMap<collection, HashMap<name, RagBase>>`), drivers_dir, ragfiles_dir,
+  config, console sessions. [DONE]
+- **Auto-load on boot:** scans `ragfiles_dir` (each subdir = collection, each `*-tokenized.json` = base). [DONE]
+- **Config `ragnarock.cfg`** (keys):
 
-  | chave | default | função |
+  | key | default | function |
   |---|---|---|
-  | `api_port` | 11499 | porta da API JSON |
-  | `dash_port` | 11498 | porta do console ValHalla |
-  | `drivers_dir` | `drivers` | drivers de linguagem (`.drv`) |
-  | `ragfiles_dir` | `ragfiles` | bases tokenizadas (auto-load) |
-  | `max_upload` | 1 GB | teto do `POST /ingest_upload` |
-  | `autoload` | true | carregar bases no boot |
-  | `storage` | `memory` | `memory` (cacheia tokens) \| `hybrid` (recomputa) |
-  | `admin_user`/`admin_pass` | admin/admin | login do console — **[FUTURO] trocar fora do dev** |
-  | `active_provider` | none | `none`\|`anthropic`\|`openai` (1 ativo; p/ query-expansion) |
+  | `api_port` | 11499 | JSON API port |
+  | `dash_port` | 11498 | ValHalla console port |
+  | `drivers_dir` | `drivers` | language drivers (`.drv`) |
+  | `ragfiles_dir` | `ragfiles` | tokenized bases (auto-load) |
+  | `max_upload` | 1 GB | cap for `POST /ingest_upload` |
+  | `autoload` | true | load bases on boot |
+  | `storage` | `memory` | `memory` (caches tokens) \| `hybrid` (recomputes) |
+  | `admin_user`/`admin_pass` | admin/admin | console login — **[FUTURE] change outside dev** |
+  | `active_provider` | none | `none`\|`anthropic`\|`openai` (1 active; for query expansion) |
   | `cache_dir` | `cache` | `thesaurus.json` / `expansions.json` |
-  | `log_file` | `/tmp/ragd-all.log` | arquivo lido pela aba Logs (= redirect do launcher) |
-  | `log_utc_offset` | -3 | fuso dos timestamps |
+  | `log_file` | `/tmp/ragd-all.log` | file read by the Logs tab (= launcher redirect) |
+  | `log_utc_offset` | -3 | timezone of timestamps |
 
-  > ⚠️ `ragnarock.cfg` guarda as **chaves de API** dos providers → está no `.gitignore`. Versionar um
-  > `ragnarock.cfg.example` sanitizado. [FUTURO]
+  > ⚠️ `ragnarock.cfg` holds the providers' **API keys** → it's in `.gitignore`. Version a sanitized
+  > `ragnarock.cfg.example`. [FUTURE]
 
-### 3.2 Pipeline de busca [FEITO]
+### 3.2 Search pipeline [DONE]
 
-`base.search(query, k, rerank, recall_n, phonetic)` → `(hits, info)`, em dois estágios:
+`base.search(query, k, rerank, recall_n, phonetic)` → `(hits, info)`, in two stages:
 
-1. **Recall (cosseno tf-idf esparso):** tokeniza a query em sílabas → vetor tf ponderado por `idf` →
-   cosseno contra cada chunk (itera o vetor menor; só dims em comum contam). Pega os `recall_n` candidatos.
-2. **Rerank (matched filter fonético por proximidade):** sobre os candidatos, mede a **menor janela**
-   que cobre um casamento de cada palavra da query (proximidade), **ignorando monossílabos** (stopwords),
-   com soundex opcional (`phonetic`). Score combina cobertura + proximidade. Devolve top-`k`.
+1. **Recall (sparse tf-idf cosine):** tokenize the query into syllables → tf vector weighted by `idf` →
+   cosine against each chunk (iterate the smaller vector; only shared dims count). Take the `recall_n` candidates.
+2. **Rerank (proximity phonetic matched filter):** over the candidates, measure the **smallest window**
+   that covers a match of each query word (proximity), **ignoring monosyllables** (stopwords), with optional
+   soundex (`phonetic`). Score combines coverage + proximity. Returns top-`k`.
 
-- **Fonética do rerank (SOUNDEX — `ragd/src/rag.rs`):** com `phonetic:true`, dois termos casam quando têm
-  o **mesmo código SOUNDEX** (consoantes mapeadas 1–6; vogais/`h`/`w` = 0; retenção clássica em `h`/`w`;
-  truncado a 4). Aplicado **só a termos de ≤3 sílabas** (nomes/grafias variantes: `"Aslan"`→`"Aslam"`);
-  termos longos discriminam pela própria sequência silábica (evita falso casamento `ressurreição`~`rigorosa`).
-  Calculado **1× por query** (não por candidato). É feature **do `ragd`** — não existe nas PoCs congeladas.
+- **Phonetic rerank (SOUNDEX — `ragd/src/rag.rs`):** with `phonetic:true`, two terms match when they share
+  the **same SOUNDEX code** (consonants mapped 1–6; vowels/`h`/`w` = 0; classic `h`/`w` retention; truncated
+  to 4). Applied **only to terms of ≤3 syllables** (names/spelling variants: `"Aslan"`→`"Aslam"`); long terms
+  discriminate by their own syllable sequence (avoids false matches like `ressurreição`~`rigorosa`).
+  Computed **once per query** (not per candidate). It is a `ragd` feature — it does not exist in the frozen PoCs.
+- **Scatter-gather:** `/search` resolves the scope (`collection` + wildcard on `base`: `"sda"`, `"sd*"`,
+  `"*"`), searches each matching base (parallelized with rayon when there's >1 base) and **merges by matchpoint**.
+- **Hit:** `{ collection, base, corpus, path, chunk, matchpoint, mf, span, cos, start, snippet }` — the
+  `path` is reconstructed (`base` decoded `__`→`/` + `corpus`) so the **AI goes straight to the file**. [DONE]
+- **Query expansion (`search_expand`):** **dictionary → cache → AI** (active provider) cascade that expands
+  the query with synonyms before searching, with a **vocab filter** (only synonyms anchored in the scope's
+  corpus) and higher weight on the original term. Exposed on the API (11499) **and** in the console. [DONE]
+  - ⚠️ Low-`idf` synonyms (common words) can dominate and pollute precise lookups → the consumer should
+    prefer **pure** search (`expand=false`) for identifier/file lookup. **[FUTURE]:** prune low-idf
+    synonyms in the expansion.
 
-- **Scatter-gather:** `/search` resolve o escopo (`collection` + wildcard em `base`: `"sda"`, `"sd*"`,
-  `"*"`), busca em cada base que casa (paraleliza com rayon quando há >1 base) e faz **merge por matchpoint**.
-- **Hit:** `{ collection, base, corpus, path, chunk, matchpoint, mf, span, cos, start, snippet }` — o
-  `path` é reconstruído (`base` decodificado `__`→`/` + `corpus`) pra **IA ir direto no arquivo**. [FEITO]
-- **Query expansion (`search_expand`):** cascata **dicionário → cache → IA** (provider ativo) que expande
-  a query por sinônimos antes de buscar, com **filtro por vocab** (só sinônimo que ancora no corpus do
-  escopo) e peso maior no termo original. Exposto na API (11499) **e** no console. [FEITO]
-  - ⚠️ Sinônimos de **idf baixo** (palavras comuns) podem dominar e poluir lookup preciso → o consumidor
-    deve preferir busca **pura** (`expand=false`) para lookup de identificador/arquivo. **[FUTURO]:** podar
-    sinônimos de idf baixo na expansão.
+### 3.3 Ingestion [DONE]
 
-### 3.3 Ingestão [FEITO]
+- `POST /ingest` (tokenized JSON, inline base, or raw), `POST /ingest_file` (path), `POST /ingest_upload`
+  (multipart **or** raw body + query string — ingests **raw text with no file**).
+- **Default = overwrite by name** (`bases.insert(name, base)` — replaces the whole base).
+- **Incremental append with chunk-packing** (`append=true`): instead of creating a new chunk, it **fills the
+  last chunk up to `chunk_size` and overflows** the excess; only the "tail" (last chunk + new text) is
+  re-tokenized, the rest reuses its `vec`; recomputes global `idf` + `norm`. Chunks grow ordered and full →
+  with `N>1` the idf starts to discriminate.
+- **Persistence:** writes `ragfiles/<collection>/<name>-tokenized.json` **before** loading into RAM.
 
-- `POST /ingest` (JSON tokenizado, base inline, ou bruto), `POST /ingest_file` (path), `POST /ingest_upload`
-  (multipart **ou** corpo bruto + querystring — ingere **texto cru sem arquivo**).
-- **Default = overwrite por nome** (`bases.insert(name, base)` — substitui a base inteira).
-- **Append incremental com chunk-packing** (`append=true`): em vez de criar chunk novo, **enche o último
-  chunk até `chunk_size` e transborda** o excedente; só o "rabo" (último chunk + texto novo) é
-  re-tokenizado, o resto reusa o `vec`; recomputa `idf` + `norm` globais. Chunks crescem ordenados e
-  cheios → com `N>1` o idf passa a discriminar.
-- **Persistência:** grava `ragfiles/<collection>/<name>-tokenized.json` **antes** de carregar em RAM.
+### 3.4 Memory and disk strategy
 
-### 3.4 Estratégia de memória e disco
-
-| modo | em RAM | trade-off | status |
+| mode | in RAM | trade-off | status |
 |---|---|---|---|
-| `memory` (default) | `meta`+`idf`+`chunks` **com `words` cacheado** | busca mais rápida, +RAM | [FEITO] |
-| `hybrid` | idem **sem `words`** (recomputa só dos candidatos no rerank) | −66% RAM medido, busca ampla um pouco mais lenta | [FEITO] |
+| `memory` (default) | `meta`+`idf`+`chunks` **with `words` cached** | faster search, +RAM | [DONE] |
+| `hybrid` | same **without `words`** (recomputes only for candidates at rerank) | −66% RAM measured, slightly slower broad search | [DONE] |
 
-- **Durabilidade:** a verdade está no disco (`ragfiles/`); RAM é cache → crash recupera no boot.
-- **`[FUTURO]` mmap/on-disk estilo Qdrant:** **não agora.** Kimi e Codex convergiram: o sistema é
-  **CPU-bound na silabificação**, não I/O-bound; mmap adiciona superfície de bug (corrupção, lock,
-  flush) e **trai o "roda em qualquer lugar"** (dependências nativas/FS). Só considerar se **corpus >
-  ~80% da RAM**, e mesmo assim **opt-in por build/config** (modular), nunca default.
-- **Pressão de memória:** o console mede RSS (`/proc/self/statm`) + estimativa text/vec/words; medido:
-  ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [FEITO]
+- **Durability:** the truth is on disk (`ragfiles/`); RAM is a cache → a crash recovers on boot.
+- **`[FUTURE]` mmap/on-disk Qdrant-style:** **not now.** Kimi and Codex converged: the system is
+  **CPU-bound on syllabification**, not I/O-bound; mmap adds bug surface (corruption, lock, flush) and
+  **betrays "runs anywhere"** (native/FS dependencies). Only consider if **corpus > ~80% of RAM**, and even
+  then **opt-in by build/config** (modular), never default.
+- **Memory pressure:** the console measures RSS (`/proc/self/statm`) + text/vec/words estimate; measured:
+  ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [DONE]
 
-### 3.5 Concorrência
+### 3.5 Concurrency
 
-- **Hoje:** `Arc<Mutex<State>>` global — toda operação (read ou write) compete pelo mesmo lock.
-  Throughput medido: ~500 req/s num Mac M-series, ~65 num x86 de 2 cores, ~43 num Raspberry Pi 3 (busca global). [FEITO]
-- **Por que basta hoje:** o uso principal é **UMA IA, sequencial** — não há contenção real. Mutex
-  funciona bem até dezenas de req/s concorrentes.
-  - ⚠️ **Nota (Kimi):** o `rayon` paraleliza o scatter-gather, mas o `Mutex` global **re-serializa**
-    internamente — o ganho real de paralelismo só vem com o `RwLock`/lock-por-coleção abaixo. É
-    otimização **[FUTURO]** de **mesma prioridade** que a leitura on-disk no `hybrid`; não urgente com 1
-    IA sequencial.
-- **`[FUTURO]` quando virar multi-agente:**
-  - `Mutex<State>` → **`RwLock<State>`**: N **buscas read-only** em paralelo; `write()` só em
-    ingest/delete. (Ressalva do Codex: o rerank em `hybrid` recomputa `words` — mas isso é leitura pura,
-    cabe no read-lock; não vira write.)
-  - **Granularidade por coleção** (lock por coleção, não global) → buscar na coleção A enquanto ingere na B.
-  - Cuidado: starvation de writers se readers forem contínuos (usar `RwLock` justo/fair).
-  - Codex sugere desacoplar ingest×busca por **canal/mensagem** (lock-light) — guardar para se o RwLock
-    não bastar; YAGNI antes disso.
+- **Today:** global `Arc<Mutex<State>>` — every operation (read or write) competes for the same lock.
+  Measured throughput: ~500 req/s on an M-series Mac, ~65 on a 2-core x86, ~43 on a Raspberry Pi 3 (global search). [DONE]
+- **Why it's enough today:** the main use is **ONE AI, sequential** — no real contention. A Mutex works
+  well up to dozens of concurrent req/s.
+  - ⚠️ **Note (Kimi):** `rayon` parallelizes the scatter-gather, but the global `Mutex` **re-serializes**
+    internally — real parallelism only comes with the `RwLock`/per-collection lock below. It's a **[FUTURE]**
+    optimization of **the same priority** as on-disk reads in `hybrid`; not urgent with 1 sequential AI.
+- **`[FUTURE]` when it becomes multi-agent:**
+  - `Mutex<State>` → **`RwLock<State>`**: N **read-only searches** in parallel; `write()` only on
+    ingest/delete. (Codex's caveat: rerank in `hybrid` recomputes `words` — but that's a pure read, fits the
+    read-lock; it doesn't become a write.)
+  - **Per-collection granularity** (lock per collection, not global) → search collection A while ingesting into B.
+  - Careful: writer starvation if readers are continuous (use a fair `RwLock`).
+  - Codex suggests decoupling ingest×search via **channel/message** (lock-light) — keep that for if the RwLock
+    isn't enough; YAGNI before that.
 
-### 3.6 Drivers de linguagem [FEITO]
+### 3.6 Language drivers [DONE]
 
-- Tokenização de **código-fonte** usa `.drv`: sílabas da base `SourceCode` (PT + sílabas de código) +
-  **keywords reservadas** da linguagem. `tokens_PTBR.drv` e `tokens_SourceCode_PTBR.drv` são a **matriz
-  fixa**; os demais derivam via `tools/gen_drivers.py`. `GET /interpret?file=foo.py` roteia extensão →
-  driver/linguagem.
+- **Source-code** tokenization uses `.drv`: syllables from the `SourceCode` base (PT + code syllables) +
+  the language's **reserved keywords**. `tokens_PTBR.drv` and `tokens_SourceCode_PTBR.drv` are the **fixed
+  matrix**; the others derive via `tools/gen_drivers.py`. `GET /interpret?file=foo.py` routes extension →
+  driver/language.
 
-### 3.7 Contrato HTTP — rotas
+### 3.7 HTTP contract — routes
 
-> 📐 **Contrato detalhado** (request/response de cada rota dos 3 daemons): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
-> Exemplos executáveis `curl -d @`: `ragd/json_samples/`. Abaixo, o resumo das rotas.
+> 📐 **Detailed contract** (request/response of each route of the 3 daemons): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
+> Runnable `curl -d @` examples: `ragd/json_samples/`. Below, the route summary.
 
-**Implementadas [FEITO]:**
+**Implemented [DONE]:**
 
-| método | rota | função |
+| method | route | function |
 |---|---|---|
 | GET | `/health` | `{status, bases, collections, drivers}` |
-| GET | `/bases` `?collection=&match=` | lista bases (com `corpus`, `n_chunks`...) |
-| GET | `/collections` | resumo por coleção |
-| GET | `/drivers` `?match=` | lista drivers |
-| GET | `/interpret` `?file=\|?ext=` | extensão → driver |
-| POST | `/search` | busca pura (recall+rerank) |
-| POST | `/search_expand` | busca com query expansion |
-| POST | `/ingest` · `/ingest_file` · `/ingest_upload` | ingestão (inclui `append=true`) |
-| POST | `/chunk` | recupera chunk(s) inteiro(s) por id (`before`/`after`) |
-| DELETE | `/bases/{nome}` `?collection=` | remove base |
+| GET | `/bases` `?collection=&match=` | list bases (with `corpus`, `n_chunks`...) |
+| GET | `/collections` | summary per collection |
+| GET | `/drivers` `?match=` | list drivers |
+| GET | `/interpret` `?file=\|?ext=` | extension → driver |
+| POST | `/search` | pure search (recall+rerank) |
+| POST | `/search_expand` | search with query expansion |
+| POST | `/ingest` · `/ingest_file` · `/ingest_upload` | ingestion (includes `append=true`) |
+| POST | `/chunk` | retrieve whole chunk(s) by id (`before`/`after`) |
+| DELETE | `/bases/{name}` `?collection=` | remove base |
 
-**A definir/faltam [FUTURO]:**
-- `DELETE /collections/{nome}` (remover coleção inteira).
-- `GET /stats` (agregado público; hoje só interno no console).
-- `GET /bases/{coll}/{name}` (metadados de 1 base sem buscar).
-- `GET /profile?collection=&base=` — **perfil léxico** (`vocab_used`, `dims`, `top_idf[]`) para alimentar
-  o **nível 0 do Nidhogg** sem sondar via `/search` (caro). Achado no ciclo de revisão (§5.3).
-- Ingestão **por arquivo dentro de um repo** (base = N arquivos; update incremental por `sha` de arquivo
-  — ver §6). Hoje base = 1 arquivo.
-
----
-
-## 4. ValHalla — console web (11498) [FEITO]
-
-Console supervisório embutido no `ragd` (HTML no binário), **sessão por cookie** (login `admin/admin`,
-TTL; **[FUTURO]** senha real). Abas:
-
-- **Visão** — coleções/bases/chunks/drivers, barras de distribuição, pressão de memória.
-- **Buscar** — form + resultados; toggle **expandir 🧠** (chama `/api/search_expand`) e **fonético**;
-  modal de chunk (arquivo + caminho + chunk N/total).
-- **Ingestão** — upload de arquivos/pasta (`webkitdirectory`), escolhe coleção, status por arquivo.
-- **Performance** — histograma query×chunk, matched filter com ponto de convergência, mapa de calor.
-- **Drivers** — lista de linguagens/keywords.
-- **Logs** — tail do `log_file`, auto-refresh, linhas coloridas (a árvore hierárquica do `search_expand`
-  aparece aqui).
-- **Config** — storage `memory|hybrid`, chaves de API (cofre mascarado, 1 provider ativo), restart.
-- **Dicionários** — liga/desliga dicts do thesaurus (toggle por flag, não move arquivo).
-- **Nidhogg** **[FUTURO]** — a "tela gigante" da camada de inteligência: liga/desliga global e por
-  coleção, dial de nível + cadência/janela, prompt por nível, toggle do **gate de aceite** + botão de
-  **aceitar** cada versão de artefato, e a leitura dos artefatos versionados (documento vivo, árvore de
-  conhecimento). **Ao LIGAR: disclaimer obrigatório** de consumo de IA.
-
-> ValHalla **lê e opera** o ragd; não tem lógica de busca própria (delega à API).
+**To define/missing [FUTURE]:**
+- `DELETE /collections/{name}` (remove a whole collection).
+- `GET /stats` (public aggregate; today only internal in the console).
+- `GET /bases/{coll}/{name}` (metadata of 1 base without searching).
+- `GET /profile?collection=&base=` — **lexical profile** (`vocab_used`, `dims`, `top_idf[]`) to feed
+  Nidhogg's **level 0** without probing via `/search` (expensive). Found during the review cycle (§5.3).
+- Ingestion **by file inside a repo** (base = N files; incremental update by file `sha` — see §6). Today
+  base = 1 file.
 
 ---
 
-## 5. `nidhoggd` / Níðhöggr — camada de inteligência (11497) [PARCIAL]
+## 4. ValHalla — web console (11498) [DONE]
 
-> No mito, Níðhöggr é a serpente que rói as raízes de Yggdrasil. Aqui, o worm rói/**digere o
-> conhecimento** da árvore do RAG e o destila num saber que **sobrevive à deleção da coleção**.
+Supervisory console embedded in `ragd` (HTML in the binary), **cookie session** (login `admin/admin`,
+TTL; **[FUTURE]** real password). Tabs:
 
-> 💎 **Por que o Nidhogg importa (posicionamento — decisão Pacman).** É a **camada analítica** — o
-> **ponto de virada onde o projeto vira produto de valor ($$$)**. O núcleo (`ragd`) é OSS e roda em
-> qualquer lugar; o Nidhogg é onde o **open source subsidia seus usuários**: gera **análises concretas,
-> assistidas por IA**, sobre qualquer assunto (código, livros, artigos), permitindo a um
-> **consultor / estudante / empresa chegar embasado**. Quem liga a IA colhe entendimento que vale dinheiro.
+- **Overview** — collections/bases/chunks/drivers, distribution bars, memory pressure.
+- **Search** — form + results; **expand 🧠** toggle (calls `/api/search_expand`) and **phonetic**;
+  chunk modal (file + path + chunk N/total).
+- **Ingestion** — file/folder upload (`webkitdirectory`), pick a collection, status per file.
+- **Performance** — query×chunk histogram, matched filter with convergence point, heatmap.
+- **Drivers** — list of languages/keywords.
+- **Logs** — tail of `log_file`, auto-refresh, colored lines (the `search_expand` hierarchical tree shows here).
+- **Config** — `memory|hybrid` storage, API keys (masked vault, 1 active provider), restart.
+- **Dictionaries** — turn thesaurus dicts on/off (toggle by flag, doesn't move the file).
+- **Nidhogg** **[FUTURE]** — the "big screen" of the intelligence layer: turn on/off globally and per
+  collection, level dial + cadence/window, per-level prompt, the **acceptance gate** toggle + **accept**
+  button for each artifact version, and reading the versioned artifacts (living document, knowledge tree).
+  **On TURN-ON: mandatory disclaimer** about AI consumption.
 
-### 5.1 Conceito & invariantes [FEITO: esqueleto]
+> ValHalla **reads and operates** `ragd`; it has no search logic of its own (delegates to the API).
 
-- Processo **separado**, **"daemon de módulos"** (porta 11497 vai hospedar N módulos além do Nidhogg).
-- Lê o corpus **sempre via API do `ragd`** (nunca disco) → independe de localização.
-- **Nasce DESLIGADO** (níveis ≥1 consomem IA). Liga/desliga **global** e **por coleção** (não re-mastiga
-  a mesma N vezes). Keepalive pinga o `ragd` a cada 15s e cacheia (status nunca faz curl ao vivo).
-- **Dois dials ortogonais:** **nível** (profundidade) + **cadência** (segundos entre ciclos = orçamento
-  de tempo).
+---
 
-### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
+## 5. `nidhoggd` / Níðhöggr — intelligence layer (11497) [PARTIAL]
 
-> **Decisão (Pacman):** o Nidhogg é um **projeto autônomo**, um **analisador crítico**. O `ragd`
-> **NUNCA** o consome — daemons desacoplados. O valor está no **artefato em si**; **não depende** de
-> ser consumido por outra máquina. *"Não interessa se alguém vai consumir ou não"* — o **entendimento
-> acumulado É o produto** (como um caderno de erudito que engorda sozinho). Isso responde a crítica do
-> Codex pela raiz: o consumidor é o **humano que lê**, não um sistema.
+> In the myth, Níðhöggr is the serpent that gnaws the roots of Yggdrasil. Here, the worm gnaws/**digests
+> the knowledge** of the RAG's tree and distills it into insight that **survives the deletion of the collection**.
 
-- **Consumidor = o humano**, via ValHalla (e export): abre e **lê** os artefatos destilados.
-- **Artefatos de primeira classe** (entregáveis, não índice auxiliar de busca):
-  - **Documento vivo** (nível **propositivo**): cresce **indefinidamente** a cada ciclo. Caso de uso do
-    Pacman: *abrir depois de 15 dias e ler um resumo profundo de uma obra (ex.: O Senhor dos Anéis), com
-    nuances de detalhe, em estilos (moderno, arcaico…)* — um "companion" que aprofunda no tempo.
-  - **Árvore de conhecimento / mapa mental** (nível **estrutural**): navegável, partindo da obra — vale
-    pra **código-fonte, texto, livro, artigo**, qualquer ingestão da base.
-- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** serve esses artefatos (pra ValHalla e export).
-- O `ragd` **não lê nem injeta** isso na busca. Se um dia um agente quiser usar os artefatos como
-  contexto, ele lê pela API do Nidhogg — **uso secundário e opcional**, não a razão de existir.
+> 💎 **Why Nidhogg matters (positioning — owner's decision).** It is the **analytical layer** — the
+> **turning point where the project becomes a product of value ($$$)**. The core (`ragd`) is OSS and runs
+> anywhere; Nidhogg is where the **open source subsidizes its users**: it produces **concrete, AI-assisted
+> analyses** on any subject (code, books, articles), letting a **consultant / student / company arrive
+> well-grounded**. Whoever turns the AI on reaps understanding worth money.
 
-### 5.3 `source_hash`, diff e incrementalidade [FUTURO]
+### 5.1 Concept & invariants [DONE: skeleton]
 
-Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo, e digerir **só o que mudou**.
+- **Separate** process, a **"module daemon"** (port 11497 will host N modules beyond Nidhogg).
+- Reads the corpus **always via the `ragd` API** (never disk) → independent of location.
+- **Starts OFF** (levels ≥1 consume AI). Turn on/off **globally** and **per collection** (doesn't re-chew
+  the same one N times). A keepalive pings `ragd` every 15s and caches it (status never does a live curl).
+- **Two orthogonal dials:** **level** (depth) + **cadence** (seconds between cycles = time budget).
 
-- **`state_hash` por base** = `hash(base_name, n_chunks, vocab_size, corpus)` — barato, vem direto do
-  `GET /bases` (não lê o conteúdo). **Nunca usa path** (rename de path não muda; `base_name` é id estável).
-- **`source_hash` da coleção** = hash da lista **ordenada** dos `state_hash` das suas bases.
-- **Diff por ciclo:** compara o checkpoint anterior (`{base → state_hash}`) com o atual → bases
-  **novas / alteradas / removidas**. Processa só as mudadas; marca órfãs (removidas); mantém as intactas.
-- **Não re-mastiga** coleção/base com `state_hash` igual ao último → economiza IA (cadência ≠ re-trabalho).
+### 5.2 Nature & consumption — Nidhogg is AUTONOMOUS; the reader is HUMAN
 
-> ⚠️ **Furo de contrato achado (Kimi):** o `ragd` **não expõe hoje** `idf`/`dims`/vocabulário efetivo por
-> base num endpoint — o nível 0 teria que **sondar** via `/search` com sílabas-probe (caro). **Decisão:**
-> adicionar um endpoint de **perfil** no `ragd` → `GET /profile?collection=&base=` retornando
-> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Alimenta o nível 0 barato. **[FUTURO — contrato novo no ragd]**
+> **Decision (owner):** Nidhogg is an **autonomous project**, a **critical analyzer**. `ragd` **NEVER**
+> consumes it — decoupled daemons. The value is in the **artifact itself**; it **does not depend** on being
+> consumed by another machine. *"It doesn't matter whether anyone will consume it or not"* — the
+> **accumulated understanding IS the product** (like a scholar's notebook that grows on its own). This
+> answers Codex's critique at the root: the consumer is the **human who reads**, not a system.
 
-### 5.4 Os 4 níveis — algoritmos e schemas
+- **Consumer = the human**, via ValHalla (and export): opens and **reads** the distilled artifacts.
+- **First-class artifacts** (deliverables, not an auxiliary search index):
+  - **Living document** (**propositive** level): grows **indefinitely** each cycle. Owner's use case:
+    *open it after 15 days and read a deep summary of a work (e.g. The Lord of the Rings), with nuance of
+    detail, in styles (modern, archaic…)* — a "companion" that deepens over time.
+  - **Knowledge tree / mind map** (**structural** level): navigable, starting from the work — valid for
+    **source code, text, book, article**, any ingestion of the base.
+- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** serves these artifacts (for ValHalla and export).
+- `ragd` **does not read or inject** this into search. If one day an agent wants to use the artifacts as
+  context, it reads them via the Nidhogg API — **secondary, optional use**, not the reason to exist.
 
-| nível | nome | IA? | produz | status |
+### 5.3 `source_hash`, diff and incrementality [FUTURE]
+
+Kimi and Codex converged: detect real change **cheaply**, no false positives, and digest **only what changed**.
+
+- **`state_hash` per base** = `hash(base_name, n_chunks, vocab_size, corpus)` — cheap, comes straight from
+  `GET /bases` (doesn't read the content). **Never uses path** (renaming the path doesn't change it;
+  `base_name` is a stable id).
+- **Collection `source_hash`** = hash of the **ordered** list of its bases' `state_hash`.
+- **Diff per cycle:** compares the previous checkpoint (`{base → state_hash}`) against the current one →
+  **new / changed / removed** bases. Processes only the changed ones; marks orphans (removed); keeps the intact ones.
+- **Doesn't re-chew** a collection/base whose `state_hash` equals the last one → saves AI (cadence ≠ rework).
+
+> ⚠️ **Contract gap found (Kimi):** `ragd` **doesn't expose today** `idf`/`dims`/effective vocabulary per
+> base in an endpoint — level 0 would have to **probe** via `/search` with syllable probes (expensive).
+> **Decision:** add a **profile** endpoint to `ragd` → `GET /profile?collection=&base=` returning
+> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Feeds level 0 cheaply. **[FUTURE — new contract in ragd]**
+
+### 5.4 The 4 levels — algorithms and schemas
+
+| level | name | AI? | produces | status |
 |---|---|---|---|---|
-| 0 | **burro** | não | 3 pilares: RootIndex · CorpusDict · CacheDigest | [PARCIAL] |
-| 1 | **consciente** | sim | `Summary` por coleção (saber que sobrevive à deleção) | [FUTURO] |
-| 2 | **estrutural** | sim | **Árvore de conhecimento / mapa mental** da obra (`KnowledgeTree`) | [FUTURO] |
-| 3 | **propositivo** | sim | **Documento vivo incremental** (`LivingDocument`, cresce no tempo) + `Gap`/`Suggestion` | [FUTURO] |
+| 0 | **dumb** | no | 3 pillars: RootIndex · CorpusDict · CacheDigest | [PARTIAL] |
+| 1 | **conscious** | yes | `Summary` per collection (insight that survives deletion) | [FUTURE] |
+| 2 | **structural** | yes | **Knowledge tree / mind map** of the work (`KnowledgeTree`) | [FUTURE] |
+| 3 | **propositive** | yes | **Incremental living document** (`LivingDocument`, grows over time) + `Gap`/`Suggestion` | [FUTURE] |
 
-**Nível 0 (sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
-health-check** ("minha coleção está íntegra e navegável?"), **não "conhecimento"** — não vender como tal.
-Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e custa zero IA.
+**Level 0 (no AI) — the 3 pillars.** ⚠️ **Honesty (Codex):** level 0 is **navigation / index /
+health-check** ("is my collection sound and navigable?"), **not "knowledge"** — don't sell it as such.
+Even so it delivers value on its own (base for the AI levels + observability) and costs zero AI.
 
-> 🌱 **A semente do Nidhogg (origem da ideia).** O nível 0 é o pedaço que devolve ao RAGnaRock **coleções
-> organizadas sobre as próprias coleções** — um **agente de auto-organização autônomo** do RAG sobre si
-> mesmo. Foi daqui que o Nidhogg nasceu. Por isso o salto **0→1 nunca tem gate de aceite** (§5.4): não há
-> o que um humano aprovar quando o RAG só está se arrumando pra si próprio.
+> 🌱 **The seed of Nidhogg (origin of the idea).** Level 0 is the piece that gives RAGnaRock back
+> **collections organized about its own collections** — a **self-organization agent** of the RAG over
+> itself. This is where Nidhogg was born. That's why the **0→1 step never has an acceptance gate** (§5.4):
+> there's nothing for a human to approve when the RAG is just tidying itself up.
 
-- **RootIndex** — sílabas/dims mais salientes por coleção (rank por `idf × freq`), agrupadas por raiz.
+- **RootIndex** — most salient syllables/dims per collection (ranked by `idf × freq`), grouped by root.
   `content:{ bases_count, total_chunks, roots:[{stem, dims, df_chunks, idf_score, bases}], coverage_ratio }`.
-- **CorpusDict** — vocabulário efetivo (dims usadas, top por `idf`, cobertura/`oov` por base, dims
-  compartilhadas vs únicas). `content:{ vocab_size, active_dims, top_idf:[{dim,syllable,idf,df}], shared_dims, unique_dims }`.
-- **CacheDigest** — consolida o cache de query-expansion: sinônimos vistos ≥ N vezes que mapeiam os
-  **mesmos** chunks viram clusters de equivalência. `content:{ entries:[{canonical, variants, shared_chunk_ids, hit_count}], hit_rate }`.
+- **CorpusDict** — effective vocabulary (dims used, top by `idf`, coverage/`oov` per base, shared vs unique
+  dims). `content:{ vocab_size, active_dims, top_idf:[{dim,syllable,idf,df}], shared_dims, unique_dims }`.
+- **CacheDigest** — consolidates the query-expansion cache: synonyms seen ≥ N times that map to the **same**
+  chunks become equivalence clusters. `content:{ entries:[{canonical, variants, shared_chunk_ids, hit_count}], hit_rate }`.
 
-**Níveis 1–3 (IA) — entrada, amostragem e saída:**
+**Levels 1–3 (AI) — input, sampling and output:**
 
-| nível | entrada pro LLM | amostragem | saída (`type`) |
+| level | input to the LLM | sampling | output (`type`) |
 |---|---|---|---|
-| 1 | chunks **novos/alterados** desde o `source_hash` + meta da base | até `MAX_CHUNKS_PER_LEVEL` (~100) espaçados + top-N por `idf`; se poucos, todos | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
-| 2 | `Summary` de nível 1 da obra/coleção (metadado — não amostra) | — | `KnowledgeTree {root, nodes[], edges[]}` — mapa mental navegável (hierarquia/encaixe de dimensões é a base) |
-| 3 | a obra + `KnowledgeTree` + `Summary` + a versão anterior do documento vivo | incremental: só o que entrou desde o último ciclo | `LivingDocument {sections[], style, version, grows:true}` (resumo profundo que cresce, variantes de estilo) + `Gap`/`Suggestion` |
+| 1 | chunks **new/changed** since `source_hash` + base meta | up to `MAX_CHUNKS_PER_LEVEL` (~100) spaced + top-N by `idf`; if few, all | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
+| 2 | level-1 `Summary` of the work/collection (metadata — not a sample) | — | `KnowledgeTree {root, nodes[], edges[]}` — navigable mind map (dimension hierarchy/fit is the base) |
+| 3 | the work + `KnowledgeTree` + `Summary` + the previous version of the living document | incremental: only what came in since the last cycle | `LivingDocument {sections[], style, version, grows:true}` (deep summary that grows, style variants) + `Gap`/`Suggestion` |
 
-- **Orçamento é DECISÃO DE QUEM RODA:** cadência = orçamento de **tempo** por ciclo; somar teto de
-  **tokens/ciclo** para os níveis IA. Nasce **OFF**, opt-in por coleção (§5.1), nível 0 cobre o sem-IA, e
-  **sem teto de gasto por default** — escolha consciente, com **disclaimer obrigatório ao ligar** (§4). O
-  grafo de IAs (dim. 3) multiplica o consumo (N IAs × N níveis) — é a camada $$$ por excelência.
-- **Rate-limit = a própria configuração das dimensões (decisão Pacman):** não há rate-limiter à parte. O
-  dono define **quando cada dimensão dispara dentro do ciclo** (ex.: nível 1 a cada ciclo, nível 3 a cada
-  N ciclos) — *isso já é* o controle de vazão/custo. Soma-se a isso o teto opcional de tokens/ciclo. Assim,
-  "consumir muita IA" vira uma escolha explícita na config, não um acidente.
-- **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
-- **Ordem HIERÁRQUICA (1→2→3):** os níveis IA acontecem **em sequência** — não há nível 2 sem o 1, nem 3
-  sem o 2 (a dimensão do conhecimento é hierárquica por natureza). O **dial seleciona o nível-topo**; o
-  worker roda `1..N` em ordem dentro do ciclo. Nível 0 (sem IA) é sempre a base.
-- **Aditivo, versionado + gate de aceite (decisão Pacman, ciclo 4):** o artefato de cada dimensão é
-  **versionado** — toda re-derivação cria uma `version` nova e arquiva a anterior como `frozen_version`
-  (§5.7); o conjunto de versões **só acumula** (aditivo), mesmo quando o corpo ativo é substituído. Entre
-  uma dimensão e a seguinte há um **gate de aceite opcional, ligável POR DIMENSÃO** (`accept_gate` =
-  conjunto de níveis com gate, no ValHalla) — **não** global e **não** por item gerado. Ligar o gate na
-  dimensão N significa: *o artefato de N só libera a dimensão N+1 depois de aprovado*. **Só há dois pontos
-  lógicos de gate: `accept_gate ⊆ {1, 2}`** (controlam 1→2 e 2→3):
-  - **0→1 nunca tem gate** — nível 0 é auto-organização autônoma do RAG sobre si mesmo (a semente do
-    Nidhogg, ver acima); não há o que aprovar.
-  - **3 não tem gate** — é o nível-topo, não há dimensão seguinte pra liberar.
-  - **1→2 raramente fica ligado na prática** — a dim. 1 emite *muito* mais artefatos (um `Summary` por
-    coleção/base); aprovar tudo seria inviável. O gate em **2→3** é o palatável (bem menos artefatos).
-  - **dimensão sem gate (default):** cascata automática — o artefato alimenta a dimensão seguinte no mesmo ciclo.
-  - **dimensão com gate ON:** o artefato fica `pending` e **só libera a próxima dimensão após o aceite
-    humano** (botão no ValHalla). É o checkpoint de qualidade — ex.: com gate na dim. 2, o humano valida a
-    árvore **antes** de o documento vivo (dim. 3) nascer dela. O aceite é também o **sinal de utilidade**
-    (fecha o feedback-loop apontado pelo Kimi) sem o `ragd` jamais consumir o artefato.
-  - **Trade-off consciente (frisar):** ligar o gate **quebra o ciclo autônomo** (§5.2) e injeta
-    **dependência humana** — o worm para e *espera* o aceite, deixa de andar sozinho. Isso pode ser
-    aceitável (quero revisar antes de aprofundar) ou inaceitável (quero o worm 100% autônomo). Não há
-    resposta certa: é por isso que é **feature opt-in**, uma troca *autonomia × controle* decidida caso a
-    caso por quem opera — nunca imposta.
-- **Prompt por nível = o TOM (decisão Pacman):** cada nível IA (1, 2, 3) tem um **prompt configurável**
-  (editável no ValHalla / `nidhogg.cfg`: `prompt_consciente`, `prompt_estrutural`, `prompt_propositivo`)
-  — é como você dita o **tom/estilo** de cada extração (ex.: moderno vs arcaico no `LivingDocument`).
-- **Cascata-delta — 3 modos de re-derivação (decisão Pacman, ciclo 4):** quando um nível inferior muda, o
-  superior re-deriva pelo vínculo `derived_from`/`digestion_id`, mas **não assume crescimento monotônico**
-  (a crítica do Kimi: rastrear proveniência ≠ rastrear impacto semântico). O artefato cresce, **encolhe ou
-  é refeito**, em três modos:
-  - **aditivo** — anexa o delta (a obra ganhou conteúdo; o `LivingDocument` estende, a árvore ganha galho).
-  - **substituição estrutural** — troca uma **seção / galho inteiro**, não só a ponta. É o caso comum em
-    **código**: mudar uma linha estrutural reescreve a *linha de raciocínio* toda — *"a corda não só
-    cresce; às vezes o trecho é trocado por completo"*.
-  - **reescrita total** — a mudança invalida o framing (themes/entities centrais mudaram no nível 1);
-    o artefato é **refeito do zero**.
-- **O que é trocado nunca some:** a versão anterior do galho/documento vira `frozen_version` (preserva o
-  histórico — §5.7); o **corpo ativo** é sempre o atual. O gatilho do modo: mudança aditiva → local;
-  *reframing* detectado no nível 1 → substituição/reescrita. (Mecanismo fino de impacto — assinatura
-  semântica por galho pra decidir local vs. global — fica **[FUTURO — implementação]**.)
-- **Auto-melhoria embutida na camada propositiva (dispensa "Synthesis"):** a dim. 3 **lê a versão
-  anterior do documento e a aprimora** — refinar É a análise propositiva. Por isso **não há mecanismo de
-  consolidação à parte**: o risco que o Kimi levantou (documento vivo incha/repete/contradiz) se resolve
-  por construção, dentro do próprio nível 3, a cada ciclo.
-- **Grafo de IAs em confronto — exclusivo da camada propositiva (decisão Pacman, ciclo 4):** na dim. 3 o
-  artefato final **não precisa sair de uma única IA**. O operador monta no ValHalla um **grafo de
-  inferência**: nós = IAs disponíveis (providers plugáveis — Bedrock, Kimi, Codex, local…), arestas =
-  **quem confronta / alimenta quem**, em **N níveis** de confronto até *"o artefato que gera o artefato
-  final"*. É o padrão Side AI (gerador × crítico × árbitro) **institucionalizado dentro do Nidhogg**. Os
-  artefatos intermediários do grafo são **insumo**; só o nó-raiz emite o `LivingDocument` versionado.
-  - **Só vale para a dim. 3.** Dims 1 e 2 usam **IA direta** (1 chamada por extração) — confronto multi-IA
-    é custo que só a camada propositiva justifica.
-  - O **provider** aqui deixa de ser "escolher 1 modelo" e vira "orquestrar vários num DAG de confronto"
-    (plugáveis: Bedrock, escolha de modelo, round-robin). Config do grafo no `nidhogg.cfg`/ValHalla. **[FUTURO]**
+- **The budget is the RUNNER'S DECISION:** cadence = **time** budget per cycle; add a cap of **tokens/cycle**
+  for the AI levels. Starts **OFF**, opt-in per collection (§5.1), level 0 covers the no-AI case, and **no
+  spending cap by default** — a conscious choice, with a **mandatory disclaimer on turn-on** (§4). The AI
+  graph (level 3) multiplies consumption (N AIs × N levels) — it's the $$$ layer par excellence.
+- **Rate-limit = the dimension configuration itself (owner's decision):** there's no separate rate-limiter.
+  The owner defines **when each dimension fires within the cycle** (e.g. level 1 every cycle, level 3 every
+  N cycles) — *that already is* the throughput/cost control. Add the optional tokens/cycle cap on top. Thus
+  "consuming a lot of AI" becomes an explicit config choice, not an accident.
+- **Incremental:** level 1 processes only new chunks; level 0 reprocesses the whole changed base (it's cheap).
+- **HIERARCHICAL order (1→2→3):** the AI levels happen **in sequence** — there's no level 2 without 1, nor 3
+  without 2 (the knowledge dimension is hierarchical by nature). The **dial selects the top level**; the
+  worker runs `1..N` in order within the cycle. Level 0 (no AI) is always the base.
+- **Additive, versioned + acceptance gate (owner's decision):** each dimension's artifact is **versioned** —
+  every re-derivation creates a new `version` and archives the previous one as `frozen_version` (§5.7); the
+  set of versions **only accumulates** (additive), even when the active body is replaced. Between one
+  dimension and the next there's an **optional acceptance gate, switchable PER DIMENSION** (`accept_gate` =
+  set of levels with a gate, in ValHalla) — **not** global and **not** per generated item. Turning the gate
+  on at dimension N means: *N's artifact only releases dimension N+1 after approval*. **There are only two
+  logical gate points: `accept_gate ⊆ {1, 2}`** (controlling 1→2 and 2→3):
+  - **0→1 never has a gate** — level 0 is autonomous self-organization of the RAG over itself (the seed of
+    Nidhogg, see above); there's nothing to approve.
+  - **3 has no gate** — it's the top level, there's no next dimension to release.
+  - **1→2 is rarely left on in practice** — dimension 1 emits *far* more artifacts (one `Summary` per
+    collection/base); approving them all would be unfeasible. The gate at **2→3** is the palatable one (far fewer artifacts).
+  - **dimension without a gate (default):** automatic cascade — the artifact feeds the next dimension in the same cycle.
+  - **dimension with gate ON:** the artifact stays `pending` and **only releases the next dimension after
+    human acceptance** (button in ValHalla). It's the quality checkpoint — e.g. with a gate on dim. 2, the
+    human validates the tree **before** the living document (dim. 3) is born from it. The acceptance is also
+    the **utility signal** (closes the feedback loop Kimi pointed out) without `ragd` ever consuming the artifact.
+  - **Conscious trade-off (to stress):** turning the gate on **breaks the autonomous cycle** (§5.2) and
+    injects **human dependency** — the worm stops and *waits* for the acceptance, no longer running on its
+    own. This may be acceptable (I want to review before going deeper) or unacceptable (I want the worm 100%
+    autonomous). There's no right answer: that's why it's an **opt-in feature**, an *autonomy × control*
+    trade-off decided case by case by whoever operates it — never imposed.
+- **Per-level prompt = the TONE (owner's decision):** each AI level (1, 2, 3) has a **configurable prompt**
+  (editable in ValHalla / `nidhogg.cfg`: `prompt_consciente`, `prompt_estrutural`, `prompt_propositivo`) —
+  it's how you dictate the **tone/style** of each extraction (e.g. modern vs archaic in the `LivingDocument`).
+- **Delta cascade — 3 re-derivation modes (owner's decision):** when a lower level changes, the upper one
+  re-derives through the `derived_from`/`digestion_id` link, but **does not assume monotonic growth** (Kimi's
+  critique: tracking provenance ≠ tracking semantic impact). The artifact grows, **shrinks or is remade**, in
+  three modes:
+  - **additive** — appends the delta (the work gained content; the `LivingDocument` extends, the tree gains a branch).
+  - **structural replacement** — swaps a **whole section / branch**, not just the tip. It's the common case in
+    **code**: changing a structural line rewrites the whole *line of reasoning* — *"the rope doesn't just
+    grow; sometimes the segment is swapped entirely"*.
+  - **full rewrite** — the change invalidates the framing (central themes/entities changed at level 1); the
+    artifact is **remade from scratch**.
+- **What gets swapped never disappears:** the previous version of the branch/document becomes a
+  `frozen_version` (preserves history — §5.7); the **active body** is always the current one. The mode
+  trigger: additive change → local; *reframing* detected at level 1 → replacement/rewrite. (Fine impact
+  mechanism — a semantic signature per branch to decide local vs. global — is **[FUTURE — implementation]**.)
+- **Self-improvement built into the propositive layer (dispenses with "Synthesis"):** dim. 3 **reads the
+  previous version of the document and improves it** — refining IS the propositive analysis. So there's **no
+  separate consolidation mechanism**: the risk Kimi raised (the living document bloats/repeats/contradicts)
+  resolves by construction, inside level 3 itself, every cycle.
+- **AI graph in confrontation — exclusive to the propositive layer (owner's decision):** at dim. 3 the final
+  artifact **need not come from a single AI**. The operator builds an **inference graph** in ValHalla: nodes =
+  available AIs (pluggable providers — Bedrock, Kimi, Codex, local…), edges = **who confronts / feeds whom**,
+  in **N levels** of confrontation until *"the artifact that generates the final artifact"*. It's the Side AI
+  pattern (generator × critic × arbiter) **institutionalized inside Nidhogg**. The graph's intermediate
+  artifacts are **input**; only the root node emits the versioned `LivingDocument`.
+  - **Only valid for dim. 3.** Dims 1 and 2 use **direct AI** (1 call per extraction) — multi-AI confrontation
+    is a cost only the propositive layer justifies.
+  - The **provider** here stops being "pick 1 model" and becomes "orchestrate several in a confrontation DAG"
+    (pluggable: Bedrock, model choice, round-robin). Graph config in `nidhogg.cfg`/ValHalla. **[FUTURE]**
 
-### 5.5 Ciclo do worker, arquivos e resumabilidade [FUTURO]
+### 5.5 Worker cycle, files and resumability [FUTURE]
 
-**Layout por coleção** (em `dir/`), append-only para ser resumível:
+**Per-collection layout** (in `dir/`), append-only to be resumable:
 
 ```
 <dir>/
-  <coll>.knowledge.jsonl    # 1 item de conhecimento por linha (escrita atômica, append)
-  <coll>.checkpoint.json    # { base_name: state_hash } + última base processada
-  <coll>.provenance.jsonl   # 1 digestão por linha
+  <coll>.knowledge.jsonl    # 1 knowledge item per line (atomic write, append)
+  <coll>.checkpoint.json    # { base_name: state_hash } + last base processed
+  <coll>.provenance.jsonl   # 1 digestion per line
   <coll>.config.json        # { enabled, level, cadence_s, last_run, accept_gate:[⊆{1,2}] }
 ```
 
-**Pseudo-fluxo de um ciclo** (sintetizado com Kimi):
+**Pseudo-flow of one cycle** (synthesized with Kimi):
 
 ```
-para cada coleção HABILITADA:
-  bases_atuais = GET /bases?collection=coll
-  diff = compara(checkpoint_anterior, state_hash(bases_atuais))   # novas/alteradas/removidas
+for each ENABLED collection:
+  current_bases = GET /bases?collection=coll
+  diff = compare(previous_checkpoint, state_hash(current_bases))   # new/changed/removed
   digestion_id = uuid()
-  nivel_topo = config[coll].level                       # dial = nível-topo (0..3)
-  nível 0 (sempre): RootIndex + CorpusDict + CacheDigest da coleção → append no .jsonl
-  para cada base ALTERADA: atualiza checkpoint[base] = state_hash
-  # níveis IA em sequência ESTRITA, sempre por coleção/obra (nunca cross-coleção).
-  # gate é POR DIMENSÃO: o nível N só roda se o N-1 não tem gate, ou sua versão está accepted:
-  liberado(N) = ((N-1) not in accept_gate) or (versao_atual(N-1).status == "accepted")
-  se nivel_topo >= 1 e liberado(1): Summary dos chunks NOVOS → nova version → append (pending|accepted)
-  se nivel_topo >= 2 e liberado(2): KnowledgeTree da obra ← Summary (re-deriva o galho) → version → append
-  se nivel_topo >= 3 e liberado(3): LivingDocument (anexa delta) + Gap/Suggestion
-                                    ← KnowledgeTree + Summary + versão anterior → version → append
-  grava provenance(digestion_id, inputs=bases_alteradas)
-  recomputa saturation ; marca órfãos (bases removidas)
+  top_level = config[coll].level                        # dial = top level (0..3)
+  level 0 (always): RootIndex + CorpusDict + CacheDigest of the collection → append to .jsonl
+  for each CHANGED base: update checkpoint[base] = state_hash
+  # AI levels in STRICT sequence, always per collection/work (never cross-collection).
+  # the gate is PER DIMENSION: level N only runs if N-1 has no gate, or its version is accepted:
+  released(N) = ((N-1) not in accept_gate) or (current_version(N-1).status == "accepted")
+  if top_level >= 1 and released(1): Summary of NEW chunks → new version → append (pending|accepted)
+  if top_level >= 2 and released(2): KnowledgeTree of the work ← Summary (re-derives the branch) → version → append
+  if top_level >= 3 and released(3): LivingDocument (appends delta) + Gap/Suggestion
+                                     ← KnowledgeTree + Summary + previous version → version → append
+  write provenance(digestion_id, inputs=changed_bases)
+  recompute saturation ; mark orphans (removed bases)
 ```
 
-**Resumabilidade:** se a IA falha no meio, o `.jsonl` já gravado é válido (append atômico) e o
-`checkpoint` aponta a última base concluída → o próximo ciclo **retoma** dali. Nunca append cego:
-dedup por `digestion_id`/`derived_from`. O `<coll>.knowledge.json` consolidado (§5.6) é uma **view**
-do `.jsonl`+checkpoint (ou o `.jsonl` vira o canônico e o `.json` é gerado). **[decisão de implementação]**
+**Resumability:** if the AI fails midway, the already-written `.jsonl` is valid (atomic append) and the
+`checkpoint` points to the last completed base → the next cycle **resumes** from there. Never a blind append:
+dedup by `digestion_id`/`derived_from`. The consolidated `<coll>.knowledge.json` (§5.6) is a **view** of the
+`.jsonl`+checkpoint (or the `.jsonl` becomes canonical and the `.json` is generated). **[implementation decision]**
 
-### 5.6 Schema do conhecimento consolidado — `<dir>/<coll>.knowledge.json`
+### 5.6 Consolidated knowledge schema — `<dir>/<coll>.knowledge.json`
 
-Um arquivo **por coleção** (hoje: `{collection, enabled, source_hash, saturation, updated, provenance,
-knowledge[]}`). Forma-alvo:
+One file **per collection** (today: `{collection, enabled, source_hash, saturation, updated, provenance,
+knowledge[]}`). Target shape:
 
 ```jsonc
 {
-  "collection": "minha_colecao",
+  "collection": "my_collection",
   "enabled": true,
-  "source_hash": "sha256 do estado da coleção na última digestão",
-  "saturation": 0.0,                 // 0..1 — fração do conhecimento ainda verificável (ver 5.4)
+  "source_hash": "sha256 of the collection's state at the last digestion",
+  "saturation": 0.0,                 // 0..1 — fraction of the knowledge still verifiable (see 5.4)
   "updated": "ISO8601",
-  "provenance": [                    // rastreabilidade: de onde veio CADA digestão
+  "provenance": [                    // traceability: where EACH digestion came from
     { "digestion_id":"uuid", "ts":"ISO8601", "source_hash":"sha256", "level":1,
-      "inputs":["collection:minha_colecao"], "model":"kimi-for-coding|null", "tokens_in":0, "tokens_out":0 }
+      "inputs":["collection:my_collection"], "model":"kimi-for-coding|null", "tokens_in":0, "tokens_out":0 }
   ],
-  "knowledge": [                     // os itens destilados
+  "knowledge": [                     // the distilled items
     { "type":"RootIndex|CorpusDict|CacheDigest|Summary|KnowledgeTree|LivingDocument|Gap|Suggestion",
       "level":1, "version":1, "created":"ISO8601", "content":{}, "confidence":0.0,
-      "derived_from":["digestion_id"], "frozen":false,   // frozen=true quando a fonte morre/muda
-      "status":"pending|accepted" }   // gate de aceite (§5.4): pending bloqueia o nível seguinte se accept_gate=on
+      "derived_from":["digestion_id"], "frozen":false,   // frozen=true when the source dies/changes
+      "status":"pending|accepted" }   // acceptance gate (§5.4): pending blocks the next level if accept_gate=on
   ]
 }
 ```
 
-### 5.7 Saturation, provenance, sobrevivência à deleção
+### 5.7 Saturation, provenance, surviving deletion
 
-- **`source_hash` (hash, não nome):** cada item de conhecimento aponta pra um hash do estado da fonte.
-  Renomear/deletar a coleção **não invalida** o que já foi destilado; só marca que a fonte mudou.
-- **`saturation` = (itens ainda verificáveis contra uma fonte viva) / (total de itens).** `→1.0` tudo
-  ancorado; `<0.5` alerta de muito conhecimento **órfão**. Decai naturalmente se coleções somem.
-- **Fonte morta → artefato CONGELADO (decisão Pacman):** quando a fonte some/muda, o destilado **nunca
-  é apagado** — sobreviver à deleção é a *feature*. Vira `frozen:true` com **selo de frescor** (fonte
-  **viva** / **alterada** desde X / **congelada** em X) pro leitor humano saber o estado. `saturation`
-  é só esse **indicador de frescor**, **nunca** gatilho de poda.
-- **Invariante:** nenhum item de nível ≥1 é gerado sem `provenance` (digestion_id + source_hash + modelo).
-- **Cadência ≠ saturação:** worm não re-mastiga coleção saturada (`source_hash` igual ao último) — economiza IA.
+- **`source_hash` (hash, not name):** each knowledge item points to a hash of the source's state. Renaming/
+  deleting the collection **does not invalidate** what was already distilled; it only marks that the source changed.
+- **`saturation` = (items still verifiable against a live source) / (total items).** `→1.0` everything
+  anchored; `<0.5` a warning of too much **orphaned** knowledge. It naturally decays if collections disappear.
+- **Dead source → FROZEN artifact (owner's decision):** when the source disappears/changes, the distillate is
+  **never deleted** — surviving deletion is the *feature*. It becomes `frozen:true` with a **freshness seal**
+  (source **alive** / **changed** since X / **frozen** at X) so the human reader knows the state. `saturation`
+  is just this **freshness indicator**, **never** a pruning trigger.
+- **Invariant:** no level ≥1 item is generated without `provenance` (digestion_id + source_hash + model).
+- **Cadence ≠ saturation:** the worm doesn't re-chew a saturated collection (`source_hash` equal to the last one) — saves AI.
 
-### 5.8 API do módulo
+### 5.8 Module API
 
-> Contrato detalhado em **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--inteligência-11497-parcial)**.
+> Detailed contract in **[`JSONCONTRACT.md`](JSONCONTRACT.md)** *(currently in Portuguese)*.
 
-**[FEITO]** `GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
-`GET /api/nidhogg/collections` (coleções + estado de digestão) · `POST /api/nidhogg`
+**[DONE]** `GET /health` · `GET /api/nidhogg` (status: level, cadence, ragd keepalive, knowledge) ·
+`GET /api/nidhogg/collections` (collections + digestion state) · `POST /api/nidhogg`
 (`{on, level, cadence}`) · `POST /api/nidhogg/collection` (`{collection, enabled}`) ·
-`POST /api/nidhogg/run` (dispara ciclo — **stub**).
+`POST /api/nidhogg/run` (triggers a cycle — **stub**).
 
-**[FUTURO]** `GET /api/nidhogg/knowledge?collection=&type=&level=` (consumo do saber destilado — §5.2) ·
-`POST /api/nidhogg/accept` (`{collection, type, level, version}` → marca `status:accepted`, libera o
-nível seguinte quando `accept_gate=on` — §5.4).
+**[FUTURE]** `GET /api/nidhogg/knowledge?collection=&type=&level=` (consumption of the distilled insight — §5.2) ·
+`POST /api/nidhogg/accept` (`{collection, type, level, version}` → marks `status:accepted`, releases the next
+level when `accept_gate=on` — §5.4).
 
-### 5.9 Questões em aberto (pauta das próximas rodadas Side AI)
+### 5.9 Open questions (agenda for the next Side AI rounds)
 
-> Seção **viva**: registra só o que **ainda não foi decidido**. Quando uma questão fecha, ela **sai daqui
-> e vira decisão no corpo** — não fica como "risco resolvido" (seria redundante). Os riscos dos ciclos
-> 1–4 (solução-procurando-problema, órfão/stale, custo, framing) foram resolvidos e moram hoje em §5.1
-> (off/opt-in), §5.2 (autonomia/consumidor humano), §5.4 (hierarquia, gate, grafo, orçamento, prompt por
-> nível) e §5.7 (sobrevivência por congelamento).
+> A **live** section: records only what's **not yet decided**. When a question closes, it **leaves here and
+> becomes a decision in the body** — it doesn't stay as a "resolved risk" (that would be redundant). The risks
+> from cycles 1–4 (solution-looking-for-a-problem, orphan/stale, cost, framing) were resolved and now live in
+> §5.1 (off/opt-in), §5.2 (autonomy/human consumer), §5.4 (hierarchy, gate, graph, budget, per-level prompt)
+> and §5.7 (survival by freezing).
 
-- **Impacto semântico da cascata-delta** — quando uma fonte muda, decidir entre re-derivar *só o galho* ou
-  *reescrever* hoje é heurística por *reframing* (§5.4). O mecanismo fino (assinatura semântica por galho
-  pra medir propagação) é **[FUTURO — implementação]**.
-- *(próximas rodadas Side AI registram aqui o que surgir.)*
+- **Semantic impact of the delta cascade** — when a source changes, deciding between re-deriving *just the
+  branch* or *rewriting* is, today, a heuristic by *reframing* (§5.4). The fine mechanism (a semantic
+  signature per branch to measure propagation) is **[FUTURE — implementation]**.
+- *(the next Side AI rounds record here whatever comes up.)*
 
 ---
 
-## 6. Estratégias transversais & roadmap maior
+## 6. Cross-cutting strategies & bigger roadmap
 
-- **Repo como base (não 1-arquivo-por-base) [FUTURO]:** schema de chunk ganha `file` + linhas; `meta`
-  ganha mapa de arquivos com `sha`; `POST /ingest_file {base, file}` recomputa só aquele arquivo
-  (remove os chunks antigos do `file`, insere os novos, atualiza `sha`); `POST /sync {base, path}` varre
-  e atualiza só o que mudou. É o coração do "RAG de código com update por arquivo".
-- **Ingestores acionados pela IA do usuário [FUTURO]:** o agente dispara ingestão (repo, diff de git,
-  arquivos específicos) via MCP / CLIs.
-- **Importadores [FUTURO]:** PDF/DOCX/XLSX (extração no cliente vs sidecar no servidor).
-- **Build Windows [FUTURO]:** Rust puro deve compilar; cuidar `/dev/urandom` (entropia Windows) e
+- **Repo as a base (not 1-file-per-base) [FUTURE]:** the chunk schema gains `file` + lines; `meta` gains a
+  file map with `sha`; `POST /ingest_file {base, file}` recomputes only that file (removes the file's old
+  chunks, inserts the new ones, updates `sha`); `POST /sync {base, path}` scans and updates only what changed.
+  It's the heart of "code RAG with per-file update".
+- **Ingestors triggered by the user's AI [FUTURE]:** the agent triggers ingestion (repo, git diff, specific
+  files) via MCP / CLIs.
+- **Importers [FUTURE]:** PDF/DOCX/XLSX (client-side extraction vs server-side sidecar).
+- **Windows build [FUTURE]:** pure Rust should compile; mind `/dev/urandom` (Windows entropy) and the
   `log_file` default.
-- **Deploy [FEITO]:** cross-compile (`cargo zigbuild --target {x86_64,aarch64}-unknown-linux-gnu.2.31`)
-  + rsync do binário + launcher que sobe `ragd` + `nidhoggd` detached e redireciona stdout pro `log_file`.
-- **Segurança [PARCIAL]:** trocar `admin/admin`; chaves só no `cfg` (gitignored); CORS aberto na 11497
-  (rever ao expor); sessão do console com TTL (rotacionar cookie — [FUTURO]).
+- **Deploy [DONE]:** cross-compile (`cargo zigbuild --target {x86_64,aarch64}-unknown-linux-gnu.2.31`) +
+  rsync the binary + a launcher that brings up `ragd` + `nidhoggd` detached and redirects stdout to `log_file`.
+- **Security [PARTIAL]:** change `admin/admin`; keys only in `cfg` (gitignored); CORS open on 11497 (revisit
+  when exposing); console session with TTL (rotate cookie — [FUTURE]).
 
 ---
 
-## 7. Apêndice — modos de falha
+## 7. Appendix — failure modes
 
-**Óbvios:** JSON de base corrompido (gravar `.bak` antes do overwrite, validar no load) · OOM (usar
-`hybrid`, [FUTURO] tetos de bases/chunks) · IA fora (níveis ≥1 degradam pro nível 0) · ragd fora (o
-keepalive do Nidhogg degrada gracioso, status do cache).
+**Obvious:** corrupted base JSON (write a `.bak` before overwrite, validate on load) · OOM (use `hybrid`,
+[FUTURE] base/chunk caps) · AI down (levels ≥1 degrade to level 0) · ragd down (Nidhogg's keepalive degrades
+gracefully, cached status).
 
-**Não-óbvios (Kimi/Codex):** silabificação divergente entre ingestão e busca (mesmo driver/vocab é
-obrigatório — append herda o driver da base) · starvation de writers no RwLock (usar lock justo) ·
-`source_hash` falso-positivo em rename (re-link manual [FUTURO]) · rerank lento em `hybrid` (aceitável;
-medir) · `knowledge.json` crescendo sem fim (compactar provenance [FUTURO]) · nível 3 alucinando furos
-inexistentes (confidence + auditoria humana).
+**Non-obvious (Kimi/Codex):** divergent syllabification between ingestion and search (same driver/vocab is
+mandatory — append inherits the base's driver) · writer starvation in the RwLock (use a fair lock) ·
+`source_hash` false positive on rename (manual re-link [FUTURE]) · slow rerank in `hybrid` (acceptable;
+measure) · `knowledge.json` growing unbounded (compact provenance [FUTURE]) · level 3 hallucinating
+nonexistent gaps (confidence + human audit).
 
 ---
 
-## 8. Decisões pendentes (gatilho → ação)
+## 8. Pending decisions (trigger → action)
 
-| decisão | gatilho | opções |
+| decision | trigger | options |
 |---|---|---|
-| mmap/on-disk | corpus > ~80% RAM | binário estruturado vs LMDB; **opt-in por build** |
-| `RwLock` + paralelismo inter-query | latência sob carga concorrente real | RwLock; depois lock por coleção |
-| base = repo (N arquivos) | usar como RAG de código a sério | `file`+`sha` no schema; `/sync` |
-| podar sinônimos idf-baixo no expand | expansão poluindo lookup | filtro por idf na cascata |
-| Nidhogg níveis 1–3 (IA) | decisão do dono (orçamento + cadência) | começa no nível 0; sobe por roadmap, gated por budget+disclaimer (§5.2/§5.4) — **não** por "esperar consumidor" |
+| mmap/on-disk | corpus > ~80% RAM | structured binary vs LMDB; **opt-in by build** |
+| `RwLock` + inter-query parallelism | latency under real concurrent load | RwLock; then per-collection lock |
+| base = repo (N files) | use it as a serious code RAG | `file`+`sha` in the schema; `/sync` |
+| prune low-idf synonyms in expand | expansion polluting lookup | idf filter in the cascade |
+| Nidhogg levels 1–3 (AI) | owner's decision (budget + cadence) | start at level 0; rise per roadmap, gated by budget+disclaimer (§5.2/§5.4) — **not** by "waiting for a consumer" |
 
 ---
 
-> *Documento vivo — incrementar a cada ciclo. Síntese curada a partir de contraposição Kimi (gerador)
-> × Codex (crítico), com o leme mantido na missão: simples, inspecionável, roda em qualquer lugar.*
+> *Living document — increment each cycle. Curated synthesis from the Kimi (generator) × Codex (critic)
+> counterpoint, keeping the helm on the mission: simple, inspectable, runs anywhere.*

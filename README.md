@@ -1,8 +1,7 @@
 > 🌐 **Language.** This is the English version · 🇧🇷 Versão em português: **[README.pt-BR.md](README.pt-BR.md)**
 >
-> 📖 **Docs note.** This README is in English. The rest of the project — `ARCHITECTURE.md`, `JSONCONTRACT.md`,
-> in-code comments and the didactic `logic_path/` track — is currently in **Portuguese (pt-BR)**. An English
-> translation is planned.
+> 📖 **Docs note.** `README.md` and `ARCHITECTURE.md` are available in English. `JSONCONTRACT.md`, in-code
+> comments and the didactic `logic_path/` track are still in **Portuguese (pt-BR)** — English translation planned.
 
 # 🪨 RAGnaRock
 
@@ -65,7 +64,7 @@ The same library (`sylkit`) exists in three incarnations that produce **field-by
 | `logic_path/`     | Didactic track **00 → 10** (frozen memorial) teaching every RAG principle. | ✅ done |
 
 > 📐 **Full specification** (the three daemons in detail, JSON contracts, memory/disk strategies,
-> concurrency, failure modes and roadmap): **[`ARCHITECTURE.md`](ARCHITECTURE.md)** *(in Portuguese)*.
+> concurrency, failure modes and roadmap): **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
 
 ---
 
@@ -80,8 +79,7 @@ that **survives the deletion of the collection**. It's the project's **analytica
 > **Status: 🚧 partial.** Skeleton ready (separate process on port **11497**, API, level/cadence dials);
 > the per-level intelligence (1–3, **opt-in** and AI-powered) is under development. The full design
 > (level hierarchy, versioned artifacts, acceptance gate, AI graph, per-level prompt and open questions)
-> lives in [`ARCHITECTURE.md` §5](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial)
-> *(in Portuguese)*.
+> lives in [`ARCHITECTURE.md` §5](ARCHITECTURE.md#5-nidhoggd--níðhöggr--intelligence-layer-11497-partial).
 
 ---
 

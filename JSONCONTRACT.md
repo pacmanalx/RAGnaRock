@@ -163,7 +163,7 @@ responde (status, config, controle por coleção); a **inteligência** (níveis 
 | POST | `/api/nidhogg/accept` | `{collection, type, level, version}` | `{ok, status:"accepted"}` — marca o artefato como aceito e libera o nível seguinte quando `accept_gate` o exige |
 
 > Schema do item de conhecimento e estados (`pending|accepted`, `frozen`, `version`): ver
-> [`ARCHITECTURE.md` §5.6](ARCHITECTURE.md#56-schema-do-conhecimento-consolidado--dircollknowledgejson).
+> [`ARCHITECTURE.pt-BR.md` §5.6](ARCHITECTURE.pt-BR.md#56-schema-do-conhecimento-consolidado--dircollknowledgejson).
 
 ---
 
