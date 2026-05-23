@@ -75,6 +75,26 @@ Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<na
 - **`words`** (sílabas por palavra) não é serializado: é derivável de `text` e cacheado em RAM no modo
   `memory`; no modo `hybrid` é recomputado sob demanda no rerank. [FEITO]
 
+### 2.1 Silabificação — o algoritmo do token [FEITO]
+
+O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em `ragd/src/tokenizer.rs`
+(`syllabify`, `syllable_seq`, `normalize`). Regras efetivas:
+
+- **Vogais/semivogais:** vogais `a e i o u` (+ acentuadas); fracas `i u` formam **ditongo**; `í ú`
+  acentuados **quebram** o ditongo (forçam hiato).
+- **Núcleos:** vogal forte + forte → **hiato** (separa: "co-a-lha"); fraca + forte ou inverso → **ditongo**
+  (junta: "pou-so", "coi-sa").
+- **Onsets:** dígrafos `ch lh nh` = **um** som; `qu`/`gu` + vogal alta → `u` mudo; encontros muta+líquida
+  (`bl br cl cr dl dr fl fr gl gr pl pr tl tr vl vr`) ficam juntos no onset.
+- **Coda × onset:** consoante isolada entre núcleos vira coda da anterior + onset da próxima; em grupo, as
+  **2 últimas** vão pro onset seguinte **se** formam encontro válido, senão só a última.
+- **Normalização = chave canônica:** minúsculas → Unicode NFD → remove diacríticos. "Narnia"→"narnia",
+  "Élrond"→"elrond" — acento **não** cria dimensão distinta.
+
+> As PoCs `python_concept/` e `rust_concept/` são **referência congelada** (validação histórica); a spec
+> viva é a do `ragd`. **[FUTURO]** casos-de-ouro (palavras com silabação consensual) pra blindar o
+> silabador contra regressão.
+
 ---
 
 ## 3. `ragd` — o daemon de produção
@@ -115,6 +135,12 @@ Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<na
 2. **Rerank (matched filter fonético por proximidade):** sobre os candidatos, mede a **menor janela**
    que cobre um casamento de cada palavra da query (proximidade), **ignorando monossílabos** (stopwords),
    com soundex opcional (`phonetic`). Score combina cobertura + proximidade. Devolve top-`k`.
+
+- **Fonética do rerank (SOUNDEX — `ragd/src/rag.rs`):** com `phonetic:true`, dois termos casam quando têm
+  o **mesmo código SOUNDEX** (consoantes mapeadas 1–6; vogais/`h`/`w` = 0; retenção clássica em `h`/`w`;
+  truncado a 4). Aplicado **só a termos de ≤3 sílabas** (nomes/grafias variantes: `"Aslan"`→`"Aslam"`);
+  termos longos discriminam pela própria sequência silábica (evita falso casamento `ressurreição`~`rigorosa`).
+  Calculado **1× por query** (não por candidato). É feature **do `ragd`** — não existe nas PoCs congeladas.
 
 - **Scatter-gather:** `/search` resolve o escopo (`collection` + wildcard em `base`: `"sda"`, `"sd*"`,
   `"*"`), busca em cada base que casa (paraleliza com rayon quando há >1 base) e faz **merge por matchpoint**.
@@ -159,6 +185,10 @@ Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<na
   Throughput medido: ~500 req/s num Mac M-series, ~65 num x86 de 2 cores, ~43 num Raspberry Pi 3 (busca global). [FEITO]
 - **Por que basta hoje:** o uso principal é **UMA IA, sequencial** — não há contenção real. Mutex
   funciona bem até dezenas de req/s concorrentes.
+  - ⚠️ **Nota (Kimi):** o `rayon` paraleliza o scatter-gather, mas o `Mutex` global **re-serializa**
+    internamente — o ganho real de paralelismo só vem com o `RwLock`/lock-por-coleção abaixo. É
+    otimização **[FUTURO]** de **mesma prioridade** que a leitura on-disk no `hybrid`; não urgente com 1
+    IA sequencial.
 - **`[FUTURO]` quando virar multi-agente:**
   - `Mutex<State>` → **`RwLock<State>`**: N **buscas read-only** em paralelo; `write()` só em
     ingest/delete. (Ressalva do Codex: o rerank em `hybrid` recomputa `words` — mas isso é leitura pura,
@@ -176,6 +206,9 @@ Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<na
   driver/linguagem.
 
 ### 3.7 Contrato HTTP — rotas
+
+> 📐 **Contrato detalhado** (request/response de cada rota dos 3 daemons): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
+> Exemplos executáveis `curl -d @`: `ragd/json_samples/`. Abaixo, o resumo das rotas.
 
 **Implementadas [FEITO]:**
 
@@ -319,6 +352,10 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
   **tokens/ciclo** para os níveis IA. Nasce **OFF**, opt-in por coleção (§5.1), nível 0 cobre o sem-IA, e
   **sem teto de gasto por default** — escolha consciente, com **disclaimer obrigatório ao ligar** (§4). O
   grafo de IAs (dim. 3) multiplica o consumo (N IAs × N níveis) — é a camada $$$ por excelência.
+- **Rate-limit = a própria configuração das dimensões (decisão Pacman):** não há rate-limiter à parte. O
+  dono define **quando cada dimensão dispara dentro do ciclo** (ex.: nível 1 a cada ciclo, nível 3 a cada
+  N ciclos) — *isso já é* o controle de vazão/custo. Soma-se a isso o teto opcional de tokens/ciclo. Assim,
+  "consumir muita IA" vira uma escolha explícita na config, não um acidente.
 - **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
 - **Ordem HIERÁRQUICA (1→2→3):** os níveis IA acontecem **em sequência** — não há nível 2 sem o 1, nem 3
   sem o 2 (a dimensão do conhecimento é hierárquica por natureza). O **dial seleciona o nível-topo**; o
@@ -455,6 +492,8 @@ knowledge[]}`). Forma-alvo:
 
 ### 5.8 API do módulo
 
+> Contrato detalhado em **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--inteligência-11497-parcial)**.
+
 **[FEITO]** `GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
 `GET /api/nidhogg/collections` (coleções + estado de digestão) · `POST /api/nidhogg`
 (`{on, level, cadence}`) · `POST /api/nidhogg/collection` (`{collection, enabled}`) ·
@@ -519,7 +558,7 @@ inexistentes (confidence + auditoria humana).
 | `RwLock` + paralelismo inter-query | latência sob carga concorrente real | RwLock; depois lock por coleção |
 | base = repo (N arquivos) | usar como RAG de código a sério | `file`+`sha` no schema; `/sync` |
 | podar sinônimos idf-baixo no expand | expansão poluindo lookup | filtro por idf na cascata |
-| Nidhogg níveis 1–3 | existir consumidor que audita | começar nível 0; subir provando valor |
+| Nidhogg níveis 1–3 (IA) | decisão do dono (orçamento + cadência) | começa no nível 0; sobe por roadmap, gated por budget+disclaimer (§5.2/§5.4) — **não** por "esperar consumidor" |
 
 ---
 

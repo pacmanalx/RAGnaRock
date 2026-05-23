@@ -47,17 +47,17 @@ Tudo é texto legível: você consegue abrir o JSON de uma base e entender exata
 
 A mesma lib (`sylkit`) existe em três encarnações que produzem **resultados idênticos** campo a campo:
 
-| Componente | O que é |
-|---|---|
-| `python_concept/` | PoC de referência em Python (só stdlib) — a "verdade" do algoritmo. |
-| `rust_concept/`   | Porte Rust **congelado**, validado idêntico ao Python (serve de teste). |
-| `ragd/`           | **Daemon de produção** (Rust): segura N bases em memória, busca/ingestão via **API HTTP JSON**. É onde o desenvolvimento acontece. |
-| **ValHalla**      | Console web do `ragd` (visão, busca, ingestão, performance, drivers, logs). |
-| `nidhoggd/`       | **Níðhöggr** — camada de **inteligência** (experimental): o *worm* que digere o conhecimento. Ver seção abaixo. |
-| **MCP**           | Casca que pluga o RAGnaRock como ferramenta em agentes de IA (opencode, Claude, etc.). |
-| `drivers/`        | Drivers de linguagem — tokenizam **código-fonte** (sílabas + keywords por linguagem). |
-| `thesaurus/`      | Dicionários multilíngue + cross-lingual (para a query expansion). |
-| `logic_path/`     | Trilha didática **00 → 10** (memorial congelado) que ensina cada princípio de RAG. |
+| Componente | O que é | Estado |
+|---|---|---|
+| `python_concept/` | PoC de referência em Python (só stdlib) — a "verdade" do algoritmo. | ✅ feito |
+| `rust_concept/`   | Porte Rust **congelado**, validado idêntico ao Python (serve de teste). | ✅ feito |
+| `ragd/`           | **Daemon de produção** (Rust): segura N bases em memória, busca/ingestão via **API HTTP JSON**. É onde o desenvolvimento acontece. | ✅ feito |
+| **ValHalla**      | Console web do `ragd` (visão, busca, ingestão, performance, drivers, logs). | ✅ feito |
+| `nidhoggd/`       | **Níðhöggr** — camada de **inteligência** (experimental): o *worm* que digere o conhecimento. Ver seção abaixo. | 🚧 parcial |
+| **MCP**           | Casca que pluga o RAGnaRock como ferramenta em agentes de IA (opencode, Claude, etc.). | 🚧 parcial |
+| `drivers/`        | Drivers de linguagem — tokenizam **código-fonte** (sílabas + keywords por linguagem). | ✅ feito |
+| `thesaurus/`      | Dicionários multilíngue + cross-lingual (para a query expansion). | ✅ feito |
+| `logic_path/`     | Trilha didática **00 → 10** (memorial congelado) que ensina cada princípio de RAG. | ✅ feito |
 
 > 📐 **Especificação completa** (os três daemons em detalhe, contratos JSON, estratégias de memória/disco,
 > concorrência, modos de falha e roadmap): **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
@@ -68,26 +68,14 @@ A mesma lib (`sylkit`) existe em três encarnações que produzem **resultados i
 
 No mito nórdico, **Níðhöggr** é a serpente que rói as raízes de Yggdrasil. No RAGnaRock, o `nidhoggd`
 é um *worm* (do bem) que **digere o conhecimento** das coleções e o destila num saber que **sobrevive
-à deleção da coleção** — fechando a mitologia: *Ragnarök* (o RAG) tem seu próprio Níðhöggr.
+à deleção da coleção**. É a **camada analítica** do projeto: **autônoma** (o `ragd` nunca a consome; o
+leitor é o humano), com quatro níveis — do índice **sem IA** (nível 0, o RAG se auto-organiza) ao
+**documento vivo** propositivo (nível 3, com IA).
 
-É a **camada analítica** do projeto, e é **autônoma** — o `ragd` **nunca** a consome; o leitor é o
-**humano** (via ValHalla/export). Processo separado (porta **11497**) que lê o corpus **sempre pela API
-do `ragd`** (nunca do disco). Nasce **desligado**, liga **por coleção**, com dois "dials": **nível**
-(profundidade) e **cadência** (de quanto em quanto tempo mastiga).
-
-**Quatro níveis** (os de IA rodam em ordem, 1→2→3):
-
-| nível | IA? | o que destila |
-|---|---|---|
-| **0 · burro** | não | índice de raízes + dicionário do corpus + digestão do cache: o RAG **se auto-organiza** sobre as próprias coleções. Custo zero |
-| **1 · consciente** | sim | resumo/insights por coleção |
-| **2 · estrutural** | sim | **árvore de conhecimento** / mapa mental da obra |
-| **3 · propositivo** | sim | **documento vivo** que aprofunda no tempo + furos e sugestões |
-
-> **Estado:** esqueleto pronto (API, keepalive, estrutura de conhecimento, os 4 níveis e os dials); a
-> inteligência por nível está em desenvolvimento. Nível 0 (sem IA) é o caminho seguro; níveis 1–3 (com IA)
-> são **opt-in e experimentais**. O desenho completo (artefatos versionados que sobrevivem à deleção,
-> gate de aceite, grafo de IAs, prompt por nível e as questões em aberto) está em
+> **Estado: 🚧 parcial.** Esqueleto pronto (processo separado na porta **11497**, API, dials de nível e
+> cadência); a inteligência por nível (1–3, **opt-in** e com IA) está em desenvolvimento. O desenho
+> completo (hierarquia dos níveis, artefatos versionados, gate de aceite, grafo de IAs, prompt por nível
+> e questões em aberto) está em
 > [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
@@ -125,7 +113,8 @@ python3 python_concept/search_rag.py meu_corpus-tokenized.json "minha consulta" 
 - Cada hit traz `collection, base, corpus` (nome do arquivo), `path`, `chunk`, `matchpoint`,
   `snippet`, etc. — então a IA vai **direto no arquivo**.
 
-Contrato completo + exemplos: **[`ragd/README.md`](ragd/README.md)** e `ragd/json_samples/`.
+Contrato formal das 3 APIs (ragd, ValHalla, nidhoggd): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
+Exemplos executáveis `curl`: **[`ragd/json_samples/`](ragd/json_samples/)**.
 
 ---
 
