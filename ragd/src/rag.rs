@@ -472,6 +472,13 @@ pub struct CollectionProfile {
     pub uidf: HashMap<usize, f64>,           // dim global → idf unificado (coleção)
     pub remap: HashMap<String, Vec<usize>>,  // base_name → (dim local → dim global)
     pub unorms: HashMap<String, Vec<f64>>,   // base_name → norma tf-idf unificada por chunk
+    pub fingerprint: (usize, usize),         // (nº bases, total chunks) — auto-invalida o cache
+}
+
+/// Fingerprint barato da coleção pra auto-invalidar o cache do perfil sem rastrear mutação:
+/// (nº de bases, total de chunks). Muda quando uma base entra/sai/é re-ingerida com tamanho diferente.
+pub fn collection_fingerprint(bases: &HashMap<String, RagBase>) -> (usize, usize) {
+    (bases.len(), bases.values().map(|b| b.chunks.len()).sum())
 }
 
 /// Constrói o perfil unificado das bases de uma coleção. Determinístico: ordena bases
@@ -517,7 +524,8 @@ pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionP
         let norms = bt.iter().map(|tf| crate::vector::tfidf_norm(tf, &uidf)).collect();
         unorms.insert(name.clone(), norms);
     }
-    CollectionProfile { uvocab, uidf, remap, unorms }
+    let fingerprint = collection_fingerprint(bases);
+    CollectionProfile { uvocab, uidf, remap, unorms, fingerprint }
 }
 
 /// Vetoriza a query no espaço unificado da coleção (mesmo esquema do query_vec: tf*idf).

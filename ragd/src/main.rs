@@ -61,6 +61,7 @@ struct State {
     word_syn: HashMap<String, Vec<String>>,   // palavra -> sinônimos (união dos dicionários ATIVOS)
     nidhogg_url: String,        // URL do daemon de módulos (nidhoggd:11497) — só pro proxy do console
     sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via SESSION_TTL)
+    collection_profiles: HashMap<String, rag::CollectionProfile>, // [#8] cache do perfil unificado por coleção (lazy; auto-invalida por fingerprint)
 }
 
 /// Configuração do daemon. Vem de ragnarock.cfg (chave = valor) e/ou CLI (CLI vence).
@@ -437,6 +438,7 @@ fn main() {
             m
         },
         nidhogg_url: cfg.nidhogg_url.clone(),
+        collection_profiles: HashMap::new(),
         sessions: HashMap::new(),
     }));
 
@@ -586,7 +588,8 @@ fn histogram(body: &str, bases: &Bases) -> (u16, String) {
     let query = match v["query"].as_str() {
         Some(q) => q, None => return (400, json!({"error": "falta 'query'"}).to_string()),
     };
-    let (code, sres) = search(body, bases);
+    let mut tmp_profiles = HashMap::new();   // histograma é visualização pontual; não usa cache unificado
+    let (code, sres) = search(body, bases, &mut tmp_profiles);
     if code != 200 { return (code, sres); }
     let sv: Value = serde_json::from_str(&sres).unwrap_or_else(|_| json!({}));
     let top = match sv["hits"].as_array().and_then(|h| h.first()) {
@@ -929,7 +932,7 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
         qb.insert("query".into(), json!(q));
         qb.insert("k".into(), json!(k));
         qb.insert("phonetic".into(), json!(phon));
-        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases);
+        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &mut st.collection_profiles);
         if code != 200 { slog(&format!("   │  ├ {} {q:?} → erro {code}", if qi == 0 { "orig" } else { "var " })); continue; }
         let rv: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
         let nh = rv["hits"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -1246,7 +1249,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
             (Method::Get,  "/api/thesaurus")   => list_dicts(&query, &st.thesaurus_dir),
             (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
             (Method::Post, "/api/ingest_upload") => ingest_upload(&query, &headers, &body, &mut *st),
-            (Method::Post, "/api/search")     => search(&body_str, &st.bases),
+            (Method::Post, "/api/search")     => { let s = &mut *st; search(&body_str, &s.bases, &mut s.collection_profiles) },
             (Method::Post, "/api/search_expand") => search_expand(&body_str, &mut *st),
             (Method::Post, "/api/histogram")  => histogram(&body_str, &st.bases),
             (Method::Post, "/api/chunk")      => fetch_chunk(&body_str, &mut st.bases),
@@ -1278,7 +1281,7 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
         (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state),
-        (Method::Post, "/search") => search(body_str(), &state.bases),
+        (Method::Post, "/search") => search(body_str(), &state.bases, &mut state.collection_profiles),
         (Method::Post, "/search_expand") => search_expand(body_str(), state),
         (Method::Post, "/chunk") => fetch_chunk(body_str(), &mut state.bases),
         (Method::Delete, p) if p.starts_with("/bases/") => {
@@ -1619,7 +1622,7 @@ fn list_collections(bases: &Bases) -> (u16, String) {
                  "collections": list}).to_string())
 }
 
-fn search(body: &str, bases: &Bases) -> (u16, String) {
+fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::CollectionProfile>) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
@@ -1643,12 +1646,46 @@ fn search(body: &str, bases: &Bases) -> (u16, String) {
             coll_pat.unwrap_or("*"))}).to_string());
     }
 
+    // [#8] modo unificado por coleção (opt-in via body.unified): vocab+idf de repo, em cache,
+    // auto-invalidado por fingerprint (nº bases, total chunks). Sem ele, recall local de sempre.
+    let unified = v["unified"].as_bool().unwrap_or(false);
+    let colls: Vec<String> = if unified {
+        let mut s: Vec<String> = pairs.iter().map(|(c, _)| c.clone()).collect();
+        s.sort(); s.dedup(); s
+    } else { vec![] };
+    for c in &colls {
+        if let Some(inner) = bases.get(c) {
+            let fp = rag::collection_fingerprint(inner);
+            if profiles.get(c).map(|p| p.fingerprint) != Some(fp) {
+                profiles.insert(c.clone(), rag::build_collection_profile(inner));
+            }
+        }
+    }
+    // vetoriza a query no espaço unificado UMA vez por coleção (não por base)
+    let qvecs: HashMap<String, (HashMap<usize, f64>, f64)> = colls.iter()
+        .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
+        .collect();
+    let profiles_ref: &HashMap<String, rag::CollectionProfile> = profiles;
+
     // scatter-gather: busca em cada base. Paraleliza com rayon quando há mais de uma
     // base no escopo (caso GLOBAL/coleção); cada base é independente, merge no fim.
     type BaseResult = (Value, String, Vec<(f64, i64, f64, Map<String, Value>)>);
     let search_one = |coll: &String, name: &String| -> Option<BaseResult> {
         let base = get_base(bases, coll, name)?;
-        let (hits, info) = base.search(query, k, rerank, recall_n, phonetic);
+        let (hits, info) = if unified {
+            // perfil + query vetorizada da coleção + remap/normas desta base → recall unificado;
+            // fallback pro recall local se faltar qualquer peça (robustez)
+            match (profiles_ref.get(coll), qvecs.get(coll)) {
+                (Some(p), Some((qv, qn))) => match (p.remap.get(name), p.unorms.get(name)) {
+                    (Some(remap), Some(unorms)) =>
+                        base.search_unified(query, k, rerank, recall_n, phonetic, qv, *qn, remap, unorms),
+                    _ => base.search(query, k, rerank, recall_n, phonetic),
+                },
+                _ => base.search(query, k, rerank, recall_n, phonetic),
+            }
+        } else {
+            base.search(query, k, rerank, recall_n, phonetic)
+        };
         let entry = json!({"collection": coll, "base": name,
                            "n_chunks": info.n_chunks, "n_converge": info.n_converge,
                            "dims": info.dims, "oov": info.oov,
