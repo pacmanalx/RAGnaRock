@@ -35,6 +35,9 @@ docs/
 # posts de LinkedIn/Face/Insta por versão; não poluir o histórico do repo OSS
 announce/
 
+# ── To-do interno (vira GitHub Issues; não duplicar no repo) ──
+to-do-list.md
+
 # ── Build artifacts ──
 **/target/
 **/node_modules/
