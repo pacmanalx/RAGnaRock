@@ -1,6 +1,6 @@
 > 🌐 **Language.** This is the English version · 🇧🇷 Versão em português: **[README.pt-BR.md](README.pt-BR.md)**
 >
-> 📖 **Docs note.** `README.md` and `ARCHITECTURE.md` are available in English. `JSONCONTRACT.md`, in-code
+> 📖 **Docs note.** `README.md`, `ARCHITECTURE.md` and `JSONCONTRACT.md` are available in English. In-code
 > comments and the didactic `logic_path/` track are still in **Portuguese (pt-BR)** — English translation planned.
 
 # 🪨 RAGnaRock

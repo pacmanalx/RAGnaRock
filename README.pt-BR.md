@@ -116,7 +116,7 @@ python3 python_concept/search_rag.py meu_corpus-tokenized.json "minha consulta" 
 - Cada hit traz `collection, base, corpus` (nome do arquivo), `path`, `chunk`, `matchpoint`,
   `snippet`, etc. — então a IA vai **direto no arquivo**.
 
-Contrato formal das 3 APIs (ragd, ValHalla, nidhoggd): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
+Contrato formal das 3 APIs (ragd, ValHalla, nidhoggd): **[`JSONCONTRACT.pt-BR.md`](JSONCONTRACT.pt-BR.md)**.
 Exemplos executáveis `curl`: **[`ragd/json_samples/`](ragd/json_samples/)**.
 
 ---

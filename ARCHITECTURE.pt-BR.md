@@ -209,7 +209,7 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
 
 ### 3.7 Contrato HTTP — rotas
 
-> 📐 **Contrato detalhado** (request/response de cada rota dos 3 daemons): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
+> 📐 **Contrato detalhado** (request/response de cada rota dos 3 daemons): **[`JSONCONTRACT.pt-BR.md`](JSONCONTRACT.pt-BR.md)**.
 > Exemplos executáveis `curl -d @`: `ragd/json_samples/`. Abaixo, o resumo das rotas.
 
 **Implementadas [FEITO]:**
@@ -494,7 +494,7 @@ knowledge[]}`). Forma-alvo:
 
 ### 5.8 API do módulo
 
-> Contrato detalhado em **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--inteligência-11497-parcial)**.
+> Contrato detalhado em **[`JSONCONTRACT.pt-BR.md` §3](JSONCONTRACT.pt-BR.md#3-nidhoggd--inteligência-11497-parcial)**.
 
 **[FEITO]** `GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
 `GET /api/nidhogg/collections` (coleções + estado de digestão) · `POST /api/nidhogg`

@@ -493,7 +493,7 @@ knowledge[]}`). Target shape:
 
 ### 5.8 Module API
 
-> Detailed contract in **[`JSONCONTRACT.md`](JSONCONTRACT.md)** *(currently in Portuguese)*.
+> Detailed contract in **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--intelligence-11497-partial)**.
 
 **[DONE]** `GET /health` · `GET /api/nidhogg` (status: level, cadence, ragd keepalive, knowledge) ·
 `GET /api/nidhogg/collections` (collections + digestion state) · `POST /api/nidhogg`
