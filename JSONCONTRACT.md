@@ -48,7 +48,8 @@ specification; that one is the tutorial.
   "k": 5,               // results after the merge (default 5)
   "rerank": true,       // stage 2 (proximity); false = recall only (default true)
   "recall_n": 20,       // recall candidates per base sent to rerank (default 20)
-  "phonetic": false     // match by SOUND (SOUNDEX): "Aslan" finds "Aslam" (default false)
+  "phonetic": false,    // match by SOUND (SOUNDEX): "Aslan" finds "Aslam" (default false)
+  "unified": false      // [#8] use the COLLECTION-unified vocab+idf (repo idf); cross-language; default false
 }
 ```
 **Response:**

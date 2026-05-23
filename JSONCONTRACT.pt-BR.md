@@ -47,7 +47,8 @@ Referência **formal** das APIs HTTP/JSON dos três daemons. Para **exemplos exe
   "k": 5,               // resultados após o merge (default 5)
   "rerank": true,       // estágio 2 (proximidade); false = só recall (default true)
   "recall_n": 20,       // candidatos do recall por base que vão ao rerank (default 20)
-  "phonetic": false     // casa por SOM (SOUNDEX): "Aslan" acha "Aslam" (default false)
+  "phonetic": false,    // casa por SOM (SOUNDEX): "Aslan" acha "Aslam" (default false)
+  "unified": false      // [#8] usa o vocab+idf unificado da COLEÇÃO (idf de repo); cross-linguagem; default false
 }
 ```
 **Response:**

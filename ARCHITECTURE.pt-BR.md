@@ -143,6 +143,12 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
   truncado a 4). Aplicado **só a termos de ≤3 sílabas** (nomes/grafias variantes: `"Aslan"`→`"Aslam"`);
   termos longos discriminam pela própria sequência silábica (evita falso casamento `ressurreição`~`rigorosa`).
   Calculado **1× por query** (não por candidato). É feature **do `ragd`** — não existe nas PoCs congeladas.
+- **Recall unificado por coleção (`unified:true`, opt-in — [#8]):** em vez do idf local de cada base, o recall
+  roda num **espaço unificado por coleção** — um `CollectionProfile` (vocab dos drivers das bases mesclado +
+  idf recomputado sobre a coleção inteira = "idf de repo"), em memória e cacheado, auto-invalidado por um
+  fingerprint `(nº bases, total chunks)`. O `vec` de cada chunk é remapeado local→global on-the-fly. Permite a
+  query casar entre **arquivos de linguagens diferentes** (ex.: Python + Rust na mesma coleção) com idf de repo
+  discriminante. Default **off** (flag por requisição); o rerank não muda.
 
 - **Scatter-gather:** `/search` resolve o escopo (`collection` + wildcard em `base`: `"sda"`, `"sd*"`,
   `"*"`), busca em cada base que casa (paraleliza com rayon quando há >1 base) e faz **merge por matchpoint**.
