@@ -134,7 +134,6 @@ pub fn tokenize_content(
     chunk_size: usize,
     max_chunks: usize,
     with_text: bool,
-    file: Option<&str>,   // [#8] caminho do arquivo no repo; marca cada chunk + meta.files (None = base 1-arquivo)
 ) -> Result<Value, String> {
     let idx = build_driver_index(drivers_dir)
         .map_err(|e| format!("erro lendo drivers em {}: {e}", drivers_dir.display()))?;
@@ -174,7 +173,6 @@ pub fn tokenize_content(
         m.insert("len".into(), json!(len_chars));
         m.insert("tokens".into(), json!(total));
         m.insert("oov".into(), json!(oov));
-        if let Some(f) = file { m.insert("file".into(), json!(f)); }   // [#8] só no modo repo
         m.insert("vec".into(), Value::Null);                 // preenchido na 2a passada
         m.insert("text".into(), if with_text { json!(piece) } else { Value::Null });
         chunks_json.push(m);
@@ -201,14 +199,6 @@ pub fn tokenize_content(
     let mut meta = Map::new();
     meta.insert("corpus".into(), json!(filename));
     meta.insert("source_file".into(), json!(source_label));
-    if let Some(f) = file {                                   // [#8] mapa arquivo→chunks (formato extensível)
-        let ids: Vec<Value> = (0..pieces.len()).map(|i| json!(i)).collect();
-        let mut entry = Map::new();
-        entry.insert("chunks".into(), Value::Array(ids));
-        let mut fmap = Map::new();
-        fmap.insert(f.to_string(), Value::Object(entry));
-        meta.insert("files".into(), Value::Object(fmap));
-    }
     meta.insert("bytes".into(), json!(text.len()));
     meta.insert("chunk_size".into(), json!(chunk_size));
     meta.insert("n_chunks".into(), json!(pieces.len()));
@@ -409,7 +399,6 @@ pub fn tokenize_file(
     chunk_size: usize,
     max_chunks: usize,
     with_text: bool,
-    file: Option<&str>,   // [#8] repassado pro tokenize_content
 ) -> Result<Value, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("erro lendo {}: {e}", path.display()))?;
@@ -417,6 +406,6 @@ pub fn tokenize_file(
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     tokenize_content(
         &text, filename, &abs.to_string_lossy(),
-        drivers_dir, driver_override, chunk_size, max_chunks, with_text, file,
+        drivers_dir, driver_override, chunk_size, max_chunks, with_text,
     )
 }
