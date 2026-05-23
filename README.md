@@ -53,10 +53,43 @@ A mesma lib (`sylkit`) existe em três encarnações que produzem **resultados i
 | `rust_concept/`   | Porte Rust **congelado**, validado idêntico ao Python (serve de teste). |
 | `ragd/`           | **Daemon de produção** (Rust): segura N bases em memória, busca/ingestão via **API HTTP JSON**. É onde o desenvolvimento acontece. |
 | **ValHalla**      | Console web do `ragd` (visão, busca, ingestão, performance, drivers, logs). |
+| `nidhoggd/`       | **Níðhöggr** — camada de **inteligência** (experimental): o *worm* que digere o conhecimento. Ver seção abaixo. |
 | **MCP**           | Casca que pluga o RAGnaRock como ferramenta em agentes de IA (opencode, Claude, etc.). |
 | `drivers/`        | Drivers de linguagem — tokenizam **código-fonte** (sílabas + keywords por linguagem). |
 | `thesaurus/`      | Dicionários multilíngue + cross-lingual (para a query expansion). |
 | `logic_path/`     | Trilha didática **00 → 10** (memorial congelado) que ensina cada princípio de RAG. |
+
+> 📐 **Especificação completa** (os três daemons em detalhe, contratos JSON, estratégias de memória/disco,
+> concorrência, modos de falha e roadmap): **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
+
+---
+
+## 🐉 Nidhogg — a camada de inteligência (experimental)
+
+No mito nórdico, **Níðhöggr** é a serpente que rói as raízes de Yggdrasil. No RAGnaRock, o `nidhoggd`
+é um *worm* (do bem) que **digere o conhecimento** das coleções e o destila num saber que **sobrevive
+à deleção da coleção** — fechando a mitologia: *Ragnarök* (o RAG) tem seu próprio Níðhöggr.
+
+**Como funciona:**
+
+- **Processo separado** (porta **11497**, um "daemon de módulos"). Lê o corpus **sempre pela API do
+  `ragd`** (nunca do disco) — então independe de onde os dados moram.
+- **Nasce desligado** e liga **por coleção** (não fica re-mastigando a mesma). Tem dois "dials":
+  **nível** (profundidade) e **cadência** (de quanto em quanto tempo mastiga).
+- **Quatro níveis cumulativos:**
+  | nível | precisa de IA? | o que destila |
+  |---|---|---|
+  | **0 · burro** | não | índice de raízes, dicionário do corpus, digestão do cache — **núcleo seguro, custo zero** |
+  | **1 · consciente** | sim | insights e resumo por coleção (o saber que sobrevive à deleção) |
+  | **2 · estrutural** | sim | hierarquia e encaixe de dimensões entre projetos/ingestões |
+  | **3 · propositivo** | sim | acha furos, sugere, comenta, resume inteligente |
+- O conhecimento destilado é persistido por coleção (`<coleção>.knowledge.json`) com **proveniência** e
+  **saturação** — rastreável e auditável, com `source_hash` (referência por hash, não por nome) e coleta
+  de órfãos, pra não contaminar resultados com saber obsoleto.
+
+> **Estado:** esqueleto pronto (API, keepalive, estrutura de conhecimento, os 4 níveis e os dials); a
+> inteligência por nível está em desenvolvimento. Nível 0 (sem IA) é o caminho seguro; níveis 1–3
+> (com IA) são **opt-in e experimentais**. Desenho completo + riscos honestos em [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
 
