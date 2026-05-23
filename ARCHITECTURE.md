@@ -196,6 +196,8 @@ Uma **base** = `{ meta, idf, chunks }`, persistida em `ragfiles/<collection>/<na
 - `DELETE /collections/{nome}` (remover coleção inteira).
 - `GET /stats` (agregado público; hoje só interno no console).
 - `GET /bases/{coll}/{name}` (metadados de 1 base sem buscar).
+- `GET /profile?collection=&base=` — **perfil léxico** (`vocab_used`, `dims`, `top_idf[]`) para alimentar
+  o **nível 0 do Nidhogg** sem sondar via `/search` (caro). Achado no ciclo de revisão (§5.3).
 - Ingestão **por arquivo dentro de um repo** (base = N arquivos; update incremental por `sha` de arquivo
   — ver §6). Hoje base = 1 arquivo.
 
@@ -235,23 +237,106 @@ TTL; **[FUTURO]** senha real). Abas:
 - **Dois dials ortogonais:** **nível** (profundidade) + **cadência** (segundos entre ciclos = orçamento
   de tempo).
 
-### 5.2 Os 4 níveis (cumulativos) — o que cada um produz e persiste
+### 5.2 Modelo de consumo — QUEM lê o conhecimento destilado [FUTURO]
 
-| nível | nome | IA? | produz (`knowledge[]`) | status |
+> A pergunta que decide se o Nidhogg é real ou teatro (Codex): **se ninguém consome, é dívida técnica.**
+> Por isso o consumidor é definido **antes** de a destilação valer a pena.
+
+- **Endpoint de leitura:** `GET /api/nidhogg/knowledge?collection=&type=&level=` → devolve o `knowledge[]`
+  destilado (filtrável). É o ponto único de consumo.
+- **Consumidor primário = o agente de IA** (via MCP / pré-contexto): lê o saber destilado como **contexto
+  curado ANTES** de buscar ("responda primeiro do conhecimento aprovado; aprofunde via `/search` bruto").
+- **ValHalla** exibe o conhecimento por coleção (painel) — inspeção/auditoria humana.
+- **[FUTURO opcional]** o `/search` do `ragd` anexa um bloco `hints` derivado do knowledge (meta-índice),
+  **sempre rotulado** — o destilado **nunca** se mistura com a fonte numa resposta sem etiqueta.
+- **Regra de ouro:** níveis 1–3 (IA) só avançam **depois** que esse consumo estiver em uso real. Começa
+  pelo nível 0 (sem IA), prova valor, sobe.
+
+### 5.3 `source_hash`, diff e incrementalidade [FUTURO]
+
+Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo, e digerir **só o que mudou**.
+
+- **`state_hash` por base** = `hash(base_name, n_chunks, vocab_size, corpus)` — barato, vem direto do
+  `GET /bases` (não lê o conteúdo). **Nunca usa path** (rename de path não muda; `base_name` é id estável).
+- **`source_hash` da coleção** = hash da lista **ordenada** dos `state_hash` das suas bases.
+- **Diff por ciclo:** compara o checkpoint anterior (`{base → state_hash}`) com o atual → bases
+  **novas / alteradas / removidas**. Processa só as mudadas; marca órfãs (removidas); mantém as intactas.
+- **Não re-mastiga** coleção/base com `state_hash` igual ao último → economiza IA (cadência ≠ re-trabalho).
+
+> ⚠️ **Furo de contrato achado (Kimi):** o `ragd` **não expõe hoje** `idf`/`dims`/vocabulário efetivo por
+> base num endpoint — o nível 0 teria que **sondar** via `/search` com sílabas-probe (caro). **Decisão:**
+> adicionar um endpoint de **perfil** no `ragd` → `GET /profile?collection=&base=` retornando
+> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Alimenta o nível 0 barato. **[FUTURO — contrato novo no ragd]**
+
+### 5.4 Os 4 níveis — algoritmos e schemas
+
+| nível | nome | IA? | produz | status |
 |---|---|---|---|---|
-| 0 | **burro** | não | **3 pilares:** índice de raízes (sílabas/stems), dicionário do corpus, digestão do cache | [PARCIAL] |
-| 1 | **consciente** | sim | insights + resumo **por coleção** (o saber que sobrevive à deleção) | [FUTURO] |
-| 2 | **estrutural** | sim | hierarquia e **encaixe de dimensões** entre projetos/ingestões | [FUTURO] |
-| 3 | **propositivo** | sim | acha **furos**, sugere, comenta, resume inteligente | [FUTURO] |
+| 0 | **burro** | não | 3 pilares: RootIndex · CorpusDict · CacheDigest | [PARCIAL] |
+| 1 | **consciente** | sim | `Summary` por coleção (saber que sobrevive à deleção) | [FUTURO] |
+| 2 | **estrutural** | sim | `DimensionMap` (hierarquia/encaixe entre coleções) | [FUTURO] |
+| 3 | **propositivo** | sim | `Gap` + `Suggestion` (furos, propostas) | [FUTURO] |
 
-- **Nível 0 é o núcleo seguro** ("fóssil" auto-suficiente, sem IA): sempre útil, custo zero, alinhado
-  com "roda em qualquer lugar". É o que liga por default quando o worm liga.
-- **Níveis 1–3 são experimentais e custam IA** — só com provider ativo, por coleção habilitada.
+**Nível 0 (sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
+health-check** ("minha coleção está íntegra e navegável?"), **não "conhecimento"** — não vender como tal.
+Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e custa zero IA.
 
-### 5.3 Schema do conhecimento persistente — `<dir>/<coll>.knowledge.json`
+- **RootIndex** — sílabas/dims mais salientes por coleção (rank por `idf × freq`), agrupadas por raiz.
+  `content:{ bases_count, total_chunks, roots:[{stem, dims, df_chunks, idf_score, bases}], coverage_ratio }`.
+- **CorpusDict** — vocabulário efetivo (dims usadas, top por `idf`, cobertura/`oov` por base, dims
+  compartilhadas vs únicas). `content:{ vocab_size, active_dims, top_idf:[{dim,syllable,idf,df}], shared_dims, unique_dims }`.
+- **CacheDigest** — consolida o cache de query-expansion: sinônimos vistos ≥ N vezes que mapeiam os
+  **mesmos** chunks viram clusters de equivalência. `content:{ entries:[{canonical, variants, shared_chunk_ids, hit_count}], hit_rate }`.
+
+**Níveis 1–3 (IA) — entrada, amostragem e saída:**
+
+| nível | entrada pro LLM | amostragem | saída (`type`) |
+|---|---|---|---|
+| 1 | chunks **novos/alterados** desde o `source_hash` + meta da base | até `MAX_CHUNKS_PER_LEVEL` (~100) espaçados + top-N por `idf`; se poucos, todos | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
+| 2 | `Summary` de nível 1 de várias coleções (metadado — não amostra) | — | `DimensionMap {shared_dimensions, hierarchy, cross_refs}` |
+| 3 | `DimensionMap` + histórico de queries (do `CacheDigest`) + gaps conhecidos | últimas N queries únicas | `Gap {query_pattern, missing_in, severity}` + `Suggestion {action, target, expected_impact}` |
+
+- **Orçamento:** cadência = orçamento de **tempo** por ciclo; somar teto de **tokens/ciclo** para os níveis IA.
+- **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
+
+### 5.5 Ciclo do worker, arquivos e resumabilidade [FUTURO]
+
+**Layout por coleção** (em `dir/`), append-only para ser resumível:
+
+```
+<dir>/
+  <coll>.knowledge.jsonl    # 1 item de conhecimento por linha (escrita atômica, append)
+  <coll>.checkpoint.json    # { base_name: state_hash } + última base processada
+  <coll>.provenance.jsonl   # 1 digestão por linha
+  <coll>.config.json        # { enabled, level, cadence_s, last_run }
+```
+
+**Pseudo-fluxo de um ciclo** (sintetizado com Kimi):
+
+```
+para cada coleção HABILITADA:
+  bases_atuais = GET /bases?collection=coll
+  diff = compara(checkpoint_anterior, state_hash(bases_atuais))   # novas/alteradas/removidas
+  digestion_id = uuid()
+  para cada base ALTERADA:
+     nível 0 (sempre): RootIndex + CorpusDict  → append no .jsonl
+     nível >=1 (se configurado): Summary só dos chunks NOVOS → append
+     atualiza checkpoint[base] = state_hash
+  nível >=2 (se >1 coleção): DimensionMap a partir dos Summary → append
+  nível 3: Gap/Suggestion a partir do DimensionMap + queries → append
+  grava provenance(digestion_id, inputs=bases_alteradas)
+  recomputa saturation ; marca órfãos (bases removidas)
+```
+
+**Resumabilidade:** se a IA falha no meio, o `.jsonl` já gravado é válido (append atômico) e o
+`checkpoint` aponta a última base concluída → o próximo ciclo **retoma** dali. Nunca append cego:
+dedup por `digestion_id`/`derived_from`. O `<coll>.knowledge.json` consolidado (§5.6) é uma **view**
+do `.jsonl`+checkpoint (ou o `.jsonl` vira o canônico e o `.json` é gerado). **[decisão de implementação]**
+
+### 5.6 Schema do conhecimento consolidado — `<dir>/<coll>.knowledge.json`
 
 Um arquivo **por coleção** (hoje: `{collection, enabled, source_hash, saturation, updated, provenance,
-knowledge[]}`). Forma-alvo (sintetizada com o Kimi):
+knowledge[]}`). Forma-alvo:
 
 ```jsonc
 {
@@ -272,7 +357,7 @@ knowledge[]}`). Forma-alvo (sintetizada com o Kimi):
 }
 ```
 
-### 5.4 Saturation, provenance, sobrevivência à deleção
+### 5.7 Saturation, provenance, sobrevivência à deleção
 
 - **`source_hash` (hash, não nome):** cada item de conhecimento aponta pra um hash do estado da fonte.
   Renomear/deletar a coleção **não invalida** o que já foi destilado; só marca que a fonte mudou.
@@ -283,14 +368,16 @@ knowledge[]}`). Forma-alvo (sintetizada com o Kimi):
 - **Invariante:** nenhum item de nível ≥1 é gerado sem `provenance` (digestion_id + source_hash + modelo).
 - **Cadência ≠ saturação:** worm não re-mastiga coleção saturada (`source_hash` igual ao último) — economiza IA.
 
-### 5.5 API do módulo [FEITO]
+### 5.8 API do módulo
 
-`GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
+**[FEITO]** `GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
 `GET /api/nidhogg/collections` (coleções + estado de digestão) · `POST /api/nidhogg`
 (`{on, level, cadence}`) · `POST /api/nidhogg/collection` (`{collection, enabled}`) ·
 `POST /api/nidhogg/run` (dispara ciclo — **stub**).
 
-### 5.6 ⚠️ Riscos & questões em aberto (a crítica honesta — Codex)
+**[FUTURO]** `GET /api/nidhogg/knowledge?collection=&type=&level=` (consumo do saber destilado — §5.2).
+
+### 5.9 ⚠️ Riscos & questões em aberto (a crítica honesta — Codex)
 
 O Nidhogg é a parte **mais arriscada** do projeto. Registrado de propósito, não escondido:
 
