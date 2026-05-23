@@ -1486,7 +1486,7 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     } else {
         match ingestor::tokenize_content(
             &text, &filename, &source_label,
-            Path::new(&state.drivers_dir), driver_override, chunk_size, max_chunks, with_text,
+            Path::new(&state.drivers_dir), driver_override, chunk_size, max_chunks, with_text, None,
         ) {
             Ok(v) => v, Err(e) => return (400, json!({"error": e}).to_string()),
         }
@@ -1556,6 +1556,7 @@ fn ingest_raw_to_base(
     let max_chunks = body["max_chunks"].as_u64().unwrap_or(0) as usize;
     let with_text = body["with_text"].as_bool().unwrap_or(true);
     let driver_override = body["driver"].as_str();
+    let file = body["file"].as_str();   // [#8] caminho relativo no repo (modo repo); ausente = base 1-arquivo
     let value = ingestor::tokenize_file(
         Path::new(path),
         Path::new(drivers_dir),
@@ -1563,6 +1564,7 @@ fn ingest_raw_to_base(
         chunk_size,
         max_chunks,
         with_text,
+        file,
     )?;
     // persiste em ragfiles_dir/<collection>/<name>-tokenized.json
     let rag_dir = Path::new(ragfiles_dir).join(collection);

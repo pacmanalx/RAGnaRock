@@ -207,6 +207,8 @@ pub fn snippet(text: &str, query: &str) -> String {
 // ------------------------------- a base RAG ----------------------------------
 pub struct Chunk {
     pub id: usize, pub start: usize, pub len: usize, pub tokens: usize, pub oov: usize,
+    /// [#8] arquivo de origem (modo repo). None em base de 1 arquivo → omitido no JSON (preserva equivalência).
+    pub file: Option<String>,
     pub vec: HashMap<usize, f64>, pub norm: f64, pub text: Option<String>,
     /// cache: sílabas por palavra do chunk (pro rerank). Calculado 1× no load —
     /// antes era refeito (re-silabado) a CADA query. Vazio quando o chunk não tem texto.
@@ -255,6 +257,7 @@ impl RagBase {
                     len: c["len"].as_u64().unwrap_or(0) as usize,
                     tokens: c["tokens"].as_u64().unwrap_or(0) as usize,
                     oov: c["oov"].as_u64().unwrap_or(0) as usize,
+                    file: c["file"].as_str().map(|s| s.to_string()),
                     vec, norm: c["norm"].as_f64().unwrap_or(1.0),
                     text, words: Vec::new(),
                 }
