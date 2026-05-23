@@ -315,7 +315,10 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
 | 2 | `Summary` de nível 1 da obra/coleção (metadado — não amostra) | — | `KnowledgeTree {root, nodes[], edges[]}` — mapa mental navegável (hierarquia/encaixe de dimensões é a base) |
 | 3 | a obra + `KnowledgeTree` + `Summary` + a versão anterior do documento vivo | incremental: só o que entrou desde o último ciclo | `LivingDocument {sections[], style, version, grows:true}` (resumo profundo que cresce, variantes de estilo) + `Gap`/`Suggestion` |
 
-- **Orçamento:** cadência = orçamento de **tempo** por ciclo; somar teto de **tokens/ciclo** para os níveis IA.
+- **Orçamento é DECISÃO DE QUEM RODA:** cadência = orçamento de **tempo** por ciclo; somar teto de
+  **tokens/ciclo** para os níveis IA. Nasce **OFF**, opt-in por coleção (§5.1), nível 0 cobre o sem-IA, e
+  **sem teto de gasto por default** — escolha consciente, com **disclaimer obrigatório ao ligar** (§4). O
+  grafo de IAs (dim. 3) multiplica o consumo (N IAs × N níveis) — é a camada $$$ por excelência.
 - **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
 - **Ordem HIERÁRQUICA (1→2→3):** os níveis IA acontecem **em sequência** — não há nível 2 sem o 1, nem 3
   sem o 2 (a dimensão do conhecimento é hierárquica por natureza). O **dial seleciona o nível-topo**; o
@@ -371,8 +374,8 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
   artefatos intermediários do grafo são **insumo**; só o nó-raiz emite o `LivingDocument` versionado.
   - **Só vale para a dim. 3.** Dims 1 e 2 usam **IA direta** (1 chamada por extração) — confronto multi-IA
     é custo que só a camada propositiva justifica.
-  - Conecta com o **provider plugável** do §5.9: aqui ele deixa de ser "escolher 1 modelo" e vira
-    "orquestrar vários num DAG de confronto". Config do grafo no `nidhogg.cfg`/ValHalla. **[FUTURO]**
+  - O **provider** aqui deixa de ser "escolher 1 modelo" e vira "orquestrar vários num DAG de confronto"
+    (plugáveis: Bedrock, escolha de modelo, round-robin). Config do grafo no `nidhogg.cfg`/ValHalla. **[FUTURO]**
 
 ### 5.5 Ciclo do worker, arquivos e resumabilidade [FUTURO]
 
@@ -461,32 +464,18 @@ knowledge[]}`). Forma-alvo:
 `POST /api/nidhogg/accept` (`{collection, type, level, version}` → marca `status:accepted`, libera o
 nível seguinte quando `accept_gate=on` — §5.4).
 
-### 5.9 ⚠️ Riscos & questões em aberto (a crítica honesta — Codex)
+### 5.9 Questões em aberto (pauta das próximas rodadas Side AI)
 
-O Nidhogg é a parte **mais arriscada** do projeto. Registrado de propósito, não escondido:
+> Seção **viva**: registra só o que **ainda não foi decidido**. Quando uma questão fecha, ela **sai daqui
+> e vira decisão no corpo** — não fica como "risco resolvido" (seria redundante). Os riscos dos ciclos
+> 1–4 (solução-procurando-problema, órfão/stale, custo, framing) foram resolvidos e moram hoje em §5.1
+> (off/opt-in), §5.2 (autonomia/consumidor humano), §5.4 (hierarquia, gate, grafo, orçamento, prompt por
+> nível) e §5.7 (sobrevivência por congelamento).
 
-- **"Solução procurando problema?" — RESOLVIDO (ver §5.2).** O Nidhogg é **autônomo** e o consumidor é
-  o **humano** que lê os artefatos (documento vivo, árvore de conhecimento). O valor é o **entendimento
-  acumulado em si** — *não depende* de consumo por máquina; o `ragd` nunca o lê. Rastreável por
-  `provenance`; o destilado nunca se mistura com a fonte sem rótulo.
-- **Órfão/stale — ATENUADO (§5.2/§5.7).** Como o Nidhogg é autônomo (ninguém consome na busca), não há
-  resultado a contaminar. Fonte morta → artefato **CONGELADO e rotulado**, nunca deletado (sobreviver é
-  feature). `saturation` = rótulo de frescor pro leitor humano; nível 0 (sem IA) é à prova disso.
-- **Custo/latência de IA — orçamento é DECISÃO DE QUEM RODA.** OFF por default; opt-in por coleção;
-  nível 0 cobre o sem-IA; cadência + janela = *quando* roda. **DISCLAIMER obrigatório** ao ligar no
-  ValHalla: *"ativar consome IA — qualquer provider"*. Provider **plugável** ([FUTURO]: Amazon Bedrock,
-  escolha de modelo, round-robin). **Sem teto de gasto por default** — escolha consciente do usuário.
-  Na **dim. 3** o **grafo de IAs em confronto** (§5.4) multiplica o consumo (N IAs × N níveis de confronto)
-  — o disclaimer e a cadência pesam em dobro ali; é a camada $$$ por excelência.
-- **Framing dos níveis pode confundir o operador — MITIGADO.** Como cada nível tem **prompt próprio**
-  (§5.4) e a **aba Nidhogg** (§4) descreve o que cada um produz (consciente=`Summary`, estrutural=árvore,
-  propositivo=documento vivo), o operador vê e edita o tom de cada camada — o framing fica explícito na
-  tela, não escondido no código.
-- **"O que avança e quando" — gated por roadmap + budget, não por consumidor.** O bullet antigo ("esperar
-  um consumidor real") **caiu**: o consumidor é o **humano** e o artefato **é** o produto (§5.2). Os
-  níveis 1→2→3 avançam conforme o **roadmap** do Pacman, **gated por orçamento + disclaimer** (§5.9 acima),
-  não por "esperar quem consuma". Começa pelo nível 0 (sem IA, à prova de risco) e sobe na cadência que o
-  dono escolher.
+- **Impacto semântico da cascata-delta** — quando uma fonte muda, decidir entre re-derivar *só o galho* ou
+  *reescrever* hoje é heurística por *reframing* (§5.4). O mecanismo fino (assinatura semântica por galho
+  pra medir propagação) é **[FUTURO — implementação]**.
+- *(próximas rodadas Side AI registram aqui o que surgir.)*
 
 ---
 

@@ -87,7 +87,7 @@ do `ragd`** (nunca do disco). Nasce **desligado**, liga **por coleção**, com d
 > **Estado:** esqueleto pronto (API, keepalive, estrutura de conhecimento, os 4 níveis e os dials); a
 > inteligência por nível está em desenvolvimento. Nível 0 (sem IA) é o caminho seguro; níveis 1–3 (com IA)
 > são **opt-in e experimentais**. O desenho completo (artefatos versionados que sobrevivem à deleção,
-> gate de aceite, grafo de IAs, prompt por nível e os riscos honestos) está em
+> gate de aceite, grafo de IAs, prompt por nível e as questões em aberto) está em
 > [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
