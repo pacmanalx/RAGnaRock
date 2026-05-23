@@ -1,0 +1,6 @@
+{
+	"base": "sda",
+	"query": "Gandalf",
+	"k": 3,
+	"rerank": false
+}

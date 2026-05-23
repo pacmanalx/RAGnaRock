@@ -1,0 +1,25 @@
+[package]
+name = "sylkit"
+version = "0.1.0"
+edition = "2021"
+description = "Toolkit silabico (RAG didatico) — porte Rust da lib Python sylkit"
+
+[dependencies]
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[lib]
+name = "sylkit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "embed_gen"
+path = "src/bin/embed_gen.rs"
+
+[[bin]]
+name = "search_rag"
+path = "src/bin/search_rag.rs"
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,7 @@
+{
+	"base": "narnia",
+	"query": "aparecimento de Aslan",
+	"k": 5,
+	"recall_n": 772,
+	"phonetic": true
+}

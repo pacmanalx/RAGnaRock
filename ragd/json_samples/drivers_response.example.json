@@ -1,0 +1,22 @@
+{
+    "drivers_dir": "/Users/alexandrepereira/dev/ragnarock/drivers",
+    "match": "Python",
+    "count": 1,
+    "drivers": [
+        {
+            "name": "tokens_Python_PTBR.drv",
+            "language": "Python",
+            "description": "codigo fonte Python (2.7/3.x, type hints, async/await, match)",
+            "extensions": [
+                ".py",
+                ".pyw",
+                ".pyi",
+                ".pyx"
+            ],
+            "syllables": 3156,
+            "keywords": 49,
+            "vocab_size": 3205,
+            "header": "RAGnaRock driver: Python"
+        }
+    ]
+}

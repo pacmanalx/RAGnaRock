@@ -1,0 +1,10 @@
+{
+    "file": "mystery.unknownext",
+    "extension": ".unknownext",
+    "drivers_dir": "drivers",
+    "drivers_scanned": 33,
+    "matched": false,
+    "fallback": "PTBR",
+    "driver": "tokens_PTBR.drv",
+    "language": "PTBR"
+}

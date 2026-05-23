@@ -1,0 +1,17 @@
+[package]
+name = "nidhoggd"
+version = "0.1.0"
+edition = "2021"
+description = "Níðhöggr — camada de inteligência do RAGnaRock. Worm autônomo que come o conhecimento das coleções via API. Daemon de módulos (porta 11497)."
+
+[dependencies]
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny_http = "0.12"
+
+[[bin]]
+name = "nidhoggd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

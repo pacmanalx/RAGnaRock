@@ -1,0 +1,40 @@
+# ── Segredos / config local (NUNCA commitar) ──
+ragnarock.cfg
+.sources
+*.bak
+*.bak-*
+
+# ── Memória / config do agente (não é fonte do projeto) ──
+.claude/
+MEMORY.md
+
+# ── Dados gerados / regeneráveis ──
+# bases tokenizadas (geradas; podem conter código de CLIENTE)
+ragfiles/
+# cache do thesaurus / expansions
+cache/
+# ~150MB de dicionários gerados (regerar com tools/build_thesaurus.py); licença de dados própria
+thesaurus/
+# drivers gerados (fonte de verdade = tools/gen_drivers.py + seeds em drivers/)
+drivers.out/
+
+# ── Corpora de exemplo COM COPYRIGHT (não redistribuir) ──
+# narnia / percy / sda — textos protegidos, usados só como teste local
+importables/
+# texto e excerto do Senhor dos Anéis usados na trilha (substituir por domínio público)
+logic_path/sda.txt
+logic_path/sample.txt
+
+# ── Notas de trabalho internas (IP de LAN, OpenFrame/NAT, estratégia) ──
+# tirar do repo público; recriar uma pasta docs/ curada depois se quiser
+docs/
+
+# ── Build artifacts ──
+**/target/
+**/node_modules/
+
+# ── Logs / temporários / OS ──
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

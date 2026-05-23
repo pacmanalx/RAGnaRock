@@ -1,0 +1,11 @@
+{
+    "ok": true,
+    "name": "hist_sample",
+    "filename": "03_histogram.py",
+    "corpus": "03_histogram.py",
+    "n_chunks": 3,
+    "bytes": 2769,
+    "bases": 1,
+    "saved_to": "/Users/alexandrepereira/dev/ragnarock/ragfiles/hist_sample-tokenized.json",
+    "via": "multipart"
+}

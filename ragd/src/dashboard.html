@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ValHalla — console do RAGnaRock</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2b3340; --ink:#c9d1d9; --dim:#7d8590;
+    --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --olive:#8a9a4d; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--mono);display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:14px;padding:11px 28px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,#11161d,#0d1117)}
+  header h1{font-size:16px;margin:0;letter-spacing:1px;white-space:nowrap}
+  header .tag{color:var(--olive);font-weight:bold}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);display:inline-block;flex:0 0 auto}
+  .dot.up{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .meta{margin-left:auto;color:var(--dim);font-size:12px;text-align:right;white-space:nowrap}
+  nav.tabs{display:flex;gap:2px;padding:0 24px;border-bottom:1px solid var(--line);background:#11161d}
+  nav.tabs button{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);
+    padding:11px 18px;font:13px var(--mono);cursor:pointer;letter-spacing:.5px;text-transform:uppercase}
+  nav.tabs button:hover{color:var(--ink)}
+  nav.tabs button.active{color:var(--acc);border-bottom-color:var(--acc)}
+  main{flex:1;padding:22px 28px;overflow:auto;width:100%}
+  .tabpanel{display:none;animation:fade .15s ease} .tabpanel.active{display:block} @keyframes fade{from{opacity:0}to{opacity:1}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:18px}
+  .panel h2{margin:0 0 12px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);border-bottom:1px solid var(--line);padding-bottom:8px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px 18px}
+  .card .n{font-size:30px;font-weight:bold;color:var(--acc);line-height:1.1}
+  .card .l{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+  .split{display:grid;grid-template-columns:1.4fr 1fr;gap:18px;align-items:start}
+  @media(max-width:900px){.split{grid-template-columns:1fr}}
+  label{display:block;font-size:11px;color:var(--dim);margin:0 0 4px;text-transform:uppercase;letter-spacing:.5px}
+  input,select,button{font:13px var(--mono);background:#0d1117;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+  input:focus,select:focus{outline:none;border-color:var(--acc)}
+  .toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap}
+  .toolbar .grow{flex:1;min-width:220px} .toolbar .sm{flex:0 0 auto;width:80px}
+  button.go{cursor:pointer;background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:bold;letter-spacing:.5px;padding:8px 20px}
+  button.go:hover{filter:brightness(1.12)} button.ghost{background:transparent;color:var(--acc);border-color:var(--line)}
+  .chk{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;padding-bottom:8px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:normal;text-transform:uppercase;font-size:10px;letter-spacing:.5px;position:sticky;top:0;background:var(--panel)}
+  tbody tr:hover{background:var(--panel2)}
+  td.f{color:var(--acc);word-break:break-all} .right{text-align:right} .muted{color:var(--dim)}
+  .pill{background:#1c2530;border:1px solid var(--line);border-radius:10px;padding:1px 8px;font-size:11px}
+  .snip{color:var(--dim);font-size:12px} .snip b{color:var(--ok);font-weight:bold}
+  .big{font-size:20px;color:var(--acc);font-weight:bold}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:12.5px}
+  .kv b{color:var(--dim);font-weight:normal}
+  .split2{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+  @media(max-width:800px){.split2{grid-template-columns:1fr}}
+  .dz{min-height:320px;transition:border-color .1s,box-shadow .1s}
+  .dz.over{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
+  .dz h2 .ok{color:var(--ok)} .dz h2 .wn{color:var(--warn)}
+  .dlist{display:flex;flex-direction:column;gap:7px;min-height:250px;max-height:calc(100vh - 270px);overflow-y:auto;padding-right:4px}
+  .dcard{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 11px;cursor:grab;display:flex;justify-content:space-between;align-items:center;gap:10px}
+  .dcard:hover{border-color:var(--acc)} .dcard:active{cursor:grabbing} .dcard.drag{opacity:.35}
+  .dcard .lang{color:var(--acc);font-weight:bold} .dcard .sub{color:var(--dim);font-size:11px}
+  .dcard .ext{color:var(--dim);font-size:10px;text-align:right;white-space:nowrap}
+  .dcard .lic{font-size:9.5px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:1px 5px;white-space:nowrap}
+  .dcard .lic.warn{color:var(--warn);border-color:var(--warn)}
+  .placeholder{color:var(--dim);font-style:italic;padding:30px;text-align:center;border:1px dashed var(--line);border-radius:6px}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:6px}
+  .bar>i{display:block;height:100%;background:var(--acc)}
+  textarea{font:13px var(--mono);background:#0d1117;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:9px 11px;width:100%;resize:vertical}
+  textarea:focus{outline:none;border-color:var(--acc)}
+  tr.clk{cursor:pointer} tr.clk:hover td{color:var(--ink)} tr.clk:hover{background:var(--panel2)}
+  /* modal */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;z-index:50;padding:40px 20px;overflow:auto}
+  .modal-bg.open{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:min(1000px,94vw);box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .modal-h{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line);background:var(--panel2);border-radius:10px 10px 0 0}
+  .modal-h .ttl{color:var(--acc);font-weight:bold;word-break:break-all}
+  .modal-h .nav{margin-left:auto;display:flex;align-items:center;gap:8px;flex:0 0 auto}
+  .modal-h .nav .cid{color:var(--dim);font-size:12px;min-width:90px;text-align:center}
+  .modal-h button{background:#0d1117;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:5px 12px;cursor:pointer;font:12px var(--mono)}
+  .modal-h button:hover{border-color:var(--acc);color:var(--acc)} .modal-h button:disabled{opacity:.35;cursor:default}
+  .modal-h button.x{padding:5px 10px;color:var(--dim)}
+  .modal-b{padding:16px 18px;max-height:70vh;overflow:auto}
+  .modal-b h3{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin:16px 0 7px;border-bottom:1px solid var(--line);padding-bottom:5px}
+  .modal-b h3:first-child{margin-top:0}
+  .metarow{display:flex;gap:8px;flex-wrap:wrap}
+  pre{background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:12px;margin:0;white-space:pre-wrap;word-break:break-word;font-size:12.5px;color:var(--ink);max-height:42vh;overflow:auto}
+  pre.json{color:var(--dim)} pre.json .k{color:var(--acc)}
+  /* login + logout */
+  .logout{background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:5px 12px;cursor:pointer;font:12px var(--mono);margin-left:14px;flex:0 0 auto}
+  .logout:hover{border-color:var(--warn);color:var(--warn)}
+  .login-bg{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;z-index:100}
+  .login-bg.show{display:flex}
+  .login-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:32px 34px;width:330px;display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.6)}
+  .login-card h1{margin:0;font-size:26px;letter-spacing:1px} .login-card .tag{color:var(--olive)}
+  .login-card .sub{color:var(--dim);font-size:12px;margin:2px 0 18px}
+  .login-card input{width:100%;padding:9px 11px}
+  .login-card .go{margin-top:20px;width:100%;padding:11px}
+  .lg-err{color:var(--warn);font-size:12px;min-height:16px;margin-top:8px}
+  .spinner{width:46px;height:46px;border:4px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* linhas de chave de API (alinhadas: label · input full-width · botões) */
+  .keyrow{margin-bottom:18px}
+  .keyrow>label{display:block;margin-bottom:5px}
+  .keyrow input{width:100%;font:13px var(--mono)}
+  .keyfield{position:relative}
+  .keyfield input{width:100%;padding-right:42px}
+  .keyfield .eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:3px 6px;color:var(--dim)}
+  .keyfield .eye:hover{color:var(--acc)}
+  .keybtns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .keybtns button{flex:0 0 auto}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>⚔ VAL<span class="tag">HALLA</span> <span style="color:var(--dim);font-weight:normal">· console do</span> RAGnaRock</h1>
+  <div class="meta" id="meta">conectando…</div>
+  <button class="logout" id="btn-logout" onclick="doLogout()">⏻ sair</button>
+</header>
+
+<div class="login-bg" id="restarting" style="flex-direction:column;gap:18px">
+  <div class="spinner"></div>
+  <div style="font-size:16px;letter-spacing:1px">⚔ <b id="restart-msg">aplicando configurações…</b></div>
+  <div class="muted">aguardando o RAGnaRock voltar ao ar</div>
+</div>
+
+<div class="login-bg" id="login">
+  <form class="login-card" onsubmit="doLogin(event)">
+    <h1>⚔ VAL<span class="tag">HALLA</span></h1>
+    <div class="sub">console do RAGnaRock</div>
+    <label>usuário</label><input id="lg-user" autocomplete="username" value="admin">
+    <label style="margin-top:10px">senha</label><input id="lg-pass" type="password" autocomplete="current-password">
+    <div class="lg-err" id="lg-err"></div>
+    <button class="go" type="submit">entrar</button>
+  </form>
+</div>
+<nav class="tabs" id="tabs">
+  <button data-tab="visao" class="active">Visão</button>
+  <button data-tab="buscar">Buscar</button>
+  <button data-tab="ingest">Ingestão</button>
+  <button data-tab="perf">Performance</button>
+  <button data-tab="drivers">Drivers</button>
+  <button data-tab="dict">Dicionários</button>
+  <button data-tab="nidhogg">🐉 Nidhogg</button>
+  <button data-tab="config">Config</button>
+  <button data-tab="logs">Logs</button>
+</nav>
+<main>
+  <!-- VISÃO -->
+  <section class="tabpanel active" data-panel="visao">
+    <div class="cards">
+      <div class="card"><div class="n" id="c-coll">–</div><div class="l">coleções</div></div>
+      <div class="card"><div class="n" id="c-bases">–</div><div class="l">bases</div></div>
+      <div class="card"><div class="n" id="c-chunks">–</div><div class="l">chunks</div></div>
+      <div class="card"><div class="n" id="c-drivers">–</div><div class="l">drivers</div></div>
+    </div>
+    <div class="split">
+      <div class="panel">
+        <h2>Coleções</h2>
+        <table id="t-coll"><thead><tr><th>coleção</th><th class="right">bases</th><th class="right">chunks</th><th style="width:40%">distribuição</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="panel">
+        <h2>Daemon</h2>
+        <div class="kv" id="kv-info"><b>conectando…</b><span></span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Memória / pressão do RAG <span class="muted" id="mem-info"></span></h2>
+      <div id="mem-gauge" class="muted">—</div>
+      <div class="bar" style="height:14px;margin-top:8px"><i id="mem-bar" style="width:0%"></i></div>
+      <div id="mem-break" style="margin-top:14px"></div>
+    </div>
+  </section>
+
+  <!-- BUSCAR -->
+  <section class="tabpanel" data-panel="buscar">
+    <div class="panel">
+      <label>query <span class="muted" style="text-transform:none">— pode colar trechos longos · Ctrl+Enter busca</span></label>
+      <textarea id="s-q" rows="3" placeholder="ex: cálculo de média do aluno&#10;cole aqui um parágrafo inteiro pra buscar por similaridade…"></textarea>
+      <div class="toolbar" style="margin-top:10px">
+        <div><label>coleção</label><select id="s-coll"><option value="">(todas)</option></select></div>
+        <div><label>base (wildcard)</label><input id="s-base" value="*" style="width:140px"></div>
+        <div><label>k</label><input id="s-k" class="sm" type="number" value="8"></div>
+        <div class="chk"><input id="s-ph" type="checkbox"><label style="margin:0">fonético</label></div>
+        <div class="chk"><input id="s-expand" type="checkbox"><label style="margin:0" title="Expande a query por sinônimos e busca por todos. Cascata: dicionários ativos (📚, instantâneo) → cache (📖) → IA (🧠)">expandir 🧠</label></div>
+        <div><button class="go" onclick="doSearch()">buscar</button></div>
+        <div class="grow" id="s-info" style="text-align:right;align-self:center" class="muted"></div>
+      </div>
+    </div>
+    <div class="panel" style="padding-top:6px">
+      <table id="t-hits"><thead><tr><th style="width:36px">#</th><th style="width:30%">coleção / base</th><th class="right">cov</th><th class="right">span</th><th class="right">cos</th><th class="right">chunk</th><th>trecho</th></tr></thead><tbody><tr><td colspan="7" class="muted">faça uma busca acima…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- INGESTÃO -->
+  <section class="tabpanel" data-panel="ingest">
+    <div class="panel">
+      <h2>Ingestão de código → RAG</h2>
+      <div class="toolbar">
+        <div class="grow"><label>coleção (existente ou nova)</label><input id="ing-coll" list="ing-colls" placeholder="ex: eduxe"><datalist id="ing-colls"></datalist></div>
+        <div><label>chunk (chars)</label><input id="ing-chunk" class="sm" type="number" value="2048"></div>
+        <div><label>&nbsp;</label><button class="go ghost" onclick="$('#ing-files').click()">escolher arquivos</button></div>
+        <div><label>&nbsp;</label><button class="go ghost" onclick="$('#ing-dir').click()">escolher pasta</button></div>
+        <div><label>&nbsp;</label><button class="go" id="ing-go" onclick="doIngest()" disabled>subir</button></div>
+        <input type="file" id="ing-files" multiple style="display:none">
+        <input type="file" id="ing-dir" webkitdirectory style="display:none">
+      </div>
+      <div id="ing-sel" class="muted" style="margin-top:10px">nenhum arquivo selecionado</div>
+      <div id="ing-out" class="muted" style="margin-top:6px"></div>
+    </div>
+    <div class="panel" style="padding-top:6px">
+      <table id="ing-tbl"><thead><tr><th style="width:62%">arquivo</th><th>status</th></tr></thead><tbody id="ing-tbody"><tr><td colspan="2" class="muted">escolha arquivos ou uma pasta acima…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- PERFORMANCE -->
+  <section class="tabpanel" data-panel="perf">
+    <div class="panel">
+      <div class="toolbar">
+        <div class="grow"><label>query</label><input id="p-q" value="cálculo de média do aluno"></div>
+        <div><label>coleção</label><select id="p-coll"><option value="">(todas)</option></select></div>
+        <div><label>repetições</label><input id="p-n" class="sm" type="number" value="30"></div>
+        <div><button class="go" onclick="doPerf()">medir</button></div>
+        <div><button class="go ghost" onclick="doHist()">histograma</button></div>
+      </div>
+      <div id="p-out" class="muted" style="margin-top:14px">defina a query e meça — roda no browser via dashboard→Mutex→motor.</div>
+    </div>
+    <div class="panel">
+      <h2>Matched filter — query deslizando sobre o chunk <span class="muted" id="mf-info"></span></h2>
+      <canvas id="mf" style="width:100%;height:240px;display:block"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Histograma — query × chunk mais próximo <span class="muted" id="h-info">— clique “histograma”</span></h2>
+      <canvas id="hist" style="width:100%;height:340px;display:block"></canvas>
+      <div class="muted" id="h-legend" style="margin-top:8px;display:flex;gap:18px;flex-wrap:wrap"></div>
+    </div>
+  </section>
+
+  <!-- DRIVERS -->
+  <section class="tabpanel" data-panel="drivers">
+    <p class="muted" style="margin:0 0 14px">Arraste um driver entre os painéis para
+      <b style="color:var(--ok)">instalar</b> (→ <code>drivers/</code>) ou
+      <b style="color:var(--warn)">desinstalar</b> (→ <code>drivers.out/</code>). Reflete na hora, sem reiniciar.</p>
+    <div class="split2">
+      <div class="panel dz" id="dz-install" data-action="install">
+        <h2><span class="ok">▣ Instalados</span> · <span id="n-in">–</span></h2>
+        <div class="dlist" id="list-in"><span class="muted">carregando…</span></div>
+      </div>
+      <div class="panel dz" id="dz-uninstall" data-action="uninstall">
+        <h2><span class="wn">▢ Disponíveis</span> · <span id="n-out">–</span></h2>
+        <div class="dlist" id="list-out"><span class="muted">carregando…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DICIONÁRIOS -->
+  <section class="tabpanel" data-panel="dict">
+    <p class="muted" style="margin:0 0 14px">Arraste um dicionário entre os painéis para
+      <b style="color:var(--ok)">ativar</b> (cria <code>inuse.flag</code> no diretório) ou
+      <b style="color:var(--warn)">desativar</b> (remove a flag). Os arquivos (4–14 MB) <b>não são movidos</b>.
+      A busca expandida 🧠 considera <b>só os dicionários ativos</b> — recarrega na hora, sem reiniciar.</p>
+    <div class="split2">
+      <div class="panel dz" id="dz-dict-on" data-kind="dict" data-action="enable">
+        <h2><span class="ok">▣ Ativos</span> · <span id="n-dict-on">–</span></h2>
+        <div class="dlist" id="list-dict-on"><span class="muted">carregando…</span></div>
+      </div>
+      <div class="panel dz" id="dz-dict-off" data-kind="dict" data-action="disable">
+        <h2><span class="wn">▢ Disponíveis</span> · <span id="n-dict-off">–</span></h2>
+        <div class="dlist" id="list-dict-off"><span class="muted">carregando…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- NIDHOGG (camada de inteligência) -->
+  <section class="tabpanel" data-panel="nidhogg">
+    <div id="nid-offline" class="panel" style="display:none;border-color:var(--warn)">
+      <h2 style="color:var(--warn)">🐉 Níðhöggr — módulo offline</h2>
+      <p class="muted" style="margin:0">O daemon de inteligência (porta 11497) não está respondendo. É um <b>processo separado</b> (opcional) — instale/suba o <code>nidhoggd</code> pra ativar esta camada. O resto do RAGnaRock segue 100%.</p>
+    </div>
+    <div id="nid-on" style="display:none">
+      <div class="panel">
+        <h2>🐉 Níðhöggr · <span id="nid-state" class="muted" style="text-transform:none"></span></h2>
+        <p class="muted" style="margin:0 0 12px">O worm do bem que <b>come o conhecimento</b> das coleções e o destila num saber que <b>sobrevive à deleção da coleção</b>. Nasce desligado — <b>precisa e consome IA</b> nos níveis ≥ Consciente.</p>
+        <div class="toolbar">
+          <div><label>worm</label>
+            <button class="go" id="nid-toggle" onclick="nidToggle()">ligar</button></div>
+          <div><label>cadência (s)</label><input id="nid-cadence" type="number" min="10" step="10" style="width:90px"></div>
+          <div><button class="go ghost" onclick="nidSetCadence()">aplicar</button></div>
+          <div class="grow muted" id="nid-msg" style="align-self:center"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Nível de inteligência <span class="muted" style="text-transform:none">— quanto mais alto, mais pensa e mais IA consome</span></h2>
+        <div id="nid-levels" class="dlist" style="max-height:none"></div>
+      </div>
+      <div class="split">
+        <div class="panel">
+          <h2>Acesso por coleção <span class="muted" style="text-transform:none">— onde o worm pode se alimentar</span></h2>
+          <p class="muted" style="margin:0 0 10px">Desligue coleções já mastigadas pra ele não re-varrer N vezes. O conhecimento destilado permanece mesmo desligando aqui.</p>
+          <div id="nid-colls" class="dlist" style="max-height:calc(100vh - 360px)"><span class="muted">carregando…</span></div>
+        </div>
+        <div class="panel">
+          <h2>Status</h2>
+          <div class="kv" id="nid-info"><b>carregando…</b><span></span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONFIG -->
+  <section class="tabpanel" data-panel="config">
+    <div class="split">
+      <div class="panel">
+        <h2>Armazenamento</h2>
+        <p class="muted" style="margin:0 0 12px">
+          <b style="color:#3fb950">memory</b> = cacheia tokens (rápido, +RAM) ·
+          <b style="color:#d29922">hybrid</b> = recomputa candidatos (−RAM; busca ampla mais lenta).
+          Trocar <b>recarrega as bases</b> (alguns segundos).</p>
+        <div class="toolbar">
+          <div><label>modo</label><select id="cfg-storage">
+            <option value="memory">memory (full RAM)</option>
+            <option value="hybrid">hybrid (disco)</option></select></div>
+          <div><button class="go" onclick="setStorage()">aplicar</button></div>
+          <div class="grow muted" id="cfg-storage-out" style="align-self:center"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Daemon (leitura)</h2>
+        <div class="kv" id="cfg-info"><b>carregando…</b><span></span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Chaves de API <span class="muted" style="text-transform:none">— acoplar LLM · <b id="cfg-active">—</b> ativo (só um por vez)</span></h2>
+      <p class="muted" style="margin:0 0 14px">Guardadas no config do servidor (persistem). <b>Regra: só um provider ativo por vez.</b> Testar faz uma chamada real (lista de modelos) via wget. O campo já vem preenchido pra edição.</p>
+      <div class="keyrow">
+        <label>Anthropic / Claude <span id="cfg-anthropic-st" class="muted" style="text-transform:none"></span></label>
+        <div class="keyfield"><input id="cfg-anthropic" type="password" spellcheck="false" autocomplete="off" placeholder="sk-ant-...">
+          <button type="button" class="eye" id="eye-anthropic" onclick="toggleEye('anthropic')" title="mostrar/ocultar">👁</button></div>
+        <div class="keybtns">
+          <button class="go" onclick="saveKey('anthropic')">salvar</button>
+          <button class="go ghost" onclick="testKey('anthropic')">testar</button>
+          <button class="go ghost" id="cfg-act-anthropic" onclick="toggleActive('anthropic')">ativar</button>
+          <button class="go ghost" onclick="clearKey('anthropic')">remover</button>
+        </div>
+      </div>
+      <div class="keyrow">
+        <label>OpenAI / Codex <span id="cfg-openai-st" class="muted" style="text-transform:none"></span></label>
+        <div class="keyfield"><input id="cfg-openai" type="password" spellcheck="false" autocomplete="off" placeholder="sk-...">
+          <button type="button" class="eye" id="eye-openai" onclick="toggleEye('openai')" title="mostrar/ocultar">👁</button></div>
+        <div class="keybtns">
+          <button class="go" onclick="saveKey('openai')">salvar</button>
+          <button class="go ghost" onclick="testKey('openai')">testar</button>
+          <button class="go ghost" id="cfg-act-openai" onclick="toggleActive('openai')">ativar</button>
+          <button class="go ghost" onclick="clearKey('openai')">remover</button>
+        </div>
+      </div>
+      <div id="cfg-key-out" class="muted" style="margin-top:6px"></div>
+    </div>
+    <div class="panel" style="text-align:center">
+      <button class="go" style="padding:12px 30px;font-size:14px" onclick="doRestart()">⟳ Reiniciar / aplicar configurações</button>
+      <div class="muted" style="margin-top:8px">Mata e sobe o RAGnaRock (aplica storage do cfg e <b>libera RAM de fato</b>). Você precisará logar de novo.</div>
+    </div>
+  </section>
+
+  <!-- LOGS -->
+  <section class="tabpanel" data-panel="logs">
+    <div class="panel">
+      <h2>Logs do daemon <span class="muted" id="log-info"></span>
+        <span style="float:right;font-size:12px;font-weight:normal;text-transform:none;display:flex;gap:12px;align-items:center">
+          <label class="chk" style="margin:0"><input type="checkbox" id="log-auto" checked> auto (3s)</label>
+          <button class="go ghost" onclick="loadLogs()">atualizar</button>
+        </span></h2>
+      <pre id="log-view" style="max-height:64vh;background:#08090c">— abra para carregar —</pre>
+    </div>
+  </section>
+</main>
+
+<div class="modal-bg" id="modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-h">
+      <span class="ttl" id="m-ttl"></span>
+      <span class="nav">
+        <button id="m-prev" onclick="chunkNav(-1)">‹ anterior</button>
+        <span class="cid" id="m-cid"></span>
+        <button id="m-next" onclick="chunkNav(1)">próximo ›</button>
+        <button class="x" onclick="closeModal()">✕</button>
+      </span>
+    </div>
+    <div class="modal-b">
+      <div class="metarow" id="m-meta"></div>
+      <h3>Texto do chunk</h3>
+      <pre id="m-text"></pre>
+      <h3>JSON</h3>
+      <pre class="json" id="m-json"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s), tb=s=>document.querySelector(s+' tbody'), nf=n=>(+n).toLocaleString('pt-BR');
+const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// rampa de calor: 0 (frio/azul) → 1 (quente/vermelho). Mais alto = mais quente.
+const HEAT=[[0,[68,119,255]],[.25,[34,221,204]],[.5,[63,185,80]],[.7,[255,216,61]],[.85,[255,140,43]],[1,[255,77,77]]];
+function heat(t){t=t<0?0:t>1?1:t;for(let i=1;i<HEAT.length;i++){if(t<=HEAT[i][0]){const a=HEAT[i-1],b=HEAT[i],u=(t-a[0])/(b[0]-a[0]);return`rgb(${a[1].map((v,k)=>Math.round(v+(b[1][k]-v)*u)).join(',')})`;}}return'rgb(255,77,77)';}
+const HEATCSS='linear-gradient(90deg,#4477ff,#22ddcc,#3fb950,#ffd83d,#ff8c2b,#ff4d4d)';
+const heatbar=lbl=>`<span style="display:inline-flex;align-items:center;gap:6px"><span class="muted">${lbl} frio</span><span style="display:inline-block;width:90px;height:9px;border-radius:5px;background:${HEATCSS};vertical-align:middle"></span><span class="muted">quente</span></span>`;
+async function api(method,url,body){
+  const o={method,headers:{}};
+  if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+  const r=await fetch(url,o);
+  if(r.status===401){showLogin();throw new Error('401');}
+  if(!r.ok)throw new Error(r.status);
+  return r.json();
+}
+const jget=u=>api('GET',u), jpost=(u,b)=>api('POST',u,b);
+function showLogin(){const l=$('#login');if(!l.classList.contains('show')){l.classList.add('show');setTimeout(()=>$('#lg-pass').focus(),50);}}
+function hideLogin(){$('#login').classList.remove('show');}
+async function doLogin(e){
+  e.preventDefault();$('#lg-err').textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user:$('#lg-user').value,pass:$('#lg-pass').value})});
+    if(r.status===401){$('#lg-err').textContent='credenciais inválidas';return;}
+    if(!r.ok){$('#lg-err').textContent='erro '+r.status;return;}
+    hideLogin();$('#lg-pass').value='';driversLoaded=false;perfLoaded=false;dictsLoaded=false;
+    selectTab(document.querySelector('nav.tabs button.active')?.dataset.tab||'visao');refresh();
+  }catch(_){$('#lg-err').textContent='erro de rede';}
+}
+async function doLogout(){try{await fetch('/api/logout',{method:'POST'});}catch(_){}showLogin();}
+function fmtUp(s){const d=s/86400|0,h=(s%86400)/3600|0,m=(s%3600)/60|0;return d?`${d}d${h}h`:h?`${h}h${m}m`:`${m}m${s%60}s`}
+
+// abas
+let driversLoaded=false,perfLoaded=false,dictsLoaded=false;
+function selectTab(name){
+  document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+  document.querySelectorAll('.tabpanel').forEach(p=>p.classList.toggle('active',p.dataset.panel===name));
+  if(name==='drivers'&&!driversLoaded){loadDrivers();driversLoaded=true;}
+  if(name==='dict'&&!dictsLoaded){loadDicts();dictsLoaded=true;}
+  if(name==='nidhogg'){loadNidhogg();}
+  if(name==='perf'&&!perfLoaded){doHist();perfLoaded=true;}
+  if(name==='logs'){loadLogs();}
+  if(name==='config'){loadConfig();}
+  if(location.hash.slice(1)!==name)history.replaceState(null,'','#'+name);
+}
+// ---- Config (storage + chaves de API) ----
+async function loadConfig(){
+  let c;try{c=await jget('/api/config')}catch(e){return}
+  $('#cfg-storage').value=c.storage;
+  $('#cfg-info').innerHTML=`<b>config</b><span>${esc(c.config_path)}</span><b>storage</b><span>${c.storage}</span>
+    <b>drivers_dir</b><span>${esc(c.drivers_dir)}</span><b>ragfiles_dir</b><span>${esc(c.ragfiles_dir)}</span>
+    <b>max upload</b><span>${c.max_upload_mb} MB</span><b>admin</b><span>${esc(c.admin_user)}</span>
+    <b>cache de expansões</b><span>${c.expansions_entries??0} entradas · ${esc(c.cache_dir||'cache')}/expansions.json</span>
+    <b>dicionários</b><span>${c.dicts_active??0} ativo(s) · ${nf(c.word_syn_entries??0)} palavras · ${esc(c.thesaurus_dir||'thesaurus')}</span>`;
+  const act=c.active_provider||'none';
+  $('#cfg-active').textContent=act;
+  $('#cfg-active').style.color=act==='none'?'var(--dim)':'var(--ok)';
+  const badge=(set,prov)=>(set?'· cadastrada':'· não cadastrada')+(act===prov?' · <b style="color:var(--ok)">ATIVO</b>':'');
+  $('#cfg-anthropic-st').innerHTML=badge(c.anthropic_key_set,'anthropic');
+  $('#cfg-openai-st').innerHTML=badge(c.openai_key_set,'openai');
+  // preenche os campos com a chave (visível, editável) — só sobrescreve se o usuário não estiver editando
+  if(document.activeElement!==$('#cfg-anthropic'))$('#cfg-anthropic').value=c.anthropic_key||'';
+  if(document.activeElement!==$('#cfg-openai'))$('#cfg-openai').value=c.openai_key||'';
+  // botões ativar/desativar refletem o estado
+  for(const p of ['anthropic','openai']){
+    const b=$('#cfg-act-'+p), on=act===p;
+    b.textContent=on?'✓ ativo (desativar)':'ativar';
+    b.style.borderColor=on?'var(--ok)':'var(--line)'; b.style.color=on?'var(--ok)':'var(--acc)';
+  }
+}
+async function doRestart(){
+  if(!confirm('Reiniciar o RAGnaRock? Ele cai e volta em alguns segundos; você loga de novo.'))return;
+  try{await jpost('/api/restart',{});}catch(e){/* a conexão pode cair durante o restart, tudo bem */}
+  $('#restarting').classList.add('show');
+  let down=false;
+  const msg=$('#restart-msg');
+  const t=setInterval(async()=>{
+    try{
+      const r=await fetch('/api/ping',{cache:'no-store'});
+      if(r.ok){
+        if(down){clearInterval(t);msg.textContent='voltou! recarregando…';setTimeout(()=>location.reload(),700);}
+      }
+    }catch(e){ if(!down){down=true;msg.textContent='RAGnaRock fora do ar, aguardando subir…';} }
+  },1000);
+  // segurança: se em 90s não voltar, recarrega assim mesmo
+  setTimeout(()=>{clearInterval(t);location.reload();},90000);
+}
+function toggleEye(which){
+  const el=$('#cfg-'+which), b=$('#eye-'+which), show=el.type==='password';
+  el.type=show?'text':'password'; b.textContent=show?'🙈':'👁';
+}
+async function toggleActive(prov){
+  const cur=$('#cfg-active').textContent;
+  const target=cur===prov?'none':prov;   // clicar no ativo desativa; senão ativa (e desliga o outro)
+  try{const r=await jpost('/api/config',{active_provider:target});$('#cfg-key-out').innerHTML='<span style="color:var(--ok)">'+r.notes.join(' · ')+'</span>';}
+  catch(e){$('#cfg-key-out').innerHTML='<span style="color:var(--warn)">erro '+e.message+' (a chave está cadastrada?)</span>';}
+  loadConfig();
+}
+async function testKey(prov){
+  $('#cfg-key-out').textContent='testando '+prov+'… (chamada real à API)';
+  try{
+    const r=await fetch('/api/test_key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:prov})});
+    if(r.status===401){showLogin();return;}
+    const j=await r.json();
+    $('#cfg-key-out').innerHTML=`<b>${prov}:</b> <span style="color:${j.ok?'var(--ok)':'#ff6b6b'}">${esc(j.message)}</span>`;
+  }catch(e){$('#cfg-key-out').innerHTML='<span style="color:#ff6b6b">erro de rede: '+e.message+'</span>';}
+}
+async function setStorage(){
+  const s=$('#cfg-storage').value;$('#cfg-storage-out').textContent='aplicando (recarrega bases)…';
+  try{const r=await jpost('/api/config',{storage:s});$('#cfg-storage-out').innerHTML='<span style="color:var(--ok)">'+r.notes.join(' · ')+'</span>';}
+  catch(e){$('#cfg-storage-out').textContent='erro '+e.message;return}
+  refresh();loadConfig();
+}
+async function saveKey(which){
+  const el=$('#cfg-'+which),v=el.value.trim();if(!v)return;
+  const b={};b[which+'_key']=v;
+  try{const r=await jpost('/api/config',b);$('#cfg-key-out').innerHTML='<span style="color:var(--ok)">'+r.notes.join(' · ')+'</span>';}
+  catch(e){$('#cfg-key-out').textContent='erro '+e.message;return}
+  loadConfig();
+}
+async function clearKey(which){
+  const b={};b['clear_'+which]=true;
+  try{const r=await jpost('/api/config',b);$('#cfg-key-out').innerHTML='<span style="color:var(--warn)">'+r.notes.join(' · ')+'</span>';}
+  catch(e){return}
+  loadConfig();
+}
+// ---- Logs (tail do log do daemon) ----
+function colorLog(l){
+  if(/FALH|err|-> 4\d\d|-> 5\d\d/i.test(l))return `<span style="color:#ff6b6b">${l}</span>`;
+  if(/^\[api\]/.test(l))return `<span style="color:#79c0ff">${l}</span>`;
+  if(/^\[valhalla\]/.test(l))return `<span style="color:#8a9a4d">${l}</span>`;
+  if(/autoload|config:|ValHalla|API em|preload/.test(l))return `<span style="color:#3fb950">${l}</span>`;
+  return l;
+}
+async function loadLogs(){
+  let d;try{d=await jget('/api/logs?n=600')}catch(e){return}
+  const v=$('#log-view'),atBottom=v.scrollHeight-v.scrollTop-v.clientHeight<60;
+  v.innerHTML=esc(d.log||'').split('\n').map(colorLog).join('\n');
+  $('#log-info').textContent='· '+d.file;
+  if(atBottom)v.scrollTop=v.scrollHeight;
+}
+setInterval(()=>{const p=document.querySelector('.tabpanel[data-panel="logs"]');
+  if(p&&p.classList.contains('active')&&$('#log-auto')&&$('#log-auto').checked)loadLogs();},3000);
+document.querySelectorAll('nav.tabs button').forEach(b=>b.onclick=()=>selectTab(b.dataset.tab));
+{const t=location.hash.slice(1); if(['visao','buscar','ingest','perf','drivers','config','logs'].includes(t))selectTab(t);}
+// ---- Ingestão (upload de arquivos/pasta) ----
+const SRC_EXT=/\.(cs|sql|sh|py|yml|yaml|json|md|markdown|ini|toml|csproj|js|mjs|ts|jsx|tsx|java|go|rs|rb|php|swift|kt|kts|c|cc|cpp|cxx|h|hpp|cshtml|razor|html|css|scss|xml|txt|pas|sql|vb)$/i;
+const SKIP=/(^|\/)(node_modules|\.git|bin|obj|\.vs|\.vscode|\.idea|dist|build|out|target|packages|\.next|coverage)(\/|$)/i;
+function filterFiles(list){return [...list].filter(f=>{const p=f.webkitRelativePath||f.name;return SRC_EXT.test(f.name)&&!SKIP.test(p)&&f.size<8*1024*1024;});}
+function setIngFiles(list,isDir){
+  const all=list.length;
+  const files=isDir?filterFiles(list):[...list].filter(f=>f.size<8*1024*1024);
+  window._ingFiles=files;
+  $('#ing-sel').textContent=`${files.length} arquivo(s) selecionado(s)`+(isDir?` (de ${all}; ${all-files.length} ignorados: lixo de build/não-fonte/>8MB)`:(all-files.length?` (${all-files.length} ignorados >8MB)`:''));
+  $('#ing-go').disabled=!files.length;
+  $('#ing-tbody').innerHTML=files.slice(0,300).map(f=>`<tr><td class="f">${esc(f.webkitRelativePath||f.name)}</td><td class="muted">aguardando</td></tr>`).join('')+(files.length>300?`<tr><td colspan="2" class="muted">… +${files.length-300} (todos serão enviados)</td></tr>`:'')||'<tr><td colspan="2" class="muted">nada após o filtro</td></tr>';
+}
+async function doIngest(){
+  const files=window._ingFiles||[];if(!files.length)return;
+  const coll=$('#ing-coll').value.trim()||'default',chunk=+$('#ing-chunk').value||2048;
+  $('#ing-go').disabled=true;
+  const tb=$('#ing-tbody');
+  tb.innerHTML=files.map((f,i)=>`<tr><td class="f">${esc(f.webkitRelativePath||f.name)}</td><td id="ing-st-${i}" class="muted">na fila</td></tr>`).join('');
+  let ok=0,fail=0,chunks=0;const t0=performance.now();
+  for(let i=0;i<files.length;i++){
+    const f=files[i],cell=$('#ing-st-'+i);cell.textContent='enviando…';
+    const rel=f.webkitRelativePath||f.name,name=rel.replace(/\.[^.]+$/,'').replace(/[\/\\]/g,'__');
+    try{
+      const buf=await f.arrayBuffer();
+      const u=`/api/ingest_upload?collection=${encodeURIComponent(coll)}&filename=${encodeURIComponent(f.name)}&name=${encodeURIComponent(name)}&chunk=${chunk}`;
+      const r=await fetch(u,{method:'POST',body:buf});
+      if(r.status===401){showLogin();$('#ing-go').disabled=false;return;}
+      const j=await r.json();
+      if(j.ok){ok++;chunks+=j.n_chunks||0;cell.innerHTML=`<span style="color:var(--ok)">ok · ${j.n_chunks} chunks</span>`;}
+      else{fail++;cell.innerHTML=`<span style="color:#ff6b6b">${esc(j.error||'erro')}</span>`;}
+    }catch(e){fail++;cell.innerHTML=`<span style="color:#ff6b6b">${esc(e.message)}</span>`;}
+    $('#ing-out').innerHTML=`<b>${ok}</b> ok · ${fail} falhas · ${chunks} chunks · ${i+1}/${files.length} · coleção <b>${esc(coll)}</b>`;
+  }
+  $('#ing-out').innerHTML+=` · ${((performance.now()-t0)/1000).toFixed(1)}s`;
+  $('#ing-go').disabled=false;refresh();
+}
+$('#ing-files').addEventListener('change',e=>setIngFiles(e.target.files,false));
+$('#ing-dir').addEventListener('change',e=>setIngFiles(e.target.files,true));
+
+async function refresh(){
+  try{
+    const s=await jget('/api/stats');
+    $('#dot').classList.add('up');
+    $('#meta').innerHTML=`v${s.version} · uptime ${fmtUp(s.uptime_secs)}`;
+    $('#c-coll').textContent=s.collections;$('#c-bases').textContent=nf(s.bases);
+    $('#c-chunks').textContent=nf(s.chunks);$('#c-drivers').textContent=s.drivers;
+    const mx=Math.max(1,...s.collections_detail.map(c=>c.chunks));
+    tb('#t-coll').innerHTML=s.collections_detail.sort((a,b)=>b.chunks-a.chunks).map(c=>`<tr>
+      <td class="f">${c.collection}</td><td class="right">${nf(c.bases)}</td><td class="right">${nf(c.chunks)}</td>
+      <td><div class="bar"><i style="width:${(c.chunks/mx*100).toFixed(1)}%"></i></div></td></tr>`).join('');
+    $('#kv-info').innerHTML=`<b>versão</b><span>${s.version}</span><b>uptime</b><span>${fmtUp(s.uptime_secs)}</span>
+      <b>coleções</b><span>${s.collections}</span><b>bases</b><span>${nf(s.bases)}</span>
+      <b>chunks</b><span>${nf(s.chunks)}</span><b>drivers</b><span>${s.drivers}</span>
+      <b>ragfiles</b><span>${s.ragfiles_dir}</span>`;
+    renderMem(s.mem);
+    const opts='<option value="">(todas)</option>'+s.collections_detail.map(c=>`<option>${c.collection}</option>`).join('');
+    if($('#s-coll').children.length<=1)$('#s-coll').innerHTML=opts;
+    if($('#p-coll').children.length<=1)$('#p-coll').innerHTML=opts;
+    $('#ing-colls').innerHTML=s.collections_detail.map(c=>`<option>${c.collection}</option>`).join('');
+  }catch(e){$('#dot').classList.remove('up');$('#meta').textContent='offline';}
+}
+function renderMem(m){
+  if(!m){$('#mem-gauge').textContent='—';return;}
+  const rss=m.rss_mb,tot=m.sys_total_mb,avail=m.sys_avail_mb;
+  const dataMb=(m.est_text_mb||0)+(m.est_vec_mb||0)+(m.est_words_mb||0);
+  if(rss&&tot){
+    const pct=Math.min(100,rss/tot*100),col=pct<60?'#3fb950':pct<85?'#d29922':'#ff6b6b';
+    $('#mem-bar').style.width=pct.toFixed(1)+'%';$('#mem-bar').style.background=col;
+    $('#mem-gauge').innerHTML=`<span class="big" style="color:${col}">${rss.toFixed(0)} MB</span> residente · sistema ${tot.toFixed(0)} MB${avail?' · '+avail.toFixed(0)+' MB livre':''} · <b>${pct.toFixed(1)}%</b> de pressão`;
+    $('#mem-info').innerHTML=`· modo <b style="color:${m.storage==='hybrid'?'#d29922':'#3fb950'}">${m.storage||'memory'}</b> · ~${dataMb.toFixed(0)} MB de dados RAG em RAM`;
+  }else{
+    $('#mem-bar').style.width='0%';
+    $('#mem-gauge').innerHTML=`<span class="muted">RSS indisponível (host sem /proc, ex: Mac) — estimativa de dados em RAM:</span> <b>~${dataMb.toFixed(0)} MB</b>`;
+    $('#mem-info').textContent='';
+  }
+  const mx=Math.max(0.1,m.est_text_mb||0,m.est_vec_mb||0,m.est_words_mb||0);
+  const row=(lbl,v,c)=>`<div style="display:flex;align-items:center;gap:10px;margin:4px 0">
+    <span style="width:150px;color:var(--dim)">${lbl}</span>
+    <div class="bar" style="flex:1"><i style="width:${(v/mx*100).toFixed(1)}%;background:${c}"></i></div>
+    <span style="width:80px;text-align:right">${(v||0).toFixed(1)} MB</span></div>`;
+  $('#mem-break').innerHTML=
+    row('texto dos chunks',m.est_text_mb||0,'#58a6ff')+
+    row('vetores (recall)',m.est_vec_mb||0,'#3fb950')+
+    row('tokens cache (words)',m.est_words_mb||0,'#d29922')+
+    `<div class="muted" style="margin-top:8px;font-size:11px">texto + tokens dominam a RAM — alvo natural do modo híbrido (disco/mmap), mantendo só o índice de recall em memória.</div>`;
+}
+function searchBody(){const b={base:$('#s-base').value||'*',query:$('#s-q').value,k:+$('#s-k').value||8,phonetic:$('#s-ph').checked};if($('#s-coll').value)b.collection=$('#s-coll').value;return b;}
+async function doSearch(){
+  const q=$('#s-q').value.trim(); if(!q)return;
+  const expand=$('#s-expand').checked;
+  $('#s-info').innerHTML=expand?'<span class="muted">🧠 expandindo + buscando…</span>':'<span class="muted">buscando…</span>';
+  const t0=performance.now();let r;
+  try{r=await jpost(expand?'/api/search_expand':'/api/search',searchBody())}
+  catch(e){$('#s-info').innerHTML='<span style="color:var(--warn)">erro '+e.message+'</span>';return}
+  const ms=(performance.now()-t0).toFixed(1);
+  window._hits=r.hits;
+  if(expand){
+    const dropped=new Set(r.dropped||[]);
+    const chips=(r.expansions||[]).map(e=>dropped.has(e)
+      ?`<span class="pill" style="opacity:.45;text-decoration:line-through" title="fora do corpus deste escopo — não foi buscada">${esc(e)}</span>`
+      :`<span class="pill">${esc(e)}</span>`).join(' ');
+    const src=r.source==='dict'?'<b style="color:var(--ok)">📚 dicionário</b>':r.source==='cache'?'<b style="color:#3fb950">📖 cache</b>':`🧠 IA <b style="color:var(--acc)">${esc(r.provider)}</b>`;
+    if(r.absent){
+      const dym=(r.did_you_mean||[]).map(e=>`<span class="pill" style="border-color:var(--acc);color:var(--acc)">${esc(e)}</span>`).join(' ');
+      $('#s-info').innerHTML=`<span style="color:var(--warn);font-weight:bold">⚠ ausente do corpus</span> · ${src} · <b style="color:var(--ok)">${ms} ms</b>
+        <br><span class="muted">expandi para:</span> ${chips||'—'}
+        <br><span class="muted">este escopo não tem essas sílabas. o mais parecido que ele tem:</span> ${dym||'—'}`;
+      tb('#t-hits').innerHTML='<tr><td colspan="7" class="muted">nenhum termo da consulta existe neste escopo — veja as sugestões acima 👆</td></tr>';
+      return;
+    }
+    $('#s-info').innerHTML=`<span class="big">${r.hits.length}</span> hits · ${src} · <b style="color:var(--ok)">${ms} ms</b><br><span class="muted">sinônimos:</span> ${chips||'—'}`;
+  }else{
+    $('#s-info').innerHTML=`<span class="big">${r.hits.length}</span> hits · ${r.scope.length} bases no escopo · <b style="color:var(--ok)">${ms} ms</b> · sílabas: ${r.query_syllables||'—'}`;
+  }
+  tb('#t-hits').innerHTML=r.hits.map((h,i)=>`<tr class="clk" onclick="openHit(${i})" title="${h.via?('casou via: '+esc(h.via)):'clique p/ ver o chunk inteiro'}">
+    <td>${h.rank}</td><td class="f">${esc(h.collection)}/${esc(h.base)}${h.via&&h.via!=='original'?' <span class="pill" style="font-size:9px">🧠</span>':''}</td>
+    <td class="right">${(h.coverage??h.matchpoint??0).toFixed(2)}</td><td class="right">${h.span??'–'}</td>
+    <td class="right">${(h.cos??0).toFixed(3)}</td><td class="right">${h.chunk}</td>
+    <td class="snip">${esc(h.snippet||'').replace(/«/g,'<b>').replace(/»/g,'</b>')}</td></tr>`).join('')
+    ||'<tr><td colspan="7" class="muted">sem resultados</td></tr>';
+}
+
+// ---- modal de inspeção de chunk (anterior/próximo via /api/chunk) ----
+let _mc=null;   // {collection, base, id}
+function openHit(i){const h=(window._hits||[])[i];if(!h)return;_mc={collection:h.collection,base:h.base,id:h.chunk};openChunk();}
+async function openChunk(){
+  if(!_mc)return;
+  $('#modal').classList.add('open');
+  $('#m-ttl').textContent='carregando…';
+  $('#m-cid').textContent=`chunk ${_mc.id}`;
+  $('#m-text').textContent='carregando…';$('#m-json').textContent='';$('#m-meta').innerHTML='';
+  let r;
+  try{r=await jpost('/api/chunk',{collection:_mc.collection,base:_mc.base,id:_mc.id,before:0,after:0})}
+  catch(e){$('#m-text').textContent='erro '+e.message;return}
+  const c=(r.chunks||[])[0];
+  // título: NOME DO ARQUIVO (corpus) + caminho (base com __ → /)
+  const path=_mc.base.replaceAll('__','/');
+  $('#m-ttl').innerHTML=`<b style="color:var(--ok)">${esc(r.corpus||'?')}</b> <span class="muted">· ${esc(_mc.collection)} · ${esc(path)}</span>`;
+  if(!c){$('#m-text').textContent='(chunk inexistente — fim da base)';$('#m-json').textContent='';$('#m-cid').textContent=`chunk ${_mc.id}`;$('#m-next').disabled=true;return}
+  $('#m-cid').textContent=`chunk ${_mc.id}${r.n_chunks?(' / '+(r.n_chunks-1)):''}`;
+  $('#m-meta').innerHTML=['arquivo: '+(r.corpus||'?'),'id '+c.id,'start '+c.start,'len '+c.len,'tokens '+c.tokens,'oov '+c.oov,'norm '+(c.norm??0).toFixed?.(4)]
+    .map(x=>`<span class="pill">${esc(String(x))}</span>`).join('');
+  $('#m-text').textContent=c.text??'(base sem texto guardado)';
+  $('#m-json').innerHTML=esc(JSON.stringify({corpus:r.corpus,collection:_mc.collection,base:_mc.base,path,id:c.id,start:c.start,len:c.len,tokens:c.tokens,oov:c.oov,norm:c.norm},null,2))
+    .replace(/&quot;(\w+)&quot;:/g,'"<span class="k">$1</span>":');
+  $('#m-prev').disabled=_mc.id<=0;
+  $('#m-next').disabled=r.n_chunks?(_mc.id>=r.n_chunks-1):false;
+}
+function chunkNav(d){if(!_mc)return;const n=_mc.id+d;if(n<0)return;_mc.id=n;openChunk();}
+function closeModal(){$('#modal').classList.remove('open');_mc=null;}
+document.addEventListener('keydown',e=>{
+  if(!$('#modal').classList.contains('open'))return;
+  if(e.key==='Escape')closeModal();
+  if(e.key==='ArrowLeft')chunkNav(-1);
+  if(e.key==='ArrowRight')chunkNav(1);
+});
+async function doPerf(){
+  const n=+$('#p-n').value||30,b={base:'*',query:$('#p-q').value,k:5};if($('#p-coll').value)b.collection=$('#p-coll').value;
+  $('#p-out').textContent='medindo…';const ts=[];
+  for(let i=0;i<n;i++){const t=performance.now();try{await jpost('/api/search',b)}catch(e){$('#p-out').textContent='erro '+e.message;return}ts.push(performance.now()-t);}
+  ts.sort((a,b)=>a-b);const avg=ts.reduce((a,b)=>a+b,0)/ts.length;
+  $('#p-out').innerHTML=`<span class="big">${avg.toFixed(1)} ms</span> média · p50 ${ts[ts.length>>1].toFixed(1)} · min ${ts[0].toFixed(1)} · max ${ts[ts.length-1].toFixed(1)} <span class="muted">(${n} reqs)</span>`;
+}
+// histograma estilo logic_path: barras cinza = embedding do chunk #1, linhas azuis = sílabas da query
+async function doHist(){
+  const b={base:'*',query:$('#p-q').value,k:5}; if($('#p-coll').value)b.collection=$('#p-coll').value;
+  if(!b.query.trim())return;
+  $('#h-info').textContent='— calculando…';
+  let d; try{d=await jpost('/api/histogram',b)}catch(e){$('#h-info').textContent='erro '+e.message;return}
+  if(!d.found){$('#h-info').textContent='— nenhum chunk convergiu';drawMF(null);drawHist(null);return}
+  $('#h-info').innerHTML=`· <span style="color:var(--acc)">${esc(d.collection)}/${esc(d.base)} #${d.chunk_id}</span> · cov ${(+d.coverage||0).toFixed(2)} · cos ${(+d.cos||0).toFixed(3)} · sílabas: ${esc(d.query_syllables||'—')}`;
+  drawMF(d);drawHist(d);
+}
+const MFCOLS=['#58a6ff','#c0392b','#3fb950','#d29922','#a371f7','#ec6cb9'];
+function drawMF(d){
+  const cv=$('#mf'),W=cv.clientWidth||900,H=240,dpr=window.devicePixelRatio||1;
+  cv.width=W*dpr;cv.height=H*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+  ctx.fillStyle='#0d1117';ctx.fillRect(0,0,W,H);
+  const padL=48,padR=14,padT=18,padB=34,pw=W-padL-padR,ph=H-padT-padB,base=padT+ph;
+  if(!d||!d.mf||!d.mf.length||!d.seq_len){ctx.fillStyle='#7d8590';ctx.font='12px monospace';ctx.textAlign='center';ctx.fillText(d?'chunk sem texto guardado':'sem dados',W/2,base-ph/2);$('#mf-info').textContent='';return;}
+  const N=Math.max(1,d.seq_len),X=p=>padL+p/N*pw,Y=f=>base-f*ph;
+  ctx.strokeStyle='#2b3340';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(padL,padT);ctx.lineTo(padL,base);ctx.lineTo(padL+pw,base);ctx.stroke();
+  ctx.fillStyle='#7d8590';ctx.font='10px monospace';ctx.textAlign='right';
+  [0,0.5,1].forEach(f=>{ctx.fillText(f.toFixed(1),padL-6,Y(f)+3);ctx.strokeStyle='#161b22';ctx.beginPath();ctx.moveTo(padL,Y(f));ctx.lineTo(padL+pw,Y(f));ctx.stroke();});
+  ctx.textAlign='center';for(let i=0;i<=4;i++){const p=Math.round(N*i/4);ctx.fillText(String(p),X(p),base+15);}
+  let best=null;
+  d.mf.forEach(m=>{
+    // cada spike colorido pela fração que casa: mais alto = mais quente + mais grosso
+    m.points.forEach(([p,f])=>{const x=Math.round(X(p))+.5;ctx.strokeStyle=heat(f);ctx.lineWidth=2.5+f*3.5;
+      ctx.beginPath();ctx.moveTo(x,base);ctx.lineTo(x,Y(f));ctx.stroke();});
+    if(!best||m.peak>best.peak)best={...m};});
+  // ponto de convergência (maior pico entre os termos)
+  if(best&&best.peak>0){const x=X(best.peak_pos),y=Y(best.peak);
+    ctx.strokeStyle='#fff';ctx.fillStyle=heat(best.peak);ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(x,y,5,0,7);ctx.fill();ctx.stroke();
+    const tx=Math.min(x+22,padL+pw-230),ty=Math.min(y+30,base-14);
+    ctx.strokeStyle='#8a93a0';ctx.beginPath();ctx.moveTo(tx,ty);ctx.lineTo(x+6,y+5);ctx.stroke();
+    ctx.fillStyle='#fcfdbf';ctx.font='11px monospace';ctx.textAlign='left';
+    ctx.fillText(`convergência: p=${best.peak_pos} · ${best.term} · ${best.peak.toFixed(2)}`,tx,ty+13);}
+  ctx.fillStyle='#7d8590';ctx.font='11px monospace';ctx.textAlign='center';
+  ctx.fillText('posição no chunk (sequência de sílabas, 0..'+N+')',padL+pw/2,H-6);
+  $('#mf-info').innerHTML=d.mf.map(m=>`<b>${esc(m.term)}</b> pico ${m.peak.toFixed(2)}`).join(' · ')+' &nbsp; '+heatbar('fração que casa:');
+}
+function drawHist(d){
+  const cv=$('#hist'),W=cv.clientWidth||900,H=340,dpr=window.devicePixelRatio||1;
+  cv.width=W*dpr;cv.height=H*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+  ctx.fillStyle='#0d1117';ctx.fillRect(0,0,W,H);
+  const padL=48,padR=14,padT=30,padB=36,pw=W-padL-padR,ph=H-padT-padB,base=padT+ph;
+  if(!d){ctx.fillStyle='#7d8590';ctx.font='13px monospace';ctx.textAlign='center';ctx.fillText('sem dados',W/2,base-ph/2);return;}
+  const vocab=Math.max(1,d.vocab_size);let maxC=1;
+  d.chunk.forEach(p=>maxC=Math.max(maxC,p.c));d.query.forEach(p=>maxC=Math.max(maxC,p.c));
+  const X=dim=>padL+dim/vocab*pw,Y=c=>base-c/maxC*ph;
+  ctx.strokeStyle='#2b3340';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(padL,padT);ctx.lineTo(padL,base);ctx.lineTo(padL+pw,base);ctx.stroke();
+  ctx.fillStyle='#7d8590';ctx.font='10px monospace';ctx.textAlign='right';
+  ctx.fillText('0',padL-6,base+3);ctx.fillText(String(maxC),padL-6,padT+8);ctx.fillText((maxC/2|0)+'',padL-6,padT+ph/2);
+  ctx.textAlign='center';
+  for(let i=0;i<=4;i++){const dim=Math.round(vocab*i/4),x=X(dim);ctx.fillText(String(dim),x,base+16);
+    ctx.strokeStyle='#161b22';ctx.beginPath();ctx.moveTo(x,padT);ctx.lineTo(x,base);ctx.stroke();}
+  // embedding do chunk: cor pela contagem (gamma p/ aquecer mais) + grossura conforme altura
+  d.chunk.forEach(p=>{const t=p.c/maxC,x=Math.round(X(p.dim))+.5;
+    ctx.strokeStyle=heat(Math.pow(t,0.6));ctx.lineWidth=2+t*3;
+    ctx.beginPath();ctx.moveTo(x,base);ctx.lineTo(x,Y(p.c));ctx.stroke();});
+  // dimensões da query: linha de altura TOTAL — VERDE = converge com o chunk (contribui pro
+  // cosseno), AZUL = só na query (não há no chunk)
+  d.query.forEach(p=>{const x=Math.round(X(p.dim))+.5;
+    ctx.strokeStyle=p.hit?'rgba(63,185,80,0.40)':'rgba(88,166,255,0.26)';ctx.lineWidth=2.5;
+    ctx.beginPath();ctx.moveTo(x,padT);ctx.lineTo(x,base);ctx.stroke();});
+  // barra de contagem da query (sólido, por cima)
+  d.query.forEach(p=>{const x=Math.round(X(p.dim))+.5;
+    ctx.strokeStyle=p.hit?'#3fb950':'#58a6ff';ctx.lineWidth=4.5;
+    ctx.beginPath();ctx.moveTo(x,base);ctx.lineTo(x,Y(p.c));ctx.stroke();});
+  // rótulo da sílaba no topo de cada dimensão da query
+  ctx.font='9px monospace';ctx.textAlign='center';
+  d.query.forEach((p,i)=>{const x=X(p.dim);ctx.fillStyle=p.hit?'#56d364':'#79c0ff';ctx.fillText(p.syl,x,padT-12+((i%2)*9));});
+  ctx.fillStyle='#7d8590';ctx.font='11px monospace';ctx.textAlign='center';
+  ctx.fillText('dimensão (índice fixo do vocabulário, 0..'+vocab+')',padL+pw/2,H-6);
+  const hits=d.query.filter(p=>p.hit).length;
+  $('#h-legend').innerHTML=`<span>chunk (embedding · ${d.chunk.length} dims) — ${heatbar('contagem:')}</span>
+    <span><span style="display:inline-block;width:14px;height:3px;background:#3fb950;vertical-align:middle"></span> query convergente (${hits} dims no cosseno)</span>
+    <span><span style="display:inline-block;width:14px;height:3px;background:#58a6ff;vertical-align:middle"></span> query só-query (${d.query.length-hits})${d.query_oov?' · '+d.query_oov+' oov':''}</span>
+    <span class="muted">contagem máx ${maxC}</span>`;
+}
+function dcard(x){
+  return `<div class="dcard" draggable="true" data-file="${esc(x.name)}" title="${esc(x.description||'')}">
+    <span><span class="lang">${esc(x.language||x.name)}</span> <span class="sub">${nf(x.syllables||0)}s${x.keywords?' · '+x.keywords+'kw':''}</span></span>
+    <span class="ext">${esc((x.extensions||[]).slice(0,4).join(' '))}</span></div>`;
+}
+function dcardDict(x){
+  const mb=(x.size_bytes?(x.size_bytes/1048576).toFixed(1)+' MB':'');
+  const lic=x.license||'—', warn=/verificar|—|^$/i.test(lic)?' warn':'';
+  const tip=`${esc(x.source||'')}${x.source_url?' · '+esc(x.source_url):''}`;
+  return `<div class="dcard" draggable="true" data-file="${esc(x.code)}" title="${tip}">
+    <span><span class="lang">${esc(x.code)}</span> <span class="sub">${nf(x.entries||0)} entradas${mb?' · '+mb:''}</span></span>
+    <span class="lic${warn}">${esc(lic)}</span></div>`;
+}
+async function loadDrivers(){
+  try{
+    const [ins,out]=await Promise.all([jget('/api/drivers'),jget('/api/drivers_out')]);
+    const sort=a=>a.sort((x,y)=>(x.language||x.name).localeCompare(y.language||y.name));
+    $('#list-in').innerHTML=sort(ins.drivers).map(dcard).join('')||'<span class="muted">vazio</span>';
+    $('#list-out').innerHTML=sort(out.drivers).map(dcard).join('')||'<span class="muted">vazio — arraste drivers pra cá pra desinstalar</span>';
+    $('#n-in').textContent=ins.count;$('#n-out').textContent=out.count;
+    wireDnD();
+  }catch(e){$('#list-in').innerHTML='<span class="muted">erro '+e.message+'</span>'}
+}
+async function loadDicts(){
+  try{
+    const r=await jget('/api/thesaurus');
+    const sort=a=>a.sort((x,y)=>(x.code||'').localeCompare(y.code||''));
+    const on=sort(r.dicts.filter(d=>d.active)), off=sort(r.dicts.filter(d=>!d.active));
+    $('#list-dict-on').innerHTML=on.map(dcardDict).join('')||'<span class="muted">nenhum ativo — arraste um dicionário pra cá</span>';
+    $('#list-dict-off').innerHTML=off.map(dcardDict).join('')||'<span class="muted">todos ativos</span>';
+    $('#n-dict-on').textContent=on.length;$('#n-dict-off').textContent=off.length;
+    wireDnD();
+  }catch(e){$('#list-dict-on').innerHTML='<span class="muted">erro '+e.message+'</span>'}
+}
+// ---- Nidhogg (camada de inteligência; módulo na 11497 via proxy do ragd) ----
+async function loadNidhogg(){
+  let d; try{d=await jget('/api/nidhogg')}catch(e){return}
+  const off=!d.online;
+  $('#nid-offline').style.display=off?'block':'none';
+  $('#nid-on').style.display=off?'none':'block';
+  if(off)return;
+  const on=!!d.on;
+  $('#nid-state').innerHTML=on?`<b style="color:var(--ok)">LIGADO</b> · nível <b style="color:var(--acc)">${esc(d.level_name)}</b>`:'<b style="color:var(--dim)">desligado</b>';
+  $('#nid-toggle').textContent=on?'desligar':'ligar';
+  $('#nid-cadence').value=d.cadence_secs||300;
+  $('#nid-levels').innerHTML=(d.levels||[]).map(l=>`
+    <div class="dcard" style="cursor:pointer;${l.n===d.level?'border-color:var(--acc);background:#0d1117':''}" onclick="nidSetLevel(${l.n})">
+      <span><span class="lang">${l.n===d.level?'● ':'○ '}${esc(l.name)}</span> <span class="sub">${l.ia?'🧠 usa IA':'⚙ sem IA'}</span> <span class="sub">— ${esc(l.desc)}</span></span></div>`).join('');
+  $('#nid-info').innerHTML=`<b>módulo</b><span>${esc(d.module)} v${esc(d.version)} · 🟢 online</span>
+    <b>ragd (corpus)</b><span>${d.ragd_online?'🟢 online':'🔴 offline'} · ${esc(d.ragd_api||'')}</span>
+    <b>conhecimento</b><span>${d.collections_known??0} coleção(ões) · ${esc(d.dir||'')}</span>
+    <b>último ciclo</b><span>${esc(d.last_cycle||'—')}</span>`;
+  loadNidColls();
+}
+async function nidToggle(){
+  const d=await jget('/api/nidhogg').catch(()=>null); if(!d||!d.online)return;
+  try{await jpost('/api/nidhogg',{on:!d.on})}catch(e){$('#nid-msg').textContent='erro '+e.message;return}
+  loadNidhogg();refresh();
+}
+async function nidSetLevel(n){ try{await jpost('/api/nidhogg',{level:n})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} loadNidhogg(); }
+async function nidSetCadence(){ const c=+$('#nid-cadence').value||300; try{await jpost('/api/nidhogg',{cadence:c})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} $('#nid-msg').textContent='cadência aplicada'; }
+async function loadNidColls(){
+  let d; try{d=await jget('/api/nidhogg/collections')}catch(e){$('#nid-colls').innerHTML='<span class="muted">erro</span>';return}
+  const cs=(d.collections||[]);
+  $('#nid-colls').innerHTML=cs.length?cs.map(c=>`
+    <div class="dcard"><span><span class="lang">${esc(c.collection)}</span> <span class="sub">${c.bases??'?'} bases${c.has_knowledge?' · 📖 destilado':''}</span></span>
+      <button class="go ${c.enabled?'':'ghost'}" style="padding:3px 10px" onclick="nidColl('${esc(c.collection)}',${!c.enabled})">${c.enabled?'comendo':'desligado'}</button></div>`).join('')
+    :'<span class="muted">nenhuma coleção no ragd</span>';
+}
+async function nidColl(coll,enabled){ try{await jpost('/api/nidhogg/collection',{collection:coll,enabled})}catch(e){return} loadNidColls(); }
+let _dragFile=null,_as=null;
+function stopScroll(){clearInterval(_as);_as=null;}
+function edgeScroll(el,y){            // rola a lista continuamente perto da borda sup/inf
+  clearInterval(_as);_as=null;
+  const r=el.getBoundingClientRect(),m=44;
+  let dir=0; if(y<r.top+m)dir=-1; else if(y>r.bottom-m)dir=1;
+  if(dir)_as=setInterval(()=>{el.scrollTop+=dir*14;},16);
+}
+function wireDnD(){
+  document.querySelectorAll('.dcard').forEach(c=>{
+    c.ondragstart=e=>{_dragFile=c.dataset.file;e.dataTransfer.setData('text/plain',c.dataset.file);e.dataTransfer.effectAllowed='move';c.classList.add('drag');};
+    c.ondragend=()=>{c.classList.remove('drag');_dragFile=null;stopScroll();};
+  });
+  document.querySelectorAll('.dlist').forEach(l=>{
+    l.addEventListener('dragover',e=>edgeScroll(l,e.clientY));
+    l.addEventListener('dragleave',stopScroll);
+  });
+  document.querySelectorAll('.dz').forEach(z=>{
+    z.ondragover=e=>{e.preventDefault();e.dataTransfer.dropEffect='move';z.classList.add('over');};
+    z.ondragleave=()=>z.classList.remove('over');
+    z.ondrop=async e=>{
+      e.preventDefault();z.classList.remove('over');stopScroll();
+      const file=e.dataTransfer.getData('text/plain')||_dragFile; if(!file)return;
+      const action=z.dataset.action;          // destino: install/uninstall (drivers) | enable/disable (dict)
+      const here=z.querySelector(`[data-file="${CSS.escape(file)}"]`);
+      if(here)return;                          // soltou no painel onde já está → no-op
+      if(z.dataset.kind==='dict'){
+        try{await jpost('/api/thesaurus_toggle',{code:file,action});}
+        catch(err){alert('erro ao alternar '+file+': '+err.message);return}
+        loadDicts();refresh();
+      }else{
+        try{await jpost('/api/driver_move',{file,action});}
+        catch(err){alert('erro ao mover '+file+': '+err.message);return}
+        loadDrivers();refresh();
+      }
+    };
+  });
+}
+$('#s-q').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();doSearch()}});
+$('#p-q').addEventListener('keydown',e=>{if(e.key==='Enter')doPerf()});
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>

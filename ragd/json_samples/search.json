@@ -1,0 +1,7 @@
+{
+	"base": "sda",
+	"query": "Frodo Bolseiro",
+	"k": 5,
+	"rerank": true,
+	"recall_n": 20
+}

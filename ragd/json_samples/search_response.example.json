@@ -1,0 +1,53 @@
+{
+	"query": "Frodo Bolseiro",
+	"query_syllables": "fro-do-bol-sei-ro",
+	"bases": [
+		"sda"
+	],
+	"searched": [
+		{
+			"base": "sda",
+			"n_chunks": 1489,
+			"n_converge": 1451,
+			"dims": 4,
+			"oov": 0,
+			"ms_recall": 1.7888330000000001,
+			"ms_rerank": 7.129
+		}
+	],
+	"hits": [
+		{
+			"base": "sda",
+			"matchpoint": 0.8,
+			"mf": 1.0,
+			"span": 2,
+			"cos": 0.2664040538543678,
+			"chunk": 28,
+			"start": 57193,
+			"snippet": "…, e favorito de Bilbo, era o jovem «Frodo» «Bolseiro». Quando B ilbo tinha noventa e nove anos, adotou «Frodo» como seu herdeiro, e o trouxe para…",
+			"rank": 1
+		},
+		{
+			"base": "sda",
+			"matchpoint": 0.606060606060606,
+			"mf": 0.8333333333333333,
+			"span": 3,
+			"cos": 0.1360226588558859,
+			"chunk": 87,
+			"start": 177773,
+			"snippet": "…102 anos.) A razão pela qual o Sr. «Frodo» estava vendendo sua bonita toca gerava ainda mais discussões que o preço. Alguns tinham a teoria —…",
+			"rank": 2
+		},
+		{
+			"base": "sda",
+			"matchpoint": 0.5714285714285714,
+			"mf": 1.0,
+			"span": 6,
+			"cos": 0.13275380003020618,
+			"chunk": 216,
+			"start": 441383,
+			"snippet": "…a reputação de homem letrado): Sr. «FRODO» CONDADO. B OLSE I RO, B OLSÃO, VI LA DOS HOB B I T S, NO — Uma carta de Gandalf. Para mim! — gritou…",
+			"rank": 3
+		}
+	]
+}

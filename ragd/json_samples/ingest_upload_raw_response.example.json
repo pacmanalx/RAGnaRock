@@ -1,0 +1,11 @@
+{
+    "ok": true,
+    "name": "sample_raw",
+    "filename": "sample.txt",
+    "corpus": "sample.txt",
+    "n_chunks": 2,
+    "bytes": 3087,
+    "bases": 2,
+    "saved_to": "/Users/alexandrepereira/dev/ragnarock/ragfiles/sample_raw-tokenized.json",
+    "via": "raw"
+}

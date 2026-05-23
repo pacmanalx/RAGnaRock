@@ -1,0 +1,9 @@
+{
+    "file": "foo.py",
+    "extension": ".py",
+    "drivers_dir": "drivers",
+    "drivers_scanned": 33,
+    "matched": true,
+    "driver": "tokens_Python_PTBR.drv",
+    "language": "Python"
+}
