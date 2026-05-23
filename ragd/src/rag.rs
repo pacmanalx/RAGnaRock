@@ -337,7 +337,14 @@ impl RagBase {
         let cand: Vec<(f64, usize)> = scored.into_iter().take(rn).collect();
         info.recall_n = cand.len();
         info.ms_recall = t0.elapsed().as_secs_f64() * 1000.0;
-        let hits: Vec<Hit> = if info.rerank {
+        let hits = self.finish(query, cand, k, phonetic, &mut info);
+        (hits, info)
+    }
+
+    /// Estágio 2 compartilhado: rerank (cobertura → proximidade → cos) ou top-k puro.
+    /// Usado pelo recall local (`search`) e pelo unificado (`search_unified`) — sem duplicação.
+    fn finish(&self, query: &str, cand: Vec<(f64, usize)>, k: usize, phonetic: bool, info: &mut Info) -> Vec<Hit> {
+        if info.rerank {
             let t1 = std::time::Instant::now();
             let qt = prep_query(query);   // tokeniza a query 1× (hoist), não por candidato
             let mut res: Vec<Hit> = cand.iter().map(|&(cos, cid)| {
@@ -360,7 +367,36 @@ impl RagBase {
             res.into_iter().take(k).collect()
         } else {
             cand.into_iter().take(k).map(|(cos, cid)| (None, None, None, cos, cid)).collect()
+        }
+    }
+
+    /// Igual ao `search`, mas o RECALL roda no espaço UNIFICADO da coleção: a query já vem
+    /// vetorizada (qvec/qnorm globais) e o `vec` de cada chunk é remapeado via `remap`+`unorms`.
+    /// O rerank (estágio 2) é idêntico. Caller usa `search` (local) quando não há perfil.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_unified(&self, query: &str, k: usize, rerank: bool, recall_n: usize, phonetic: bool,
+                          qvec: &HashMap<usize, f64>, qnorm: f64, remap: &[usize], unorms: &[f64]) -> (Vec<Hit>, Info) {
+        let mut info = Info { syls: vec![], oov: 0, dims: qvec.len(), n_chunks: self.chunks.len(),
+            n_converge: 0, recall_n: 0, rerank: rerank && self.has_text, ms_recall: 0.0, ms_rerank: 0.0 };
+        if qvec.is_empty() { return (vec![], info); }
+        let t0 = std::time::Instant::now();
+        let score_one = |cid: usize, c: &Chunk| -> Option<(f64, usize)> {
+            let un = unorms.get(cid).copied().unwrap_or(0.0);
+            let s = cosine_unified(qvec, qnorm, c, remap, un);
+            if s > 0.0 { Some((s, cid)) } else { None }
         };
+        let mut scored: Vec<(f64, usize)> = if self.chunks.len() >= PAR_RECALL_MIN {
+            self.chunks.par_iter().enumerate().filter_map(|(cid, c)| score_one(cid, c)).collect()
+        } else {
+            self.chunks.iter().enumerate().filter_map(|(cid, c)| score_one(cid, c)).collect()
+        };
+        info.n_converge = scored.len();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(b.1.cmp(&a.1)));
+        let rn = if info.rerank { k.max(recall_n) } else { k };
+        let cand: Vec<(f64, usize)> = scored.into_iter().take(rn).collect();
+        info.recall_n = cand.len();
+        info.ms_recall = t0.elapsed().as_secs_f64() * 1000.0;
+        let hits = self.finish(query, cand, k, phonetic, &mut info);
         (hits, info)
     }
 
@@ -426,5 +462,171 @@ impl RagBase {
 
         json!({"vocab_size": self.index.len(), "query": q, "query_oov": oov,
                "chunk": chunk, "seq_len": n, "mf": mf})
+    }
+}
+
+// --------------------- [#8] perfil unificado por coleção ---------------------
+/// Junta os vocabs dos drivers de TODAS as bases de uma coleção num espaço de
+/// dimensões GLOBAL e recomputa o idf sobre todos os chunks da coleção (o "idf de
+/// repo"). Construído em memória; os JSONs no disco não mudam. O `remap` traduz a
+/// dim local de cada base → dim global, pro cosseno remapear on-the-fly na busca.
+pub struct CollectionProfile {
+    pub uvocab: HashMap<String, usize>,      // sílaba → dim global
+    pub uidf: HashMap<usize, f64>,           // dim global → idf unificado (coleção)
+    pub remap: HashMap<String, Vec<usize>>,  // base_name → (dim local → dim global)
+    pub unorms: HashMap<String, Vec<f64>>,   // base_name → norma tf-idf unificada por chunk
+}
+
+/// Constrói o perfil unificado das bases de uma coleção. Determinístico: ordena bases
+/// por nome e sílabas por dim local — a mesma coleção gera sempre o mesmo perfil.
+pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionProfile {
+    let mut uvocab: HashMap<String, usize> = HashMap::new();
+    let mut remap: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut names: Vec<&String> = bases.keys().collect();
+    names.sort();
+    for name in &names {
+        let base = &bases[*name];
+        let mut m = vec![0usize; base.index.len()];
+        let mut pairs: Vec<(&String, usize)> = base.index.iter().map(|(s, &d)| (s, d)).collect();
+        pairs.sort_by_key(|(_, d)| *d);
+        for (syl, ld) in pairs {
+            let next = uvocab.len();
+            let gd = *uvocab.entry(syl.clone()).or_insert(next);
+            if ld < m.len() { m[ld] = gd; }
+        }
+        remap.insert((*name).clone(), m);
+    }
+    // tfs remapeados por base (pro idf de coleção e pras normas unificadas)
+    let mut flat: Vec<HashMap<usize, u32>> = Vec::new();
+    let mut per_base: Vec<(String, Vec<HashMap<usize, u32>>)> = Vec::new();
+    for name in &names {
+        let base = &bases[*name];
+        let m = &remap[*name];
+        let mut bt: Vec<HashMap<usize, u32>> = Vec::with_capacity(base.chunks.len());
+        for ch in &base.chunks {
+            let mut tf: HashMap<usize, u32> = HashMap::with_capacity(ch.vec.len());
+            for (&ld, &cnt) in &ch.vec {
+                if ld < m.len() { tf.insert(m[ld], cnt as u32); }
+            }
+            flat.push(tf.clone());
+            bt.push(tf);
+        }
+        per_base.push(((*name).clone(), bt));
+    }
+    let uidf = crate::vector::compute_idf(&flat, flat.len());
+    // norma unificada (tf-idf no espaço global) por chunk — denominador do cosseno
+    let mut unorms: HashMap<String, Vec<f64>> = HashMap::new();
+    for (name, bt) in &per_base {
+        let norms = bt.iter().map(|tf| crate::vector::tfidf_norm(tf, &uidf)).collect();
+        unorms.insert(name.clone(), norms);
+    }
+    CollectionProfile { uvocab, uidf, remap, unorms }
+}
+
+/// Vetoriza a query no espaço unificado da coleção (mesmo esquema do query_vec: tf*idf).
+pub fn query_vec_unified(query: &str, p: &CollectionProfile) -> (HashMap<usize, f64>, f64) {
+    let lower = query.to_lowercase();
+    let mut tf: HashMap<usize, u32> = HashMap::new();
+    for w in words(&lower) {
+        for s in syllabify(&w) {
+            let ns = normalize(&s);
+            if ns.is_empty() { continue; }
+            if let Some(&gd) = p.uvocab.get(&ns) { *tf.entry(gd).or_insert(0) += 1; }
+        }
+    }
+    let mut qvec: HashMap<usize, f64> = HashMap::new();
+    let mut sum = 0.0;
+    for (&gd, &c) in &tf {
+        let w = c as f64 * p.uidf.get(&gd).copied().unwrap_or(0.0);
+        if w != 0.0 { qvec.insert(gd, w); sum += w * w; }
+    }
+    let qnorm = sum.sqrt();
+    (qvec, if qnorm == 0.0 { 1.0 } else { qnorm })
+}
+
+/// Cosseno de um chunk (vec em dims LOCAIS) contra a query (espaço GLOBAL), remapeando
+/// on-the-fly via `remap` + idf unificado. Replica o esquema do `cosine` atual: dot da
+/// query tf-idf com o tf cru do chunk, sobre qnorm × norma tf-idf unificada do chunk.
+pub fn cosine_unified(qvec: &HashMap<usize, f64>, qnorm: f64, chunk: &Chunk, remap: &[usize], unorm: f64) -> f64 {
+    if unorm == 0.0 { return 0.0; }
+    let mut dot = 0.0;
+    for (&ld, &cnt) in &chunk.vec {
+        if ld >= remap.len() { continue; }
+        if let Some(&wq) = qvec.get(&remap[ld]) { dot += wq * cnt; }
+    }
+    dot / (qnorm * unorm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn mk_base(vocab: &[&str], chunks: &[&[usize]]) -> RagBase {
+        let index: HashMap<String, usize> =
+            vocab.iter().enumerate().map(|(i, s)| (s.to_string(), i)).collect();
+        let chunks: Vec<Chunk> = chunks.iter().enumerate().map(|(i, dims)| Chunk {
+            id: i, start: 0, len: 0, tokens: 0, oov: 0, file: None,
+            vec: dims.iter().map(|&d| (d, 1.0)).collect(),
+            norm: 1.0, text: None, words: Vec::new(),
+        }).collect();
+        let n = chunks.len();
+        RagBase { index, idf: HashMap::new(), chunks, has_text: false,
+                  n_chunks: n, vocab_size: vocab.len(), corpus: "t".into(), generator: "t".into() }
+    }
+    #[test]
+    fn unifies_vocabs_across_different_drivers() {
+        // base "a" (driver 1): vocab [fro, do]; base "b" (driver 2): vocab [do, ga].
+        // "do" tem dim LOCAL diferente em cada (1 em a, 0 em b) — o furo poliglota.
+        let mut bases = HashMap::new();
+        bases.insert("a".to_string(), mk_base(&["fro", "do"], &[&[0, 1]]));
+        bases.insert("b".to_string(), mk_base(&["do", "ga"], &[&[0, 1]]));
+        let p = build_collection_profile(&bases);
+        assert_eq!(p.uvocab.len(), 3); // união: fro, do, ga
+        let g_do = p.uvocab["do"];
+        assert_eq!(p.remap["a"][1], g_do); // "do" local 1 em "a" → mesmo dim global
+        assert_eq!(p.remap["b"][0], g_do); // "do" local 0 em "b" → mesmo dim global
+        // idf de coleção: "do" em 2 chunks de 2 → ln((2+1)/2); "fro" em 1 de 2 → ln(3/1)
+        assert!((p.uidf[&g_do] - (3.0_f64 / 2.0).ln()).abs() < 1e-9);
+        assert!((p.uidf[&p.uvocab["fro"]] - (3.0_f64 / 1.0).ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unified_cosine_remaps_local_dims_across_bases() {
+        let mut bases = HashMap::new();
+        // "a": vocab[fro,do], chunk0=[fro,do], chunk1=[fro]; "b": vocab[do,ga], chunk0=[do,ga]
+        bases.insert("a".to_string(), mk_base(&["fro", "do"], &[&[0, 1], &[0]]));
+        bases.insert("b".to_string(), mk_base(&["do", "ga"], &[&[0, 1]]));
+        let p = build_collection_profile(&bases);
+        let g_do = p.uvocab["do"];
+        // query (espaço global) = só "do"
+        let qw = p.uidf[&g_do];
+        let mut qvec = HashMap::new();
+        qvec.insert(g_do, qw);
+        let qnorm = qw.abs().max(1e-12);
+        // chunk de "b" tem "do" no dim LOCAL 0 → remapeado casa a query global
+        let s_b = cosine_unified(&qvec, qnorm, &bases["b"].chunks[0], &p.remap["b"], p.unorms["b"][0]);
+        // chunk1 de "a" (só "fro") não tem "do" → 0
+        let s_a1 = cosine_unified(&qvec, qnorm, &bases["a"].chunks[1], &p.remap["a"], p.unorms["a"][1]);
+        assert!(s_b > 0.0, "chunk de outra base/driver deve casar via remap");
+        assert_eq!(s_a1, 0.0, "chunk sem o termo não casa");
+    }
+
+    #[test]
+    fn search_unified_finds_cross_driver_chunk() {
+        let mut bases = HashMap::new();
+        bases.insert("a".to_string(), mk_base(&["fro", "do"], &[&[0, 1], &[0]]));
+        bases.insert("b".to_string(), mk_base(&["do", "ga"], &[&[0, 1]]));
+        let p = build_collection_profile(&bases);
+        let g_do = p.uvocab["do"];
+        let qw = p.uidf[&g_do];
+        let mut qvec = HashMap::new();
+        qvec.insert(g_do, qw);
+        let qnorm = qw.abs().max(1e-12);
+        // base "b": chunk0 tem "do" (dim local 0) → casa via remap
+        let (hb, _) = bases["b"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["b"], &p.unorms["b"]);
+        assert_eq!(hb.len(), 1);
+        // base "a": só chunk0 (fro,do) casa; chunk1 (só fro) não
+        let (ha, _) = bases["a"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["a"], &p.unorms["a"]);
+        assert_eq!(ha.len(), 1);
+        assert_eq!(ha[0].4, 0); // cid do chunk com "do"
     }
 }
