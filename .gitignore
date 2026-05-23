@@ -7,6 +7,8 @@ ragnarock.cfg
 # ── Memória / config do agente (não é fonte do projeto) ──
 .claude/
 MEMORY.md
+# instruções internas do Claude Code (paths locais, memória) — fora do repo público
+CLAUDE.md
 
 # ── Dados gerados / regeneráveis ──
 # bases tokenizadas (geradas; podem conter código de CLIENTE)
