@@ -29,6 +29,10 @@ logic_path/sample.txt
 # tirar do repo público; recriar uma pasta docs/ curada depois se quiser
 docs/
 
+# ── Textos de divulgação (prazo de validade — trocam a cada release) ──
+# posts de LinkedIn/Face/Insta por versão; não poluir o histórico do repo OSS
+announce/
+
 # ── Build artifacts ──
 **/target/
 **/node_modules/
