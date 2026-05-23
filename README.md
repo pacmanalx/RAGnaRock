@@ -70,26 +70,25 @@ No mito nórdico, **Níðhöggr** é a serpente que rói as raízes de Yggdrasil
 é um *worm* (do bem) que **digere o conhecimento** das coleções e o destila num saber que **sobrevive
 à deleção da coleção** — fechando a mitologia: *Ragnarök* (o RAG) tem seu próprio Níðhöggr.
 
-**Como funciona:**
+É a **camada analítica** do projeto, e é **autônoma** — o `ragd` **nunca** a consome; o leitor é o
+**humano** (via ValHalla/export). Processo separado (porta **11497**) que lê o corpus **sempre pela API
+do `ragd`** (nunca do disco). Nasce **desligado**, liga **por coleção**, com dois "dials": **nível**
+(profundidade) e **cadência** (de quanto em quanto tempo mastiga).
 
-- **Processo separado** (porta **11497**, um "daemon de módulos"). Lê o corpus **sempre pela API do
-  `ragd`** (nunca do disco) — então independe de onde os dados moram.
-- **Nasce desligado** e liga **por coleção** (não fica re-mastigando a mesma). Tem dois "dials":
-  **nível** (profundidade) e **cadência** (de quanto em quanto tempo mastiga).
-- **Quatro níveis cumulativos:**
-  | nível | precisa de IA? | o que destila |
-  |---|---|---|
-  | **0 · burro** | não | índice de raízes, dicionário do corpus, digestão do cache — **núcleo seguro, custo zero** |
-  | **1 · consciente** | sim | insights e resumo por coleção (o saber que sobrevive à deleção) |
-  | **2 · estrutural** | sim | hierarquia e encaixe de dimensões entre projetos/ingestões |
-  | **3 · propositivo** | sim | acha furos, sugere, comenta, resume inteligente |
-- O conhecimento destilado é persistido por coleção (`<coleção>.knowledge.json`) com **proveniência** e
-  **saturação** — rastreável e auditável, com `source_hash` (referência por hash, não por nome) e coleta
-  de órfãos, pra não contaminar resultados com saber obsoleto.
+**Quatro níveis** (os de IA rodam em ordem, 1→2→3):
+
+| nível | IA? | o que destila |
+|---|---|---|
+| **0 · burro** | não | índice de raízes + dicionário do corpus + digestão do cache: o RAG **se auto-organiza** sobre as próprias coleções. Custo zero |
+| **1 · consciente** | sim | resumo/insights por coleção |
+| **2 · estrutural** | sim | **árvore de conhecimento** / mapa mental da obra |
+| **3 · propositivo** | sim | **documento vivo** que aprofunda no tempo + furos e sugestões |
 
 > **Estado:** esqueleto pronto (API, keepalive, estrutura de conhecimento, os 4 níveis e os dials); a
-> inteligência por nível está em desenvolvimento. Nível 0 (sem IA) é o caminho seguro; níveis 1–3
-> (com IA) são **opt-in e experimentais**. Desenho completo + riscos honestos em [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
+> inteligência por nível está em desenvolvimento. Nível 0 (sem IA) é o caminho seguro; níveis 1–3 (com IA)
+> são **opt-in e experimentais**. O desenho completo (artefatos versionados que sobrevivem à deleção,
+> gate de aceite, grafo de IAs, prompt por nível e os riscos honestos) está em
+> [`ARCHITECTURE.md`](ARCHITECTURE.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
 
