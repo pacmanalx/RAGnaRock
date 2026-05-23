@@ -218,6 +218,9 @@ TTL; **[FUTURO]** senha real). Abas:
   aparece aqui).
 - **Config** — storage `memory|hybrid`, chaves de API (cofre mascarado, 1 provider ativo), restart.
 - **Dicionários** — liga/desliga dicts do thesaurus (toggle por flag, não move arquivo).
+- **Nidhogg** **[FUTURO]** — a "tela gigante" da camada de inteligência: liga/desliga global e por
+  coleção, dial de nível + cadência/janela, prompt por nível, e a leitura dos artefatos (documento vivo,
+  árvore de conhecimento). **Ao LIGAR: disclaimer obrigatório** de consumo de IA.
 
 > ValHalla **lê e opera** o ragd; não tem lógica de busca própria (delega à API).
 
@@ -228,6 +231,12 @@ TTL; **[FUTURO]** senha real). Abas:
 > No mito, Níðhöggr é a serpente que rói as raízes de Yggdrasil. Aqui, o worm rói/**digere o
 > conhecimento** da árvore do RAG e o destila num saber que **sobrevive à deleção da coleção**.
 
+> 💎 **Por que o Nidhogg importa (posicionamento — decisão Pacman).** É a **camada analítica** — o
+> **ponto de virada onde o projeto vira produto de valor ($$$)**. O núcleo (`ragd`) é OSS e roda em
+> qualquer lugar; o Nidhogg é onde o **open source subsidia seus usuários**: gera **análises concretas,
+> assistidas por IA**, sobre qualquer assunto (código, livros, artigos), permitindo a um
+> **consultor / estudante / empresa chegar embasado**. Quem liga a IA colhe entendimento que vale dinheiro.
+
 ### 5.1 Conceito & invariantes [FEITO: esqueleto]
 
 - Processo **separado**, **"daemon de módulos"** (porta 11497 vai hospedar N módulos além do Nidhogg).
@@ -237,20 +246,24 @@ TTL; **[FUTURO]** senha real). Abas:
 - **Dois dials ortogonais:** **nível** (profundidade) + **cadência** (segundos entre ciclos = orçamento
   de tempo).
 
-### 5.2 Modelo de consumo — QUEM lê o conhecimento destilado [FUTURO]
+### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
 
-> A pergunta que decide se o Nidhogg é real ou teatro (Codex): **se ninguém consome, é dívida técnica.**
-> Por isso o consumidor é definido **antes** de a destilação valer a pena.
+> **Decisão (Pacman):** o Nidhogg é um **projeto autônomo**, um **analisador crítico**. O `ragd`
+> **NUNCA** o consome — daemons desacoplados. O valor está no **artefato em si**; **não depende** de
+> ser consumido por outra máquina. *"Não interessa se alguém vai consumir ou não"* — o **entendimento
+> acumulado É o produto** (como um caderno de erudito que engorda sozinho). Isso responde a crítica do
+> Codex pela raiz: o consumidor é o **humano que lê**, não um sistema.
 
-- **Endpoint de leitura:** `GET /api/nidhogg/knowledge?collection=&type=&level=` → devolve o `knowledge[]`
-  destilado (filtrável). É o ponto único de consumo.
-- **Consumidor primário = o agente de IA** (via MCP / pré-contexto): lê o saber destilado como **contexto
-  curado ANTES** de buscar ("responda primeiro do conhecimento aprovado; aprofunde via `/search` bruto").
-- **ValHalla** exibe o conhecimento por coleção (painel) — inspeção/auditoria humana.
-- **[FUTURO opcional]** o `/search` do `ragd` anexa um bloco `hints` derivado do knowledge (meta-índice),
-  **sempre rotulado** — o destilado **nunca** se mistura com a fonte numa resposta sem etiqueta.
-- **Regra de ouro:** níveis 1–3 (IA) só avançam **depois** que esse consumo estiver em uso real. Começa
-  pelo nível 0 (sem IA), prova valor, sobe.
+- **Consumidor = o humano**, via ValHalla (e export): abre e **lê** os artefatos destilados.
+- **Artefatos de primeira classe** (entregáveis, não índice auxiliar de busca):
+  - **Documento vivo** (nível **propositivo**): cresce **indefinidamente** a cada ciclo. Caso de uso do
+    Pacman: *abrir depois de 15 dias e ler um resumo profundo de uma obra (ex.: O Senhor dos Anéis), com
+    nuances de detalhe, em estilos (moderno, arcaico…)* — um "companion" que aprofunda no tempo.
+  - **Árvore de conhecimento / mapa mental** (nível **estrutural**): navegável, partindo da obra — vale
+    pra **código-fonte, texto, livro, artigo**, qualquer ingestão da base.
+- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** serve esses artefatos (pra ValHalla e export).
+- O `ragd` **não lê nem injeta** isso na busca. Se um dia um agente quiser usar os artefatos como
+  contexto, ele lê pela API do Nidhogg — **uso secundário e opcional**, não a razão de existir.
 
 ### 5.3 `source_hash`, diff e incrementalidade [FUTURO]
 
@@ -274,8 +287,8 @@ Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo,
 |---|---|---|---|---|
 | 0 | **burro** | não | 3 pilares: RootIndex · CorpusDict · CacheDigest | [PARCIAL] |
 | 1 | **consciente** | sim | `Summary` por coleção (saber que sobrevive à deleção) | [FUTURO] |
-| 2 | **estrutural** | sim | `DimensionMap` (hierarquia/encaixe entre coleções) | [FUTURO] |
-| 3 | **propositivo** | sim | `Gap` + `Suggestion` (furos, propostas) | [FUTURO] |
+| 2 | **estrutural** | sim | **Árvore de conhecimento / mapa mental** da obra (`KnowledgeTree`) | [FUTURO] |
+| 3 | **propositivo** | sim | **Documento vivo incremental** (`LivingDocument`, cresce no tempo) + `Gap`/`Suggestion` | [FUTURO] |
 
 **Nível 0 (sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
 health-check** ("minha coleção está íntegra e navegável?"), **não "conhecimento"** — não vender como tal.
@@ -293,11 +306,21 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
 | nível | entrada pro LLM | amostragem | saída (`type`) |
 |---|---|---|---|
 | 1 | chunks **novos/alterados** desde o `source_hash` + meta da base | até `MAX_CHUNKS_PER_LEVEL` (~100) espaçados + top-N por `idf`; se poucos, todos | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
-| 2 | `Summary` de nível 1 de várias coleções (metadado — não amostra) | — | `DimensionMap {shared_dimensions, hierarchy, cross_refs}` |
-| 3 | `DimensionMap` + histórico de queries (do `CacheDigest`) + gaps conhecidos | últimas N queries únicas | `Gap {query_pattern, missing_in, severity}` + `Suggestion {action, target, expected_impact}` |
+| 2 | `Summary` de nível 1 da obra/coleção (metadado — não amostra) | — | `KnowledgeTree {root, nodes[], edges[]}` — mapa mental navegável (hierarquia/encaixe de dimensões é a base) |
+| 3 | a obra + `KnowledgeTree` + `Summary` + a versão anterior do documento vivo | incremental: só o que entrou desde o último ciclo | `LivingDocument {sections[], style, version, grows:true}` (resumo profundo que cresce, variantes de estilo) + `Gap`/`Suggestion` |
 
 - **Orçamento:** cadência = orçamento de **tempo** por ciclo; somar teto de **tokens/ciclo** para os níveis IA.
 - **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
+- **Ordem HIERÁRQUICA (1→2→3):** os níveis IA acontecem **em sequência** — não há nível 2 sem o 1, nem 3
+  sem o 2 (a dimensão do conhecimento é hierárquica por natureza). O **dial seleciona o nível-topo**; o
+  worker roda `1..N` em ordem dentro do ciclo. Nível 0 (sem IA) é sempre a base.
+- **Prompt por nível = o TOM (decisão Pacman):** cada nível IA (1, 2, 3) tem um **prompt configurável**
+  (editável no ValHalla / `nidhogg.cfg`: `prompt_consciente`, `prompt_estrutural`, `prompt_propositivo`)
+  — é como você dita o **tom/estilo** de cada extração (ex.: moderno vs arcaico no `LivingDocument`).
+- **Cascata-delta (decisão Pacman):** quando um nível inferior muda, o superior **re-deriva incremental**,
+  não do zero — o `LivingDocument` **cresce** (anexa o delta), a `KnowledgeTree` **atualiza só o galho**
+  afetado. O vínculo é `derived_from`/`digestion_id`: cada item superior sabe de quais itens inferiores
+  nasceu, então o ciclo só re-mastiga o que de fato mudou. É o que torna o aprofundamento no tempo barato.
 
 ### 5.5 Ciclo do worker, arquivos e resumabilidade [FUTURO]
 
@@ -350,9 +373,9 @@ knowledge[]}`). Forma-alvo:
       "inputs":["collection:minha_colecao"], "model":"kimi-for-coding|null", "tokens_in":0, "tokens_out":0 }
   ],
   "knowledge": [                     // os itens destilados
-    { "type":"RootIndex|CorpusDict|Summary|DimensionMap|Gap|Suggestion",
+    { "type":"RootIndex|CorpusDict|CacheDigest|Summary|KnowledgeTree|LivingDocument|Gap|Suggestion",
       "level":1, "created":"ISO8601", "content":{}, "confidence":0.0,
-      "derived_from":["digestion_id"], "orphaned":false }
+      "derived_from":["digestion_id"], "frozen":false }   // frozen=true quando a fonte morre/muda
   ]
 }
 ```
@@ -363,8 +386,10 @@ knowledge[]}`). Forma-alvo:
   Renomear/deletar a coleção **não invalida** o que já foi destilado; só marca que a fonte mudou.
 - **`saturation` = (itens ainda verificáveis contra uma fonte viva) / (total de itens).** `→1.0` tudo
   ancorado; `<0.5` alerta de muito conhecimento **órfão**. Decai naturalmente se coleções somem.
-- **GC lazy de órfãos:** ao carregar um `knowledge.json`, conferir se as fontes (`source_hash`) ainda
-  existem; o que não existe vira `orphaned:true`; abaixo de um threshold, pode ser arquivado.
+- **Fonte morta → artefato CONGELADO (decisão Pacman):** quando a fonte some/muda, o destilado **nunca
+  é apagado** — sobreviver à deleção é a *feature*. Vira `frozen:true` com **selo de frescor** (fonte
+  **viva** / **alterada** desde X / **congelada** em X) pro leitor humano saber o estado. `saturation`
+  é só esse **indicador de frescor**, **nunca** gatilho de poda.
 - **Invariante:** nenhum item de nível ≥1 é gerado sem `provenance` (digestion_id + source_hash + modelo).
 - **Cadência ≠ saturação:** worm não re-mastiga coleção saturada (`source_hash` igual ao último) — economiza IA.
 
@@ -381,18 +406,26 @@ knowledge[]}`). Forma-alvo:
 
 O Nidhogg é a parte **mais arriscada** do projeto. Registrado de propósito, não escondido:
 
-- **"Solução procurando problema?"** O conhecimento destilado só vale se **alguém o consome com
-  rastreabilidade**. **Decisão:** o consumidor é explícito (o módulo expõe o saber via API, auditável
-  por `provenance`); e o que é **destilado** nunca se mistura com a **fonte** numa resposta sem rótulo.
-- **Órfão/stale contaminando resultados** — conhecimento de fonte morta vira resposta fantasiosa.
-  **Guard-rail:** `source_hash` + `saturation` + `orphaned` + GC lazy; nível 0 (sem IA) é à prova disso.
-- **Custo/latência de IA vs "roda em qualquer lugar"** — **Guard-rail:** OFF por default; níveis 1–3
-  opt-in por coleção; nível 0 cobre o caso sem-IA; cadência limita o orçamento.
-- **Conhecimento cíclico** (nível 2 consome nível 1 que consome…) — `derived_from` + `digestion_id`
-  evitam loop; nunca derivar de item órfão.
-- **Framing dos níveis** pode confundir operador — o console deve descrever o que **cada nível** faz.
-- **O que fica de fora até existir consumidor real:** níveis 2–3 e qualquer destilação cara só avançam
-  quando houver quem **consuma e audite** o resultado. Começar pelo nível 0 (sem IA), provar valor, subir.
+- **"Solução procurando problema?" — RESOLVIDO (ver §5.2).** O Nidhogg é **autônomo** e o consumidor é
+  o **humano** que lê os artefatos (documento vivo, árvore de conhecimento). O valor é o **entendimento
+  acumulado em si** — *não depende* de consumo por máquina; o `ragd` nunca o lê. Rastreável por
+  `provenance`; o destilado nunca se mistura com a fonte sem rótulo.
+- **Órfão/stale — ATENUADO (§5.2/§5.7).** Como o Nidhogg é autônomo (ninguém consome na busca), não há
+  resultado a contaminar. Fonte morta → artefato **CONGELADO e rotulado**, nunca deletado (sobreviver é
+  feature). `saturation` = rótulo de frescor pro leitor humano; nível 0 (sem IA) é à prova disso.
+- **Custo/latência de IA — orçamento é DECISÃO DE QUEM RODA.** OFF por default; opt-in por coleção;
+  nível 0 cobre o sem-IA; cadência + janela = *quando* roda. **DISCLAIMER obrigatório** ao ligar no
+  ValHalla: *"ativar consome IA — qualquer provider"*. Provider **plugável** ([FUTURO]: Amazon Bedrock,
+  escolha de modelo, round-robin). **Sem teto de gasto por default** — escolha consciente do usuário.
+- **Framing dos níveis pode confundir o operador — MITIGADO.** Como cada nível tem **prompt próprio**
+  (§5.4) e a **aba Nidhogg** (§4) descreve o que cada um produz (consciente=`Summary`, estrutural=árvore,
+  propositivo=documento vivo), o operador vê e edita o tom de cada camada — o framing fica explícito na
+  tela, não escondido no código.
+- **"O que avança e quando" — gated por roadmap + budget, não por consumidor.** O bullet antigo ("esperar
+  um consumidor real") **caiu**: o consumidor é o **humano** e o artefato **é** o produto (§5.2). Os
+  níveis 1→2→3 avançam conforme o **roadmap** do Pacman, **gated por orçamento + disclaimer** (§5.9 acima),
+  não por "esperar quem consuma". Começa pelo nível 0 (sem IA, à prova de risco) e sobe na cadência que o
+  dono escolher.
 
 ---
 
