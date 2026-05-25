@@ -38,6 +38,11 @@ announce/
 # ── To-do interno (vira GitHub Issues; não duplicar no repo) ──
 to-do-list.md
 
+# ── VEGA2 (projeto separado; estudo+diversão, não faz parte do core OSS) ──
+# notas de integração e qualquer artefato de cruzamento RAGnaRock × cluster ESP32
+VEGA2_*
+vega2/
+
 # ── Build artifacts ──
 **/target/
 **/node_modules/
