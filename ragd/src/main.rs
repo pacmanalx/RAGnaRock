@@ -953,9 +953,35 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
             }
         }
     }
-    let mut rows: Vec<(f64, Value, usize)> = best.into_values().collect();
-    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    let hits: Vec<Value> = rows.into_iter().take(k).enumerate().map(|(i, (_, mut h, via))| {
+    // RERANK contra a INTENÇÃO ORIGINAL (fix #1). A cobertura de uma variante de 1 termo é
+    // sempre 1.0 — rankear por ela fazia o lixo subir ao topo ("seguir" casando "Pippin
+    // exausto", hits de outra coleção com matchpoint 1.0). Aqui cada candidato é rescorado
+    // com a query ORIGINAL; esse vira o matchpoint EXIBIDO (inspecionável a olho nu). A
+    // cobertura da variante (`var_cov`) só desempata, premiando o sinônimo que de fato ajudou.
+    let qt = rag::prep_query(query);
+    let mut rows: Vec<(f64, f64, i64, usize, Value)> = best.into_values()
+        .map(|(var_cov, mut h, via)| {
+            let coll_h = h["collection"].as_str().unwrap_or("").to_string();
+            let base_h = h["base"].as_str().unwrap_or("").to_string();
+            let cid = h["chunk"].as_u64().unwrap_or(0) as usize;
+            let (orig_cov, orig_span) = st.bases.get(&coll_h)
+                .and_then(|m| m.get(&base_h))
+                .map(|b| b.score_chunk(&qt, cid, phon))
+                .unwrap_or((0.0, 0));
+            if let Some(o) = h.as_object_mut() {
+                o.insert("matchpoint".into(), json!(orig_cov));
+                o.insert("coverage".into(), json!(orig_cov));
+                o.insert("span".into(), json!(orig_span));
+                o.insert("var_cov".into(), json!(var_cov));
+            }
+            (orig_cov, var_cov, -(orig_span as i64), via, h)
+        }).collect();
+    // cobertura ORIGINAL ↓ · cobertura de variante ↓ · span ↑ · original desempata
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()
+        .then(b.1.partial_cmp(&a.1).unwrap())
+        .then(b.2.cmp(&a.2))
+        .then((b.3 == 0).cmp(&(a.3 == 0))));
+    let hits: Vec<Value> = rows.into_iter().take(k).enumerate().map(|(i, (.., via, mut h))| {
         if let Some(o) = h.as_object_mut() {
             o.insert("rank".into(), json!(i + 1));
             o.insert("via".into(), json!(if via == 0 { "original".to_string() } else { variants[via].clone() }));

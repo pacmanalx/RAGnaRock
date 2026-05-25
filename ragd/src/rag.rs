@@ -138,18 +138,28 @@ const MIN_SYL: usize = 3;   // termo "presente": casamento COMPLETO (curtos) ou 
 /// co-ocorrencia dos termos-chave no chunk e pontua pela proximidade entre eles.
 /// Devolve (cobertura_dos_termos, span minimo entre os termos presentes).
 /// `qt` = query já tokenizada (prep_query, 1×); `words_in_chunk` = cache do chunk.
-fn rerank_score(qt: &QueryTerms, words_in_chunk: &[Vec<String>], phonetic: bool) -> (f64, usize) {
+fn rerank_score(qt: &QueryTerms, weights: &[f64], words_in_chunk: &[Vec<String>], phonetic: bool) -> (f64, usize) {
     if qt.terms.is_empty() { return (0.0, 0); }
     // indices das palavras onde cada termo esta PRESENTE (casa por fronteira de palavra)
     let mut present_lists: Vec<Vec<usize>> = vec![];
+    let mut present_w = 0.0;   // soma dos pesos (idf) dos termos presentes
     for (ti, qs) in qt.terms.iter().enumerate() {
         let (frac, pos) = best_positions(qs, &qt.sx[ti], words_in_chunk, phonetic);
         let matched = (frac * qs.len() as f64).round() as usize;   // silabas casadas
         if frac >= 0.999 || matched >= MIN_SYL {   // termo curto: completo; longo: raiz (>=3)
             present_lists.push(pos);
+            present_w += weights[ti];
         }
     }
-    let coverage = present_lists.len() as f64 / qt.terms.len() as f64;
+    // COBERTURA PONDERADA POR IDF: termo raro/distintivo (Elrond) domina; termo comum
+    // (do/conselho) ou variante-funcao (to/for) pesa quase nada. Fallback p/ contagem crua
+    // se a base nao tem idf disponivel (ex.: peso total 0).
+    let total_w: f64 = weights.iter().sum();
+    let coverage = if total_w > 0.0 {
+        present_w / total_w
+    } else {
+        present_lists.len() as f64 / qt.terms.len() as f64
+    };
     // span agora em PALAVRAS (proximidade entre os termos presentes)
     let span = if present_lists.len() > 1 { min_span(&present_lists) } else { 0 };
     (coverage, span)
@@ -344,6 +354,7 @@ impl RagBase {
         if info.rerank {
             let t1 = std::time::Instant::now();
             let qt = prep_query(query);   // tokeniza a query 1× (hoist), não por candidato
+            let weights = self.term_weights(&qt);   // peso idf por termo, 1× (hoist)
             let mut res: Vec<Hit> = cand.iter().map(|&(cos, cid)| {
                 let ch = &self.chunks[cid];
                 // memory: usa o cache; hybrid: recomputa só este candidato a partir do texto
@@ -353,7 +364,7 @@ impl RagBase {
                 } else if let Some(t) = &ch.text {
                     recomputed = chunk_words(t); &recomputed
                 } else { &[] };
-                let (coverage, span) = rerank_score(&qt, words, phonetic);
+                let (coverage, span) = rerank_score(&qt, &weights, words, phonetic);
                 (Some(coverage), Some(coverage), Some(span), cos, cid)
             }).collect();
             // COBERTURA (quantos termos co-ocorrem) domina; span (proximidade) e cos só desempatam
@@ -365,6 +376,34 @@ impl RagBase {
         } else {
             cand.into_iter().take(k).map(|(cos, cid)| (None, None, None, cos, cid)).collect()
         }
+    }
+
+    /// Cobertura/span de UMA query (já tokenizada) contra UM chunk pelo id (== índice).
+    /// Usado pelo expand pra rerankar o merge contra a INTENÇÃO ORIGINAL — não contra a
+    /// cobertura trivial (sempre 1.0) de uma variante de 1 termo. Devolve (0.0, 0) se o
+    /// chunk não existe ou não tem texto pra casar.
+    pub fn score_chunk(&self, qt: &QueryTerms, chunk_id: usize, phonetic: bool) -> (f64, usize) {
+        let ch = match self.chunks.get(chunk_id) { Some(c) => c, None => return (0.0, 0) };
+        let recomputed;
+        let words: &[Vec<String>] = if !ch.words.is_empty() {
+            &ch.words
+        } else if let Some(t) = &ch.text {
+            recomputed = chunk_words(t); &recomputed
+        } else { &[] };
+        let weights = self.term_weights(qt);
+        rerank_score(qt, &weights, words, phonetic)
+    }
+
+    /// Peso de cada termo da query = soma dos idf das suas sílabas presentes no vocab.
+    /// É o que torna a cobertura PONDERADA: termo raro (Elrond) pesa muito, termo comum
+    /// (do/conselho) ou variante-função (to/for) quase nada. Sílaba OOV não soma.
+    fn term_weights(&self, qt: &QueryTerms) -> Vec<f64> {
+        qt.terms.iter().map(|syls| {
+            syls.iter()
+                .filter_map(|s| self.index.get(s))
+                .map(|d| self.idf.get(d).copied().unwrap_or(0.0))
+                .sum()
+        }).collect()
     }
 
     /// Igual ao `search`, mas o RECALL roda no espaço UNIFICADO da coleção: a query já vem
