@@ -151,9 +151,10 @@ fn rerank_score(qt: &QueryTerms, weights: &[f64], words_in_chunk: &[Vec<String>]
             present_w += weights[ti];
         }
     }
-    // COBERTURA PONDERADA POR IDF: termo raro/distintivo (Elrond) domina; termo comum
-    // (do/conselho) ou variante-funcao (to/for) pesa quase nada. Fallback p/ contagem crua
-    // se a base nao tem idf disponivel (ex.: peso total 0).
+    // COBERTURA = fracao da MASSA DE IDF da query que o chunk casa. `weights` vem da escala da
+    // COLECAO (uidf) quando ha perfil: assim um termo presente na colecao mas ausente NESTA base
+    // mantem seu peso no denominador (nao some -> nao crava 1.0 falso) e a escala fica consistente
+    // entre bases. Fallback p/ contagem crua se nao ha idf nenhum.
     let total_w: f64 = weights.iter().sum();
     let coverage = if total_w > 0.0 {
         present_w / total_w
@@ -319,7 +320,7 @@ impl RagBase {
         (qvec, qnorm, syls, oov)
     }
 
-    pub fn search(&self, query: &str, k: usize, rerank: bool, recall_n: usize, phonetic: bool) -> (Vec<Hit>, Info) {
+    pub fn search(&self, query: &str, k: usize, rerank: bool, recall_n: usize, phonetic: bool, weights: Option<&[f64]>) -> (Vec<Hit>, Info) {
         let (qvec, qnorm, syls, oov) = self.query_vec(query);
         let mut info = Info { syls, oov, dims: qvec.len(), n_chunks: self.chunks.len(),
             n_converge: 0, recall_n: 0, rerank: rerank && self.has_text, ms_recall: 0.0, ms_rerank: 0.0 };
@@ -344,17 +345,21 @@ impl RagBase {
         let cand: Vec<(f64, usize)> = scored.into_iter().take(rn).collect();
         info.recall_n = cand.len();
         info.ms_recall = t0.elapsed().as_secs_f64() * 1000.0;
-        let hits = self.finish(query, cand, k, phonetic, &mut info);
+        let qt = prep_query(query);
+        let hits = self.finish(&qt, weights, cand, k, phonetic, &mut info);
         (hits, info)
     }
 
     /// Estágio 2 compartilhado: rerank (cobertura → proximidade → cos) ou top-k puro.
     /// Usado pelo recall local (`search`) e pelo unificado (`search_unified`) — sem duplicação.
-    fn finish(&self, query: &str, cand: Vec<(f64, usize)>, k: usize, phonetic: bool, info: &mut Info) -> Vec<Hit> {
+    /// `weights` = peso por termo na escala da COLEÇÃO quando o caller tem perfil (`Some`);
+    /// `None` cai no peso LOCAL da base ([term_weights]) — mesma fórmula, fonte de idf diferente.
+    fn finish(&self, qt: &QueryTerms, weights: Option<&[f64]>, cand: Vec<(f64, usize)>, k: usize, phonetic: bool, info: &mut Info) -> Vec<Hit> {
         if info.rerank {
             let t1 = std::time::Instant::now();
-            let qt = prep_query(query);   // tokeniza a query 1× (hoist), não por candidato
-            let weights = self.term_weights(&qt);   // peso idf por termo, 1× (hoist)
+            // peso por termo: unificado (do caller) ou local (fallback). Hoist 1×, não por candidato.
+            let owned = if weights.is_none() { Some(self.term_weights(qt)) } else { None };
+            let weights: &[f64] = weights.unwrap_or_else(|| owned.as_ref().unwrap());
             let mut res: Vec<Hit> = cand.iter().map(|&(cos, cid)| {
                 let ch = &self.chunks[cid];
                 // memory: usa o cache; hybrid: recomputa só este candidato a partir do texto
@@ -364,7 +369,7 @@ impl RagBase {
                 } else if let Some(t) = &ch.text {
                     recomputed = chunk_words(t); &recomputed
                 } else { &[] };
-                let (coverage, span) = rerank_score(&qt, &weights, words, phonetic);
+                let (coverage, span) = rerank_score(qt, weights, words, phonetic);
                 (Some(coverage), Some(coverage), Some(span), cos, cid)
             }).collect();
             // COBERTURA (quantos termos co-ocorrem) domina; span (proximidade) e cos só desempatam
@@ -382,7 +387,7 @@ impl RagBase {
     /// Usado pelo expand pra rerankar o merge contra a INTENÇÃO ORIGINAL — não contra a
     /// cobertura trivial (sempre 1.0) de uma variante de 1 termo. Devolve (0.0, 0) se o
     /// chunk não existe ou não tem texto pra casar.
-    pub fn score_chunk(&self, qt: &QueryTerms, chunk_id: usize, phonetic: bool) -> (f64, usize) {
+    pub fn score_chunk(&self, qt: &QueryTerms, weights: Option<&[f64]>, chunk_id: usize, phonetic: bool) -> (f64, usize) {
         let ch = match self.chunks.get(chunk_id) { Some(c) => c, None => return (0.0, 0) };
         let recomputed;
         let words: &[Vec<String>] = if !ch.words.is_empty() {
@@ -390,13 +395,15 @@ impl RagBase {
         } else if let Some(t) = &ch.text {
             recomputed = chunk_words(t); &recomputed
         } else { &[] };
-        let weights = self.term_weights(qt);
-        rerank_score(qt, &weights, words, phonetic)
+        let owned = if weights.is_none() { Some(self.term_weights(qt)) } else { None };
+        let weights: &[f64] = weights.unwrap_or_else(|| owned.as_ref().unwrap());
+        rerank_score(qt, weights, words, phonetic)
     }
 
-    /// Peso de cada termo da query = soma dos idf das suas sílabas presentes no vocab.
+    /// Peso de cada termo da query = soma dos idf das suas sílabas presentes no vocab LOCAL.
     /// É o que torna a cobertura PONDERADA: termo raro (Elrond) pesa muito, termo comum
-    /// (do/conselho) ou variante-função (to/for) quase nada. Sílaba OOV não soma.
+    /// (do/conselho) ou variante-função (to/for) quase nada. Sílaba OOV não soma. Usado como
+    /// fallback quando não há perfil de coleção; com perfil, o peso vem de [weighting_unified].
     fn term_weights(&self, qt: &QueryTerms) -> Vec<f64> {
         qt.terms.iter().map(|syls| {
             syls.iter()
@@ -411,7 +418,8 @@ impl RagBase {
     /// O rerank (estágio 2) é idêntico. Caller usa `search` (local) quando não há perfil.
     #[allow(clippy::too_many_arguments)]
     pub fn search_unified(&self, query: &str, k: usize, rerank: bool, recall_n: usize, phonetic: bool,
-                          qvec: &HashMap<usize, f64>, qnorm: f64, remap: &[usize], unorms: &[f64]) -> (Vec<Hit>, Info) {
+                          qvec: &HashMap<usize, f64>, qnorm: f64, remap: &[usize], unorms: &[f64],
+                          weights: Option<&[f64]>) -> (Vec<Hit>, Info) {
         let mut info = Info { syls: vec![], oov: 0, dims: qvec.len(), n_chunks: self.chunks.len(),
             n_converge: 0, recall_n: 0, rerank: rerank && self.has_text, ms_recall: 0.0, ms_rerank: 0.0 };
         if qvec.is_empty() { return (vec![], info); }
@@ -432,7 +440,8 @@ impl RagBase {
         let cand: Vec<(f64, usize)> = scored.into_iter().take(rn).collect();
         info.recall_n = cand.len();
         info.ms_recall = t0.elapsed().as_secs_f64() * 1000.0;
-        let hits = self.finish(query, cand, k, phonetic, &mut info);
+        let qt = prep_query(query);
+        let hits = self.finish(&qt, weights, cand, k, phonetic, &mut info);
         (hits, info)
     }
 
@@ -588,6 +597,20 @@ pub fn query_vec_unified(query: &str, p: &CollectionProfile) -> (HashMap<usize, 
     (qvec, if qnorm == 0.0 { 1.0 } else { qnorm })
 }
 
+/// Peso por termo na escala da COLEÇÃO (uidf) — mesma fórmula do `term_weights` local, só que
+/// a fonte de idf é unificada. É a correção estrutural do #5: como o uidf conhece todos os
+/// termos da coleção, um termo presente na coleção mas ausente NUMA base específica mantém seu
+/// peso no denominador do rerank (não some → não crava cobertura 1.0 falsa) e a escala fica
+/// consistente entre bases (acaba o resíduo cross-base). Sílaba inédita na coleção não soma.
+pub fn weighting_unified(qt: &QueryTerms, p: &CollectionProfile) -> Vec<f64> {
+    qt.terms.iter().map(|syls| {
+        syls.iter()
+            .filter_map(|s| p.uvocab.get(s))
+            .map(|gd| p.uidf.get(gd).copied().unwrap_or(0.0))
+            .sum()
+    }).collect()
+}
+
 /// Cosseno de um chunk (vec em dims LOCAIS) contra a query (espaço GLOBAL), remapeando
 /// on-the-fly via `remap` + idf unificado. Replica o esquema do `cosine` atual: dot da
 /// query tf-idf com o tf cru do chunk, sobre qnorm × norma tf-idf unificada do chunk.
@@ -666,10 +689,10 @@ mod tests {
         qvec.insert(g_do, qw);
         let qnorm = qw.abs().max(1e-12);
         // base "b": chunk0 tem "do" (dim local 0) → casa via remap
-        let (hb, _) = bases["b"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["b"], &p.unorms["b"]);
+        let (hb, _) = bases["b"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["b"], &p.unorms["b"], None);
         assert_eq!(hb.len(), 1);
         // base "a": só chunk0 (fro,do) casa; chunk1 (só fro) não
-        let (ha, _) = bases["a"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["a"], &p.unorms["a"]);
+        let (ha, _) = bases["a"].search_unified("", 5, false, 20, false, &qvec, qnorm, &p.remap["a"], &p.unorms["a"], None);
         assert_eq!(ha.len(), 1);
         assert_eq!(ha[0].4, 0); // cid do chunk com "do"
     }

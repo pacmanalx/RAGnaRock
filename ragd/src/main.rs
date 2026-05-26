@@ -959,14 +959,19 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
     // com a query ORIGINAL; esse vira o matchpoint EXIBIDO (inspecionável a olho nu). A
     // cobertura da variante (`var_cov`) só desempata, premiando o sinônimo que de fato ajudou.
     let qt = rag::prep_query(query);
+    // [#5] peso unificado por coleção pro rescore (perfis já construídos pelas buscas das
+    // variantes via `search`); coleção sem perfil cai no peso local dentro do score_chunk.
+    let exp_weightings: HashMap<String, Vec<f64>> = st.collection_profiles.iter()
+        .map(|(c, p)| (c.clone(), rag::weighting_unified(&qt, p))).collect();
     let mut rows: Vec<(f64, f64, i64, usize, Value)> = best.into_values()
         .map(|(var_cov, mut h, via)| {
             let coll_h = h["collection"].as_str().unwrap_or("").to_string();
             let base_h = h["base"].as_str().unwrap_or("").to_string();
             let cid = h["chunk"].as_u64().unwrap_or(0) as usize;
+            let w = exp_weightings.get(&coll_h).map(|v| v.as_slice());
             let (orig_cov, orig_span) = st.bases.get(&coll_h)
                 .and_then(|m| m.get(&base_h))
-                .map(|b| b.score_chunk(&qt, cid, phon))
+                .map(|b| b.score_chunk(&qt, w, cid, phon))
                 .unwrap_or((0.0, 0));
             if let Some(o) = h.as_object_mut() {
                 o.insert("matchpoint".into(), json!(orig_cov));
@@ -1675,11 +1680,16 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
     // [#8] modo unificado por coleção (opt-in via body.unified): vocab+idf de repo, em cache,
     // auto-invalidado por fingerprint (nº bases, total chunks). Sem ele, recall local de sempre.
     let unified = v["unified"].as_bool().unwrap_or(false);
-    let colls: Vec<String> = if unified {
-        let mut s: Vec<String> = pairs.iter().map(|(c, _)| c.clone()).collect();
-        s.sort(); s.dedup(); s
-    } else { vec![] };
-    for c in &colls {
+    // [#5] PESO unificado no rerank: coleção com >1 base NO ESCOPO ganha perfil (idf de coleção,
+    // cacheado por fingerprint) pra que o peso por termo use a escala da COLEÇÃO — termo ausente
+    // numa base não some do denominador (corrige o "1.0 falso" per-arquivo) e a escala fica
+    // consistente entre bases. Busca de 1 base usa peso local (fallback no finish). O recall
+    // unificado (opt-in) reusa o mesmo perfil.
+    let mut scope_count: HashMap<&str, usize> = HashMap::new();
+    for (c, _) in &pairs { *scope_count.entry(c.as_str()).or_insert(0) += 1; }
+    let build_colls: Vec<String> = scope_count.iter()
+        .filter(|(_, n)| **n > 1).map(|(c, _)| c.to_string()).collect();
+    for c in &build_colls {
         if let Some(inner) = bases.get(c) {
             let fp = rag::collection_fingerprint(inner);
             if profiles.get(c).map(|p| p.fingerprint) != Some(fp) {
@@ -1687,10 +1697,17 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
             }
         }
     }
-    // vetoriza a query no espaço unificado UMA vez por coleção (não por base)
-    let qvecs: HashMap<String, (HashMap<usize, f64>, f64)> = colls.iter()
-        .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
+    let qt = rag::prep_query(query);
+    // peso por termo (owned, pra soltar o borrow de `profiles`) por coleção do escopo
+    let weightings: HashMap<String, Vec<f64>> = build_colls.iter()
+        .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::weighting_unified(&qt, p))))
         .collect();
+    // recall unificado (opt-in): vetoriza a query no espaço da coleção 1× por coleção
+    let qvecs: HashMap<String, (HashMap<usize, f64>, f64)> = if unified {
+        build_colls.iter()
+            .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
+            .collect()
+    } else { HashMap::new() };
     let profiles_ref: &HashMap<String, rag::CollectionProfile> = profiles;
 
     // scatter-gather: busca em cada base. Paraleliza com rayon quando há mais de uma
@@ -1698,19 +1715,20 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
     type BaseResult = (Value, String, Vec<(f64, i64, f64, Map<String, Value>)>);
     let search_one = |coll: &String, name: &String| -> Option<BaseResult> {
         let base = get_base(bases, coll, name)?;
+        let w = weightings.get(coll).map(|v| v.as_slice());   // peso unificado da coleção (ou None)
         let (hits, info) = if unified {
             // perfil + query vetorizada da coleção + remap/normas desta base → recall unificado;
             // fallback pro recall local se faltar qualquer peça (robustez)
             match (profiles_ref.get(coll), qvecs.get(coll)) {
                 (Some(p), Some((qv, qn))) => match (p.remap.get(name), p.unorms.get(name)) {
                     (Some(remap), Some(unorms)) =>
-                        base.search_unified(query, k, rerank, recall_n, phonetic, qv, *qn, remap, unorms),
-                    _ => base.search(query, k, rerank, recall_n, phonetic),
+                        base.search_unified(query, k, rerank, recall_n, phonetic, qv, *qn, remap, unorms, w),
+                    _ => base.search(query, k, rerank, recall_n, phonetic, w),
                 },
-                _ => base.search(query, k, rerank, recall_n, phonetic),
+                _ => base.search(query, k, rerank, recall_n, phonetic, w),
             }
         } else {
-            base.search(query, k, rerank, recall_n, phonetic)
+            base.search(query, k, rerank, recall_n, phonetic, w)
         };
         let entry = json!({"collection": coll, "base": name,
                            "n_chunks": info.n_chunks, "n_converge": info.n_converge,
