@@ -2056,7 +2056,18 @@ fn dict_toggle(body: &str, st: &mut State) -> (u16, String) {
 fn expand_with_dicts(query: &str, map: &HashMap<String, Vec<String>>) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let mut seen: HashSet<String> = HashSet::new();
-    for w in query.to_lowercase().split_whitespace() {
+    let lower = query.to_lowercase();
+    let all: Vec<&str> = lower.split_whitespace().collect();
+    // MESMO critério do prep_query (rerank): só palavra de CONTEÚDO (>=2 sílabas) vira chave de
+    // expansão. Palavra-função/stopword ("do","de","da","a","o") NÃO expande — senão colide com
+    // palavra EN nos dicts ingleses ativos (do→inglês "do": *act/accomplish* + festa *mardi
+    // gras/saturnalia*; da→"D.A." District Attorney) e polui o recall. Fallback igual ao
+    // prep_query: se TODAS forem monossílabas, usa todas.
+    let is_content = |w: &str| tokenizer::syllabify(w).iter()
+        .filter(|s| !tokenizer::normalize(s).is_empty()).count() >= 2;
+    let content: Vec<&str> = all.iter().copied().filter(|w| is_content(w)).collect();
+    let keys: &[&str] = if content.is_empty() { &all } else { &content };
+    for &w in keys {
         if let Some(syns) = map.get(w) {
             for s in syns {
                 let s = s.trim();
