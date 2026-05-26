@@ -326,7 +326,7 @@ Kimi and Codex converged: detect real change **cheaply**, no false positives, an
 
 | level | name | AI? | produces | status |
 |---|---|---|---|---|
-| 0 | **dumb** | no | 3 pillars: RootIndex · CorpusDict · CacheDigest | [PARTIAL] |
+| 0 | **miner** | no | 3 pillars: RootIndex · CorpusDict · CacheDigest | [PARTIAL] |
 | 1 | **conscious** | yes | `Summary` per collection (insight that survives deletion) | [FUTURE] |
 | 2 | **structural** | yes | **Knowledge tree / mind map** of the work (`KnowledgeTree`) | [FUTURE] |
 | 3 | **propositive** | yes | **Incremental living document** (`LivingDocument`, grows over time) + `Gap`/`Suggestion` | [FUTURE] |

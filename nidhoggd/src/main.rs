@@ -23,16 +23,18 @@ const DEFAULT_CADENCE: u64 = 300;   // s entre ciclos do worm (cadência = orça
 // ───────────────────────────── níveis de inteligência (slider) ─────────────────────────────
 // Cumulativos. 0 não usa IA; 1+ precisam de provider de IA configurado.
 fn level_name(l: u8) -> &'static str {
-    match l { 0 => "burro", 1 => "consciente", 2 => "estrutural", 3 => "propositivo", _ => "burro" }
+    match l { 0 => "minerador", 1 => "consciente", 2 => "estrutural", 3 => "propositivo", _ => "minerador" }
 }
 fn level_num(s: &str) -> u8 {
     match s.trim().to_lowercase().as_str() {
-        "consciente" | "1" => 1, "estrutural" | "2" => 2, "propositivo" | "3" => 3, _ => 0,
+        "consciente" | "1" => 1, "estrutural" | "2" => 2, "propositivo" | "3" => 3,
+        // "burro" aceito como sinônimo retrocompatível de "minerador" (nome antigo do nível 0).
+        "minerador" | "burro" | "0" | _ => 0,
     }
 }
 fn levels_json() -> Value {
     json!([
-        {"n":0,"name":"burro","ia":false,"desc":"Só os 3 pilares: índice de raízes, dicionário do corpus, digestão do cache. Zero IA."},
+        {"n":0,"name":"minerador","ia":false,"desc":"Só os 3 pilares: índice de raízes, dicionário do corpus, digestão do cache. Zero IA — cava o material bruto."},
         {"n":1,"name":"consciente","ia":true,"desc":"Insights e resumo por coleção — conhecimento que sobrevive à deleção da coleção."},
         {"n":2,"name":"estrutural","ia":true,"desc":"Hierarquia e encaixe de dimensões entre projetos/ingestões — sabe o que encaixa em quê."},
         {"n":3,"name":"propositivo","ia":true,"desc":"Acha furos, sugere, comenta, resume inteligente — código e livros. Aprimora a base de conhecimento."}
@@ -44,7 +46,7 @@ struct Config {
     port: u16,
     ragd_api: String,
     on: bool,            // OFF por default
-    level: u8,           // 0 burro
+    level: u8,           // 0 minerador
     dir: String,         // raiz do conhecimento persistente
     cadence: u64,        // segundos entre ciclos
     cfg_path: String,
@@ -284,13 +286,13 @@ fn help() {
 uso:
   nidhoggd [--config <arq>] [--port {DEFAULT_PORT}] [--ragd <url>]
   config: --config <arq>, senão ./nidhogg.cfg, senão defaults.
-          chaves: port, ragd_api, nidhogg(on/off), level(burro|consciente|estrutural|propositivo), dir, cadence
+          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|propositivo), dir, cadence
   nasce DESLIGADO (precisa de IA). Liga pelo ValHalla ou pelo cfg.
 rotas:
   GET  /health
   GET  /api/nidhogg                 status (nível, cadência, keepalive do ragd, conhecimento)
   GET  /api/nidhogg/collections     coleções do ragd + estado de digestão (liga/desliga por coleção)
-  POST /api/nidhogg                 {{\"on\":bool,\"level\":\"burro|...\",\"cadence\":secs}}
+  POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
   POST /api/nidhogg/run             dispara um ciclo agora (stub)");
 }

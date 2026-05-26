@@ -155,7 +155,7 @@ responds (status, config, per-collection control); the **intelligence** (levels 
 | GET | `/health` | — | `{status, module, version, on, level}` |
 | GET | `/api/nidhogg` | — | `{module, version, uptime_secs, on, level, level_name, levels, needs_ia, cadence_secs, dir, collections_known, last_cycle, ragd_api, ragd_online, ragd:{…}}` |
 | GET | `/api/nidhogg/collections` | — | `{collections:[{collection, bases, chunks, enabled, saturation, updated, has_knowledge}]}` |
-| POST | `/api/nidhogg` | `{on:bool, level:"burro\|consciente\|estrutural\|propositivo", cadence:secs}` | same as `GET /api/nidhogg` |
+| POST | `/api/nidhogg` | `{on:bool, level:"minerador\|consciente\|estrutural\|propositivo", cadence:secs}` | same as `GET /api/nidhogg` |
 | POST | `/api/nidhogg/collection` | `{collection, enabled:bool}` | `{ok, collection, enabled}` |
 | POST | `/api/nidhogg/run` | — | `{ok, note}` (triggers a cycle — **stub**, intelligence still 0) |
 
