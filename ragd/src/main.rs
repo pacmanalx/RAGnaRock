@@ -328,15 +328,46 @@ fn req_extra(path: &str, body: &[u8], payload: &str) -> String {
         let lines = pj["lines"].as_array().map(|a| a.len() as u64).unwrap_or(pj["count"].as_u64().unwrap_or(0));
         return format!("linhas={lines}");
     }
-    if path.ends_with("/api/stats") {
-        return format!("bases={} cols={} rss={:.0}MB",
+    if path.ends_with("/api/stats") || path == "/stats" {
+        return format!("bases={} cols={} chunks={}",
                        pj["bases"].as_u64().unwrap_or(0),
                        pj["collections"].as_u64().unwrap_or(0),
-                       pj["mem_rss_mb"].as_f64().unwrap_or(0.0));
+                       pj["chunks"].as_u64().unwrap_or(0));
     }
 
-    // ── DELETE /bases/{name} ──
+    // ── /profile (#1) ──
+    if path == "/profile" {
+        let scope = pj["scope"].as_str().unwrap_or("?");
+        let coll = pj["collection"].as_str().unwrap_or("?");
+        if scope == "base" {
+            return format!("{coll}/{} chunks={} vocab={}",
+                           pj["base"].as_str().unwrap_or("?"),
+                           pj["n_chunks"].as_u64().unwrap_or(0),
+                           pj["vocab_size"].as_u64().unwrap_or(0));
+        }
+        return format!("{coll} (unified) bases={} chunks={} vocab={}",
+                       pj["bases"].as_u64().unwrap_or(0),
+                       pj["chunks"].as_u64().unwrap_or(0),
+                       pj["unified_vocab_size"].as_u64().unwrap_or(0));
+    }
+
+    // ── DELETE /collections/{name} (#2) ──
+    if path.starts_with("/collections/") {
+        return format!("removida={} bases_removed={} purged={}",
+                       pj["collection"].as_str().unwrap_or("?"),
+                       pj["bases_removed"].as_u64().unwrap_or(0),
+                       pj["purged"].as_bool().unwrap_or(false));
+    }
+
+    // ── /bases/{coll}/{name} (GET, #4) ou DELETE /bases/{name} ──
     if path.starts_with("/bases/") {
+        // GET com coll/name traz a meta; DELETE traz removed
+        if let Some(corpus) = pj["corpus"].as_str() {
+            return format!("{}/{} corpus={corpus} chunks={}",
+                           pj["collection"].as_str().unwrap_or("?"),
+                           pj["name"].as_str().unwrap_or("?"),
+                           pj["n_chunks"].as_u64().unwrap_or(0));
+        }
         return format!("removida={}", pj["removed"].as_str().or(pj["name"].as_str()).unwrap_or("?"));
     }
 
@@ -1406,7 +1437,16 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
                          "collections": state.bases.len(),
                          "drivers": count_drivers(&state.drivers_dir)}).to_string()),
         (Method::Get, "/bases") => list_bases(query, &state.bases),
+        (Method::Get, p) if p.starts_with("/bases/") && p[7..].contains('/') => {   // [#4]
+            let rest = &p[7..];
+            match rest.split_once('/') {
+                Some((coll, name)) => base_meta(coll, name, &state.bases),
+                None => (404, json!({"error": "uso: GET /bases/{coll}/{name}"}).to_string()),
+            }
+        }
         (Method::Get, "/collections") => list_collections(&state.bases),
+        (Method::Get, "/profile") => profile(query, &state.bases),                  // [#1]
+        (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
@@ -1425,6 +1465,10 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             } else {
                 (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string())
             }
+        }
+        (Method::Delete, p) if p.starts_with("/collections/") => {                  // [#2]
+            let name = &p["/collections/".len()..];
+            drop_collection(name, query, state)
         }
         _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
     }
@@ -1782,6 +1826,102 @@ fn list_collections(bases: &Bases) -> (u16, String) {
     let list: Vec<Value> = colls.iter().map(|(c, n)| json!({"collection": c, "bases": n})).collect();
     (200, json!({"count": list.len(), "total_bases": total_bases(bases),
                  "collections": list}).to_string())
+}
+
+/// GET /bases/{coll}/{name} — só a meta da base (sem chunks). [#4]
+fn base_meta(coll: &str, name: &str, bases: &Bases) -> (u16, String) {
+    let base = match bases.get(coll).and_then(|m| m.get(name)) {
+        Some(b) => b,
+        None => return (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string()),
+    };
+    let vocab_used = base.idf.iter().filter(|(_, &v)| v > 0.0).count();
+    (200, json!({
+        "collection": coll, "name": name,
+        "corpus": base.corpus, "generator": base.generator,
+        "n_chunks": base.n_chunks, "vocab_size": base.vocab_size, "vocab_used": vocab_used,
+        "has_text": base.has_text, "mtime": base.mtime,
+    }).to_string())
+}
+
+/// GET /profile?collection=&base=&top=N — perfil léxico inspecionável. [#1]
+/// Dois modos: com `base` → idf POR-BASE; sem `base` → idf UNIFICADO da coleção (constrói o
+/// perfil on-the-fly — operação read-only, sem cachear no State).
+fn profile(query: &str, bases: &Bases) -> (u16, String) {
+    let coll = match query_param(query, "collection") {
+        Some(c) => c, None => return (400, json!({"error": "falta 'collection'"}).to_string()),
+    };
+    let top_n: usize = query_param(query, "top").and_then(|s| s.parse().ok()).unwrap_or(20);
+
+    // ── modo BASE ─────────────────────────────────────────────────────────────
+    if let Some(name) = query_param(query, "base") {
+        let base = match bases.get(&coll).and_then(|m| m.get(&name)) {
+            Some(b) => b,
+            None => return (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string()),
+        };
+        let mut dim2syl: HashMap<usize, &str> = HashMap::with_capacity(base.index.len());
+        for (s, &d) in &base.index { dim2syl.insert(d, s.as_str()); }
+        let vocab_used = base.idf.iter().filter(|(_, &v)| v > 0.0).count();
+        let mut idfs: Vec<(usize, f64)> = base.idf.iter().map(|(&d, &v)| (d, v)).collect();
+        idfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top_idf: Vec<Value> = idfs.into_iter().take(top_n).map(|(d, v)| {
+            json!({"dim": d, "syllable": dim2syl.get(&d).copied().unwrap_or("?"), "idf": v})
+        }).collect();
+        return (200, json!({
+            "scope": "base",
+            "collection": coll, "base": name,
+            "corpus": base.corpus, "n_chunks": base.n_chunks,
+            "vocab_size": base.vocab_size, "vocab_used": vocab_used,
+            "has_text": base.has_text, "mtime": base.mtime,
+            "top_idf": top_idf,
+        }).to_string());
+    }
+
+    // ── modo COLEÇÃO (unificado, refs #5/#8) ──────────────────────────────────
+    let inner = match bases.get(&coll) {
+        Some(m) if !m.is_empty() => m,
+        _ => return (404, json!({"error": format!("coleção '{coll}' vazia ou não encontrada")}).to_string()),
+    };
+    let prof = rag::build_collection_profile(inner);
+    let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
+    for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
+    let mut uidfs: Vec<(usize, f64)> = prof.uidf.iter().map(|(&d, &v)| (d, v)).collect();
+    uidfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let top_uidf: Vec<Value> = uidfs.into_iter().take(top_n).map(|(d, v)| {
+        json!({"dim": d, "syllable": udim2syl.get(&d).copied().unwrap_or("?"), "uidf": v})
+    }).collect();
+    let total_chunks: usize = inner.values().map(|b| b.n_chunks).sum();
+    (200, json!({
+        "scope": "collection",
+        "collection": coll,
+        "bases": inner.len(), "chunks": total_chunks,
+        "unified_vocab_size": prof.uvocab.len(),
+        "top_uidf": top_uidf,
+    }).to_string())
+}
+
+/// DELETE /collections/{name}?purge=true — apaga uma coleção inteira da memória.
+/// Com `purge=true` também remove `ragfiles/<name>/` do disco. [#2]
+fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
+    let purge = query_param(query, "purge").map(|s| s == "true" || s == "1").unwrap_or(false);
+    let removed = match st.bases.remove(name) {
+        Some(m) => m.len(),
+        None => return (404, json!({"error": format!("coleção '{name}' não encontrada")}).to_string()),
+    };
+    st.collection_profiles.remove(name);   // invalida o perfil cacheado
+    let mut purged = false;
+    if purge {
+        let dir = Path::new(&st.ragfiles_dir).join(name);
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                return (500, json!({"error": format!("removida da memória mas falhou apagar {}: {e}", dir.display()),
+                                    "collection": name, "bases_removed": removed}).to_string());
+            }
+            purged = true;
+        }
+    }
+    (200, json!({"ok": true, "collection": name, "bases_removed": removed,
+                 "purged": purged, "bases": total_bases(&st.bases),
+                 "collections": st.bases.len()}).to_string())
 }
 
 fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::CollectionProfile>) -> (u16, String) {
