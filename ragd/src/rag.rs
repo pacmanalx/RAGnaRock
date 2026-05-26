@@ -654,7 +654,8 @@ mod tests {
         }).collect();
         let n = chunks.len();
         RagBase { index, idf: HashMap::new(), chunks, has_text: false,
-                  n_chunks: n, vocab_size: vocab.len(), corpus: "t".into(), generator: "t".into() }
+                  n_chunks: n, vocab_size: vocab.len(), corpus: "t".into(), generator: "t".into(),
+                  mtime: 0 }
     }
     #[test]
     fn unifies_vocabs_across_different_drivers() {

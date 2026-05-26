@@ -5,7 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};   // [#6] sem PoisonError, fair, sem .unwrap() em locks
 use std::thread;
 use std::time::Instant;
 use rayon::prelude::*;
@@ -41,7 +42,13 @@ fn safe_name(n: &str) -> String {
 /// Mapa de bases agrupadas por coleção: collection -> name -> RagBase.
 type Bases = HashMap<String, HashMap<String, RagBase>>;
 
-/// Estado compartilhado entre as rotas (API + dashboard, via Arc<Mutex<State>>).
+/// Estado compartilhado entre as rotas (API + dashboard, via Arc<RwLock<State>>).
+/// [#6] **Outer lock = parking_lot::RwLock<State>** (fair, sem PoisonError):
+///   - rotas read-only (search/chunk/list/health/profile/stats) pegam `.read()` → N paralelas;
+///   - rotas write (ingest/delete/config/login/toggle) pegam `.write()` → exclusivo.
+/// **Interior mutability** em `collection_profiles` e `expansions`: são caches que `search` e
+/// `search_expand` precisam mutar mesmo sob outer-read — `Mutex` interno permite isso sem
+/// pedir outer-write (que serializaria com as outras searches em paralelo).
 struct State {
     bases: Bases,
     drivers_dir: String,
@@ -56,12 +63,12 @@ struct State {
     openai_key: String,         // chave p/ acoplar OpenAI/Codex
     active_provider: String,    // "none" | "anthropic" | "openai" — SÓ UM ativo por vez
     cache_dir: String,          // pasta do cache por-QUERY (sinônimos consultados antes da IA)
-    expansions: HashMap<String, Vec<String>>, // CACHE query normalizada -> expansões (cresce com a IA, editável). NÃO confundir com thesaurus_dir (dicionários por-palavra)
+    expansions: RwLock<HashMap<String, Vec<String>>>, // [#6] interior mut RW: search_expand cacheia sob outer-read; N readers
     thesaurus_dir: String,      // pasta dos dicionários por-PALAVRA (subdir/CODE com inuse.flag)
     word_syn: HashMap<String, Vec<String>>,   // palavra -> sinônimos (união dos dicionários ATIVOS)
     nidhogg_url: String,        // URL do daemon de módulos (nidhoggd:11497) — só pro proxy do console
     sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via SESSION_TTL)
-    collection_profiles: HashMap<String, rag::CollectionProfile>, // [#8] cache do perfil unificado por coleção (lazy; auto-invalida por fingerprint)
+    collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
 }
 
 /// Configuração do daemon. Vem de ragnarock.cfg (chave = valor) e/ou CLI (CLI vence).
@@ -546,7 +553,7 @@ fn main() {
     println!("🤘 RAGnaRock {VERSION}  ({} base(s) em {} coleção(ões), {} driver(s), ragfiles em {:?}, max upload {} MB)",
              total_bases(&bases), bases.len(), n_drivers, cfg.ragfiles_dir, cfg.max_upload / (1024 * 1024));
     let max_upload = cfg.max_upload;   // local p/ limitar leitura sem travar o Mutex
-    let state = Arc::new(Mutex::new(State {
+    let state = Arc::new(RwLock::new(State {
         bases, drivers_dir: cfg.drivers_dir.clone(), ragfiles_dir: cfg.ragfiles_dir.clone(),
         max_upload, started: Instant::now(),
         admin_user: cfg.admin_user.clone(), admin_pass: cfg.admin_pass.clone(),
@@ -556,11 +563,11 @@ fn main() {
         openai_key: cfg.openai_key.clone(),
         active_provider: cfg.active_provider.clone(),
         cache_dir: cfg.cache_dir.clone(),
-        expansions: {
+        expansions: RwLock::new({
             let t = load_expansions(&cfg.cache_dir);
             println!("cache de expansões: {} entrada(s) em {:?}", t.len(), expansions_file(&cfg.cache_dir));
             t
-        },
+        }),
         thesaurus_dir: cfg.thesaurus_dir.clone(),
         word_syn: {
             let m = load_active_dicts(&cfg.thesaurus_dir);
@@ -570,7 +577,7 @@ fn main() {
             m
         },
         nidhogg_url: cfg.nidhogg_url.clone(),
-        collection_profiles: HashMap::new(),
+        collection_profiles: RwLock::new(HashMap::new()),
         sessions: HashMap::new(),
     }));
 
@@ -608,9 +615,16 @@ fn main() {
             req.as_reader().take(max_read as u64).read_to_end(&mut body_bytes).ok();
         }
         let t0 = Instant::now();
-        let (code, payload) = {
-            let mut st = state.lock().unwrap();
+        // [#6] Classifica antes de pegar o lock: rotas que mutam o State (ingest, delete,
+        // toggle) pegam write() exclusivo; o resto pega read() — N searches em paralelo.
+        // Caches que search/search_expand precisam mutar (collection_profiles, expansions)
+        // têm interior mutability (Mutex<>) e funcionam sob read() outer.
+        let (code, payload) = if is_write_route(&method, &path) {
+            let mut st = state.write();
             route(&method, &path, &query, &headers, &body_bytes, &mut *st)
+        } else {
+            let st = state.read();
+            route_ro(&method, &path, &query, &headers, &body_bytes, &*st)
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
@@ -720,8 +734,8 @@ fn histogram(body: &str, bases: &Bases) -> (u16, String) {
     let query = match v["query"].as_str() {
         Some(q) => q, None => return (400, json!({"error": "falta 'query'"}).to_string()),
     };
-    let mut tmp_profiles = HashMap::new();   // histograma é visualização pontual; não usa cache unificado
-    let (code, sres) = search(body, bases, &mut tmp_profiles);
+    let tmp_profiles = RwLock::new(HashMap::new());   // histograma é visualização pontual; não usa cache unificado
+    let (code, sres) = search(body, bases, &tmp_profiles);
     if code != 200 { return (code, sres); }
     let sv: Value = serde_json::from_str(&sres).unwrap_or_else(|_| json!({}));
     let top = match sv["hits"].as_array().and_then(|h| h.first()) {
@@ -981,7 +995,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// POST /api/search_expand — busca COM expansão por IA: expande a query, roda a busca léxica
 /// pra original + variantes, e mescla por (coleção,base,chunk) com peso maior no termo original.
-fn search_expand(body: &str, st: &mut State) -> (u16, String) {
+fn search_expand(body: &str, st: &State) -> (u16, String) {
+    // [#6] aceita &State (não mut) — os caches que precisa mutar (expansions, collection_profiles)
+    // têm interior mutability (RwLock<>), o que permite search_expand rodar sob outer-read.
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()),
     };
@@ -1001,8 +1017,7 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
         slog(&format!("   ├─ cascata: 📚 dicionário ({} palavras ativas) → {} variante(s) · ENCERRA (sem cache/IA)",
                       st.word_syn.len(), dict_exps.len()));
         (dict_exps, "dict")
-    } else if let Some(cached) = st.expansions.get(&nkey) {
-        let c = cached.clone();
+    } else if let Some(c) = st.expansions.read().get(&nkey).cloned() {
         slog(&format!("   ├─ cascata: 📚 dict=∅ → 📖 cache HIT ({} variante(s)) · sem IA", c.len()));
         (c, "cache")
     } else {
@@ -1015,7 +1030,10 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
         slog(&format!("   ├─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 aciona IA ({provider})"));
         match llm_expand(&provider, &key, query) {
             Ok(e) => {
-                st.expansions.insert(nkey.clone(), e.clone()); save_expansions(&st.cache_dir, &st.expansions);
+                let mut m = st.expansions.write();
+                m.insert(nkey.clone(), e.clone());
+                save_expansions(&st.cache_dir, &m);
+                drop(m);
                 slog(&format!("   ├─ IA → {} variante(s) · gravado no cache", e.len()));
                 (e, "llm")
             }
@@ -1064,7 +1082,7 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
         qb.insert("query".into(), json!(q));
         qb.insert("k".into(), json!(k));
         qb.insert("phonetic".into(), json!(phon));
-        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &mut st.collection_profiles);
+        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &st.collection_profiles);
         if code != 200 { slog(&format!("   │  ├ {} {q:?} → erro {code}", if qi == 0 { "orig" } else { "var " })); continue; }
         let rv: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
         let nh = rv["hits"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -1093,8 +1111,10 @@ fn search_expand(body: &str, st: &mut State) -> (u16, String) {
     let qt = rag::prep_query(query);
     // [#5] peso unificado por coleção pro rescore (perfis já construídos pelas buscas das
     // variantes via `search`); coleção sem perfil cai no peso local dentro do score_chunk.
-    let exp_weightings: HashMap<String, Vec<f64>> = st.collection_profiles.iter()
-        .map(|(c, p)| (c.clone(), rag::weighting_unified(&qt, p))).collect();
+    let exp_weightings: HashMap<String, Vec<f64>> = {
+        let p = st.collection_profiles.read();
+        p.iter().map(|(c, prof)| (c.clone(), rag::weighting_unified(&qt, prof))).collect()
+    };
     let mut rows: Vec<(f64, f64, i64, usize, Value)> = best.into_values()
         .map(|(var_cov, mut h, via)| {
             let coll_h = h["collection"].as_str().unwrap_or("").to_string();
@@ -1176,7 +1196,7 @@ fn config_json(st: &State) -> String {
         "openai_key_set": !st.openai_key.is_empty(), "openai_key": st.openai_key,
         "active_provider": st.active_provider,
         "cache_dir": st.cache_dir,
-        "expansions_entries": st.expansions.len(),
+        "expansions_entries": st.expansions.read().len(),
         "thesaurus_dir": st.thesaurus_dir,
         "dicts_active": dict_dirs(&st.thesaurus_dir).iter().filter(|p| p.join("inuse.flag").exists()).count(),
         "word_syn_entries": st.word_syn.len(),
@@ -1295,7 +1315,7 @@ fn respond_json(req: Request, code: u16, payload: String, set_cookie: Option<&st
 
 /// Servidor da porta de controle (ValHalla): serve o shell HTML (público — sem segredos)
 /// + endpoints /api/* atrás de SESSÃO POR COOKIE (login/logout reais). Reusa o motor da API.
-fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
+fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     let method = req.method().clone();
     let full = req.url().to_string();
     let (path, query) = match full.split_once('?') {
@@ -1332,7 +1352,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
     if method == Method::Post && path == "/api/login" {
         let v: Value = serde_json::from_str(&body_str).unwrap_or(json!({}));
         let (u, p) = (v["user"].as_str().unwrap_or(""), v["pass"].as_str().unwrap_or(""));
-        let mut st = state.lock().unwrap();
+        let mut st = state.write();
         if u == st.admin_user && p == st.admin_pass {
             let tok = gen_token();
             st.sessions.retain(|_, t| t.elapsed().as_secs() < SESSION_TTL);   // limpa expiradas
@@ -1349,7 +1369,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
 
     // logout: descarta a sessão + limpa o cookie
     if method == Method::Post && path == "/api/logout" {
-        if let Some(t) = cookie_val(&headers, "vh_session") { state.lock().unwrap().sessions.remove(&t); }
+        if let Some(t) = cookie_val(&headers, "vh_session") { state.write().sessions.remove(&t); }
         let cookie = "vh_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict";
         println!("[{}] [valhalla] {ip} logout", now_stamp());
         respond_json(req, 200, json!({"ok": true}).to_string(), Some(cookie));
@@ -1357,7 +1377,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
     }
 
     // demais /api/* exigem sessão válida
-    let authed = { let st = state.lock().unwrap(); session_ok(&headers, &st.sessions) };
+    let authed = { let st = state.read(); session_ok(&headers, &st.sessions) };
     if !authed {
         println!("[{}] [valhalla] {ip} {method:?} {path} -> 401 (sem sessão)", now_stamp());
         respond_json(req, 401, json!({"error": "sessão necessária", "login": true}).to_string(), None);
@@ -1375,7 +1395,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
     // MÓDULOS externos (Nidhogg etc.): o console agrega via proxy HTTP. CRÍTICO: fazer FORA
     // do lock do State — o módulo chama a API do ragd de volta e deadlockaria no mesmo Mutex.
     if path.starts_with("/api/nidhogg") {
-        let url = { state.lock().unwrap().nidhogg_url.clone() };
+        let url = { state.read().nidhogg_url.clone() };
         let q = if query.is_empty() { String::new() } else { format!("?{query}") };
         let (code, payload) = module_proxy(&format!("{url}{path}{q}"), if method == Method::Post { Some(&body_str) } else { None });
         log_line("valhalla", &ip, &method, &path, &query, code, t0.elapsed().as_secs_f64() * 1000.0, &req_extra(&path, &body, &payload));
@@ -1383,12 +1403,24 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
         return;
     }
 
-    let (code, payload) = {
-        let mut st = state.lock().unwrap();
+    // [#6] write apenas pras rotas que mutam o State (config POST, thesaurus_toggle, ingest_upload);
+    // o resto roda sob read() — N polls de stats/logs/search do ValHalla em paralelo com a API.
+    let is_w = matches!((&method, path.as_str()),
+        (Method::Post, "/api/config") | (Method::Post, "/api/thesaurus_toggle")
+        | (Method::Post, "/api/ingest_upload"));
+    let (code, payload) = if is_w {
+        let mut st = state.write();
+        match (&method, path.as_str()) {
+            (Method::Post, "/api/config")           => set_config(&body_str, &mut *st),
+            (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
+            (Method::Post, "/api/ingest_upload")    => ingest_upload(&query, &headers, &body, &mut *st),
+            _ => unreachable!(),
+        }
+    } else {
+        let st = state.read();
         match (&method, path.as_str()) {
             (Method::Get, "/api/stats")       => (200, stats_json(&st)),
             (Method::Get, "/api/config")      => (200, config_json(&st)),
-            (Method::Post, "/api/config")     => set_config(&body_str, &mut *st),
             (Method::Post, "/api/test_key")   => {
                 let pv: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
                 let prov = pv["provider"].as_str().unwrap_or("");
@@ -1408,14 +1440,12 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
                 if Path::new(&out).is_dir() { list_drivers(&query, &out) }
                 else { (200, json!({"drivers_dir": out, "match": "*", "count": 0, "drivers": []}).to_string()) }
             }
-            (Method::Post, "/api/driver_move") => driver_move(&body_str, &st.drivers_dir),
-            (Method::Get,  "/api/thesaurus")   => list_dicts(&query, &st.thesaurus_dir),
-            (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
-            (Method::Post, "/api/ingest_upload") => ingest_upload(&query, &headers, &body, &mut *st),
-            (Method::Post, "/api/search")     => { let s = &mut *st; search(&body_str, &s.bases, &mut s.collection_profiles) },
-            (Method::Post, "/api/search_expand") => search_expand(&body_str, &mut *st),
-            (Method::Post, "/api/histogram")  => histogram(&body_str, &st.bases),
-            (Method::Post, "/api/chunk")      => fetch_chunk(&body_str, &mut st.bases),
+            (Method::Post, "/api/driver_move")   => driver_move(&body_str, &st.drivers_dir),
+            (Method::Get,  "/api/thesaurus")     => list_dicts(&query, &st.thesaurus_dir),
+            (Method::Post, "/api/search")        => search(&body_str, &st.bases, &st.collection_profiles),
+            (Method::Post, "/api/search_expand") => search_expand(&body_str, &*st),
+            (Method::Post, "/api/histogram")     => histogram(&body_str, &st.bases),
+            (Method::Post, "/api/chunk")         => fetch_chunk(&body_str, &st.bases),
             _ => (404, json!({"error": "rota dashboard não encontrada", "path": path}).to_string()),
         }
     };
@@ -1427,9 +1457,18 @@ fn handle_dashboard(mut req: Request, state: &Arc<Mutex<State>>) {
     respond_json(req, code, payload, None);
 }
 
-fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
-         body_bytes: &[u8], state: &mut State) -> (u16, String) {
-    // helper: body como str (JSON sempre e' utf-8)
+/// [#6] Decide o lock antes do dispatch: rotas que mutam o State pedem write(); o resto read().
+fn is_write_route(method: &Method, path: &str) -> bool {
+    matches!((method, path),
+        (Method::Post, "/ingest") | (Method::Post, "/ingest_file") | (Method::Post, "/ingest_upload"))
+    || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}
+}
+
+/// [#6] Dispatch READ-ONLY: roda sob `state.read()`, N requests em paralelo. Os caches que
+/// search/search_expand precisam mutar (collection_profiles, expansions) têm interior
+/// mutability (RwLock<>) — sob outer-read continuam funcionando.
+fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, String)],
+            body_bytes: &[u8], state: &State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     match (method, path) {
         (Method::Get, "/health") =>
@@ -1450,12 +1489,21 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
+        (Method::Post, "/search") => search(body_str(), &state.bases, &state.collection_profiles),
+        (Method::Post, "/search_expand") => search_expand(body_str(), state),
+        (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases),
+        _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
+    }
+}
+
+/// [#6] Dispatch READ-WRITE: roda sob `state.write()`, exclusivo. Só ingest e delete entram aqui.
+fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
+         body_bytes: &[u8], state: &mut State) -> (u16, String) {
+    let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
+    match (method, path) {
         (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
         (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state),
-        (Method::Post, "/search") => search(body_str(), &state.bases, &mut state.collection_profiles),
-        (Method::Post, "/search_expand") => search_expand(body_str(), state),
-        (Method::Post, "/chunk") => fetch_chunk(body_str(), &mut state.bases),
         (Method::Delete, p) if p.starts_with("/bases/") => {
             let name = &p["/bases/".len()..];
             let coll = query_param(query, "collection").unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
@@ -1470,7 +1518,7 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             let name = &p["/collections/".len()..];
             drop_collection(name, query, state)
         }
-        _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
+        _ => (404, json!({"error": "rota write não encontrada", "path": path}).to_string()),
     }
 }
 
@@ -1907,7 +1955,7 @@ fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
         Some(m) => m.len(),
         None => return (404, json!({"error": format!("coleção '{name}' não encontrada")}).to_string()),
     };
-    st.collection_profiles.remove(name);   // invalida o perfil cacheado
+    st.collection_profiles.write().remove(name);   // invalida o perfil cacheado
     let mut purged = false;
     if purge {
         let dir = Path::new(&st.ragfiles_dir).join(name);
@@ -1924,7 +1972,7 @@ fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
                  "collections": st.bases.len()}).to_string())
 }
 
-fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::CollectionProfile>) -> (u16, String) {
+fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::CollectionProfile>>) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
@@ -1960,26 +2008,40 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
     for (c, _) in &pairs { *scope_count.entry(c.as_str()).or_insert(0) += 1; }
     let build_colls: Vec<String> = scope_count.iter()
         .filter(|(_, n)| **n > 1).map(|(c, _)| c.to_string()).collect();
-    for c in &build_colls {
-        if let Some(inner) = bases.get(c) {
-            let fp = rag::collection_fingerprint(inner);
-            if profiles.get(c).map(|p| p.fingerprint) != Some(fp) {
-                profiles.insert(c.clone(), rag::build_collection_profile(inner));
+    // [#6] check fingerprint sob READ primeiro (N searches paralelas não esperam aqui); só pega
+    // WRITE rapidinho se precisa rebuild — minimiza tempo de exclusão.
+    let stale: Vec<String> = {
+        let p = profiles.read();
+        build_colls.iter().filter(|c| {
+            bases.get(*c).map(|inner| {
+                let fp = rag::collection_fingerprint(inner);
+                p.get(*c).map(|x| x.fingerprint) != Some(fp)
+            }).unwrap_or(false)
+        }).cloned().collect()
+    };
+    if !stale.is_empty() {
+        let mut p = profiles.write();
+        for c in &stale {
+            if let Some(inner) = bases.get(c) {
+                let fp = rag::collection_fingerprint(inner);
+                if p.get(c).map(|x| x.fingerprint) != Some(fp) {
+                    p.insert(c.clone(), rag::build_collection_profile(inner));
+                }
             }
         }
     }
     let qt = rag::prep_query(query);
-    // peso por termo (owned, pra soltar o borrow de `profiles`) por coleção do escopo
+    // segura UM read-lock durante todo o scatter-gather: outras searches lêem em paralelo
+    let profiles_guard = profiles.read();
     let weightings: HashMap<String, Vec<f64>> = build_colls.iter()
-        .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::weighting_unified(&qt, p))))
+        .filter_map(|c| profiles_guard.get(c).map(|p| (c.clone(), rag::weighting_unified(&qt, p))))
         .collect();
-    // recall unificado (opt-in): vetoriza a query no espaço da coleção 1× por coleção
     let qvecs: HashMap<String, (HashMap<usize, f64>, f64)> = if unified {
         build_colls.iter()
-            .filter_map(|c| profiles.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
+            .filter_map(|c| profiles_guard.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
             .collect()
     } else { HashMap::new() };
-    let profiles_ref: &HashMap<String, rag::CollectionProfile> = profiles;
+    let profiles_ref: &HashMap<String, rag::CollectionProfile> = &*profiles_guard;
 
     // scatter-gather: busca em cada base. Paraleliza com rayon quando há mais de uma
     // base no escopo (caso GLOBAL/coleção); cada base é independente, merge no fim.
@@ -2086,7 +2148,7 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
 }
 
 /// Retorna o(s) chunk(s) inteiro(s) por id — pra montar contexto (vizinhos, etc).
-fn fetch_chunk(body: &str, bases: &mut Bases) -> (u16, String) {
+fn fetch_chunk(body: &str, bases: &Bases) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),

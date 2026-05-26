@@ -9,6 +9,9 @@ serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"
 rayon = "1"
+# [#6] parking_lot — RwLock sem PoisonError, com starvation prevention nativo.
+# RwLock dá N leitores concorrentes (search) + 1 escritor exclusivo (ingest/delete).
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3
