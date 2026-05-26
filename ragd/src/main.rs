@@ -1458,7 +1458,7 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) 
     } else if let Some(p) = v["path"].as_str() {
         RagBase::load(p)
     } else if !v["data"].is_null() {
-        RagBase::from_str(&v["data"].to_string())
+        RagBase::from_str(&v["data"].to_string()).map(|mut b| { b.mtime = rag::now_secs(); b })
     } else {
         return (400, json!({"error": "forneça 'path', 'data' (JSON tokenizado) ou {path, raw:true} (arquivo bruto)"}).to_string());
     };
@@ -1661,11 +1661,12 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
         .unwrap_or_else(|_| out_path.display().to_string());
     tlog("ingest", &format!("   ├─ salvo: {saved_to} ({json_bytes} bytes)"));
 
-    let base = match RagBase::from_str(&String::from_utf8(buf).unwrap_or_default()) {
+    let mut base = match RagBase::from_str(&String::from_utf8(buf).unwrap_or_default()) {
         Ok(b) => b,
         Err(e) => { tlog("ingest", &format!("   └─ FALHOU ao carregar como RagBase: {e}"));
                     return (400, json!({"error": e}).to_string()); }
     };
+    base.mtime = rag::now_secs();   // ingestão recém-feita → "agora" pra boost de recência
     let n = base.n_chunks;
     let corpus = base.corpus.clone();
     insert_base(&mut state.bases, &collection, name.clone(), base);
@@ -1743,6 +1744,7 @@ fn ingest_raw_to_base(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string()));
     RagBase::from_str(&String::from_utf8(buf).unwrap_or_default())
+        .map(|mut b| { b.mtime = rag::now_secs(); b })
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -1841,7 +1843,7 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
 
     // scatter-gather: busca em cada base. Paraleliza com rayon quando há mais de uma
     // base no escopo (caso GLOBAL/coleção); cada base é independente, merge no fim.
-    type BaseResult = (Value, String, Vec<(f64, i64, f64, Map<String, Value>)>);
+    type BaseResult = (Value, String, Vec<(f64, u64, i64, f64, Map<String, Value>)>);
     let search_one = |coll: &String, name: &String| -> Option<BaseResult> {
         let base = get_base(bases, coll, name)?;
         let w = weightings.get(coll).map(|v| v.as_slice());   // peso unificado da coleção (ou None)
@@ -1863,7 +1865,7 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
                            "n_chunks": info.n_chunks, "n_converge": info.n_converge,
                            "dims": info.dims, "oov": info.oov,
                            "ms_recall": info.ms_recall, "ms_rerank": info.ms_rerank});
-        let mut local: Vec<(f64, i64, f64, Map<String, Value>)> = vec![];
+        let mut local: Vec<(f64, u64, i64, f64, Map<String, Value>)> = vec![];
         for (rr, cov, span, cos, cid) in hits {
             let c = &base.chunks[cid];
             let coverage = rr.unwrap_or(cos);
@@ -1887,7 +1889,9 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
             o.insert("chunk".into(), json!(c.id));
             o.insert("start".into(), json!(c.start));
             if let Some(t) = &c.text { o.insert("snippet".into(), json!(rag::snippet(t, query))); }
-            local.push((coverage, -(sp as i64), cos, o));
+            // tuple: (coverage_honesta, mtime_base, neg_span, cos, hit). mtime entra pro boost
+            // de recência no merge cross-base (sessão nova não perde pra antiga em quase-empate).
+            local.push((coverage, base.mtime, -(sp as i64), cos, o));
         }
         Some((entry, info.syls.join("-"), local))
     };
@@ -1897,7 +1901,7 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
         pairs.iter().filter_map(|(c, n)| search_one(c, n)).collect()
     };
     // merge: concatena hits e monta o relatório por base (ordem = ordem do escopo)
-    let mut merged: Vec<(f64, i64, f64, Map<String, Value>)> = vec![];
+    let mut merged: Vec<(f64, u64, i64, f64, Map<String, Value>)> = vec![];
     let mut searched: Vec<Value> = vec![];
     let mut syllables = String::new();
     for (entry, syls, local) in per_base {
@@ -1905,10 +1909,30 @@ fn search(body: &str, bases: &Bases, profiles: &mut HashMap<String, rag::Collect
         searched.push(entry);
         merged.extend(local);
     }
-    merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()
-        .then(b.1.cmp(&a.1))
-        .then(b.2.partial_cmp(&a.2).unwrap()));
-    let hits: Vec<Value> = merged.into_iter().take(k).enumerate().map(|(i, (_, _, _, mut o))| {
+    // BOOST DE RECÊNCIA (princípio único pra "novo não perde p/ velho em empate"):
+    // score = coverage × (1 + ALPHA · exp(-age / HALF_LIFE)). Sessão nova ganha leve
+    // multiplicador, velha aproxima de 1.0. ALPHA=0.10 (boost máx 10%), HALF_LIFE=7 dias.
+    // mtime=0 (desconhecido) → fator=1.0 (sem boost; fallback neutro).
+    const REC_ALPHA: f64 = 0.10;
+    const REC_HALF_LIFE: f64 = 7.0 * 86400.0;
+    let now = rag::now_secs();
+    let recency = |mtime: u64| -> f64 {
+        if mtime == 0 { return 1.0; }
+        let age = (now.saturating_sub(mtime)) as f64;
+        1.0 + REC_ALPHA * (-age / REC_HALF_LIFE).exp()
+    };
+    // ordena pelo SCORE BOOSTED; matchpoint exibido continua = coverage honesta (campo
+    // `recency` no hit dá transparência do fator). mtime desempata final (mais novo ganha).
+    merged.sort_by(|a, b| {
+        let sa = a.0 * recency(a.1);
+        let sb = b.0 * recency(b.1);
+        sb.partial_cmp(&sa).unwrap()
+            .then(a.2.cmp(&b.2))                        // span asc (proximidade)
+            .then(b.3.partial_cmp(&a.3).unwrap())       // cos desc
+            .then(b.1.cmp(&a.1))                        // mtime desc (recência puro p/ desempate)
+    });
+    let hits: Vec<Value> = merged.into_iter().take(k).enumerate().map(|(i, (_cov, mt, _sp, _cos, mut o))| {
+        o.insert("recency".into(), json!(format!("{:.3}", recency(mt))));
         o.insert("rank".into(), json!(i + 1));
         Value::Object(o)
     }).collect();

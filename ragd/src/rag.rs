@@ -233,6 +233,10 @@ pub struct RagBase {
     pub vocab_size: usize,
     pub corpus: String,
     pub generator: String,
+    /// Timestamp (seg desde epoch) da última ingestão desta base. Usado pelo merge cross-base
+    /// pra dar leve boost de recência (sessão nova não perde por empate p/ sessão antiga).
+    /// 0 = desconhecido (sem boost; comportamento legado).
+    pub mtime: u64,
 }
 
 pub struct Info {
@@ -286,12 +290,18 @@ impl RagBase {
             generator: meta["generator"].as_str().unwrap_or("?").to_string(),
             has_text: meta["with_text"].as_bool().unwrap_or(false),
             chunks,
+            mtime: 0,   // sem contexto de arquivo aqui; caller (load/ingest) seta depois.
         })
     }
 
     pub fn load(path: &str) -> Result<RagBase, String> {
         let data = std::fs::read_to_string(path).map_err(|e| format!("erro lendo {path:?}: {e}"))?;
-        RagBase::from_str(&data)
+        let mut b = RagBase::from_str(&data)?;
+        b.mtime = std::fs::metadata(path).ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        Ok(b)
     }
 
     fn query_vec(&self, query: &str) -> (HashMap<usize, f64>, f64, Vec<String>, usize) {
@@ -525,6 +535,13 @@ pub struct CollectionProfile {
 
 /// Fingerprint barato da coleção pra auto-invalidar o cache do perfil sem rastrear mutação:
 /// (nº de bases, total de chunks). Muda quando uma base entra/sai/é re-ingerida com tamanho diferente.
+/// Segundos desde epoch (UTC). Usado pra setar `RagBase.mtime` em ingestão nova e pra
+/// computar idade no boost de recência do merge cross-base. 0 em falha (sem boost).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0)
+}
+
 pub fn collection_fingerprint(bases: &HashMap<String, RagBase>) -> (usize, usize) {
     (bases.len(), bases.values().map(|b| b.chunks.len()).sum())
 }
