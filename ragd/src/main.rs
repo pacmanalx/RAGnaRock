@@ -1013,11 +1013,15 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     //   3) LLM ativo — só quando 1 e 2 não deram nada; grava no cache.
     let nkey = normalize_query(query);
     let dict_exps = if st.word_syn.is_empty() { vec![] } else { expand_with_dicts(query, &st.word_syn) };
+    // [#6 fix] Extrai o cache hit pra um let ANTES do if/else: garante que o read lock de
+    // `expansions` é dropado ANTES da arm `else` poder tentar `expansions.write()` (senão
+    // mesmo-thread read+write deadlocka em parking_lot/std RwLock).
+    let cache_hit: Option<Vec<String>> = st.expansions.read().get(&nkey).cloned();
     let (exps, source): (Vec<String>, &str) = if !dict_exps.is_empty() {
         slog(&format!("   ├─ cascata: 📚 dicionário ({} palavras ativas) → {} variante(s) · ENCERRA (sem cache/IA)",
                       st.word_syn.len(), dict_exps.len()));
         (dict_exps, "dict")
-    } else if let Some(c) = st.expansions.read().get(&nkey).cloned() {
+    } else if let Some(c) = cache_hit {
         slog(&format!("   ├─ cascata: 📚 dict=∅ → 📖 cache HIT ({} variante(s)) · sem IA", c.len()));
         (c, "cache")
     } else {
