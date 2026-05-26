@@ -216,32 +216,131 @@ fn now_stamp() -> String {
 fn req_extra(path: &str, body: &[u8], payload: &str) -> String {
     let pj: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
     let bj = || serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    // Erros têm prioridade — sem o err o resto vira lixo (campos vazios).
+    if let Some(err) = pj["error"].as_str() { return format!("err={err}"); }
+
+    // ── busca ──
     if path.ends_with("search_expand") {
         let q = bj()["query"].as_str().unwrap_or("").to_string();
         let hits = pj["hits"].as_array().map(|a| a.len()).unwrap_or(0);
         let dropped = pj["dropped"].as_array().map(|a| a.len()).unwrap_or(0);
         let abs = if pj["absent"].as_bool().unwrap_or(false) { " AUSENTE" } else { "" };
-        format!("q={q:?} source={} hits={hits} dropped={dropped}{abs}", pj["source"].as_str().unwrap_or("?"))
-    } else if path.ends_with("/search") {
-        let q = bj()["query"].as_str().unwrap_or("").to_string();
+        return format!("q={q:?} source={} hits={hits} dropped={dropped}{abs}",
+                       pj["source"].as_str().unwrap_or("?"));
+    }
+    if path.ends_with("/search") {
+        let b = bj();
+        let q = b["query"].as_str().unwrap_or("").to_string();
+        let unified = b["unified"].as_bool().unwrap_or(false);
         let hits = pj["hits"].as_array().map(|a| a.len()).unwrap_or(0);
         let scope = pj["scope"].as_array().map(|a| a.len()).unwrap_or(0);
         let conv: u64 = pj["searched"].as_array()
             .map(|a| a.iter().map(|x| x["n_converge"].as_u64().unwrap_or(0)).sum()).unwrap_or(0);
-        format!("q={q:?} hits={hits} scope={scope} convergem={conv}")
-    } else if path.contains("ingest") {
-        format!("name={} chunks={}", pj["name"].as_str().unwrap_or("?"), pj["n_chunks"].as_u64().unwrap_or(0))
-    } else if path.ends_with("/chunk") {
+        return format!("q={q:?} hits={hits} scope={scope} convergem={conv}{}", if unified { " unified" } else { "" });
+    }
+
+    // ── ingestão (todas as variantes: /ingest, /ingest_file, /ingest_upload) ──
+    if path.contains("ingest") {
+        let coll = pj["collection"].as_str().unwrap_or("?");
+        let name = pj["name"].as_str().unwrap_or("?");
+        let chunks = pj["n_chunks"].as_u64().unwrap_or(0);
+        let mut s = format!("{coll}/{name} chunks={chunks}");
+        if let Some(b) = pj["bytes"].as_u64() { s.push_str(&format!(" bytes={b}")); }
+        if let Some(v) = pj["via"].as_str() { s.push_str(&format!(" via={v}")); }
+        if pj["appended"].as_bool().unwrap_or(false) { s.push_str(" append"); }
+        if let Some(b) = pj["bases"].as_u64() { s.push_str(&format!(" total_bases={b}")); }
+        return s;
+    }
+
+    // ── chunk lookup ──
+    if path.ends_with("/chunk") {
         let b = bj();
-        format!("base={} id={}", b["base"].as_str().unwrap_or("?"), b["id"])
-    } else if path.ends_with("driver_move") {
-        format!("{} {}", pj["action"].as_str().unwrap_or("?"), pj["file"].as_str().unwrap_or("?"))
-    } else if path.ends_with("/histogram") {
-        format!("q={:?} -> {}/{}", bj()["query"].as_str().unwrap_or(""),
-                pj["base"].as_str().unwrap_or("?"), pj["chunk_id"])
-    } else if pj["error"].is_string() {
-        format!("err={}", pj["error"].as_str().unwrap_or(""))
-    } else { String::new() }
+        let base = b["base"].as_str().unwrap_or("?");
+        let target = if b["ids"].is_array() {
+            format!("ids={}", b["ids"].as_array().map(|a| a.len()).unwrap_or(0))
+        } else { format!("id={}", b["id"]) };
+        let before = b["before"].as_u64().unwrap_or(0);
+        let after = b["after"].as_u64().unwrap_or(0);
+        let win = if before > 0 || after > 0 { format!(" before={before} after={after}") } else { String::new() };
+        let returned = pj["chunks"].as_array().map(|a| a.len()).unwrap_or(
+            if pj["chunk"].is_object() { 1 } else { 0 });
+        return format!("base={base} {target}{win} -> {returned}");
+    }
+
+    // ── dashboard / inspeção ──
+    if path.ends_with("/histogram") {
+        return format!("q={:?} -> {}/{}", bj()["query"].as_str().unwrap_or(""),
+                       pj["base"].as_str().unwrap_or("?"), pj["chunk_id"]);
+    }
+
+    // ── listagens ──
+    if path.ends_with("/collections") {
+        return format!("coleções={} bases_total={}",
+                       pj["count"].as_u64().unwrap_or(0),
+                       pj["total_bases"].as_u64().unwrap_or(0));
+    }
+    if path.ends_with("/bases") {
+        return format!("escopo={}/{} -> {}",
+                       pj["collection"].as_str().unwrap_or("*"),
+                       pj["match"].as_str().unwrap_or("*"),
+                       pj["count"].as_u64().unwrap_or(0));
+    }
+    if path.ends_with("/drivers") || path.ends_with("/drivers_out") {
+        let c = pj["count"].as_u64().unwrap_or_else(|| pj["drivers"].as_array().map(|a| a.len() as u64).unwrap_or(0));
+        return format!("count={c}");
+    }
+    if path.ends_with("/thesaurus") {
+        return format!("dicts={} ativos={}",
+                       pj["count"].as_u64().unwrap_or(0),
+                       pj["active"].as_u64().unwrap_or(0));
+    }
+    if path.ends_with("/interpret") {
+        return format!("{} -> {} ({})",
+                       pj["file"].as_str().or(pj["ext"].as_str()).unwrap_or("?"),
+                       pj["driver"].as_str().unwrap_or("?"),
+                       pj["language"].as_str().unwrap_or("?"));
+    }
+
+    // ── ações ──
+    if path.ends_with("driver_move") {
+        return format!("{} {}", pj["action"].as_str().unwrap_or("?"), pj["file"].as_str().unwrap_or("?"));
+    }
+    if path.ends_with("thesaurus_toggle") {
+        let b = bj();
+        return format!("{} {} -> ativos={} palavras={}",
+                       b["code"].as_str().unwrap_or("?"),
+                       b["action"].as_str().unwrap_or("?"),
+                       pj["active_count"].as_u64().or(pj["active"].as_u64()).unwrap_or(0),
+                       pj["entries"].as_u64().or(pj["words"].as_u64()).unwrap_or(0));
+    }
+
+    // ── config / chaves ──
+    if path.ends_with("/api/config") {
+        return format!("provider={}", pj["active_provider"].as_str().or(pj["provider"].as_str()).unwrap_or("?"));
+    }
+    if path.ends_with("test_key") {
+        let ok = pj["ok"].as_bool().unwrap_or(false);
+        return format!("{} {}", pj["provider"].as_str().unwrap_or("?"), if ok { "OK" } else { "FALHA" });
+    }
+
+    // ── observabilidade ──
+    if path.ends_with("/api/logs") {
+        let lines = pj["lines"].as_array().map(|a| a.len() as u64).unwrap_or(pj["count"].as_u64().unwrap_or(0));
+        return format!("linhas={lines}");
+    }
+    if path.ends_with("/api/stats") {
+        return format!("bases={} cols={} rss={:.0}MB",
+                       pj["bases"].as_u64().unwrap_or(0),
+                       pj["collections"].as_u64().unwrap_or(0),
+                       pj["mem_rss_mb"].as_f64().unwrap_or(0.0));
+    }
+
+    // ── DELETE /bases/{name} ──
+    if path.starts_with("/bases/") {
+        return format!("removida={}", pj["removed"].as_str().or(pj["name"].as_str()).unwrap_or("?"));
+    }
+
+    String::new()
 }
 
 /// Linha de log padronizada: [ts] [tag] ip METHOD path?query -> code (Xms) · extra
@@ -251,10 +350,12 @@ fn log_line(tag: &str, ip: &str, method: &Method, path: &str, query: &str, code:
     println!("[{}] [{tag}] {ip} {method:?} {path}{q} -> {code} ({ms:.1}ms){ex}", now_stamp());
 }
 
-/// Trace hierárquico do pipeline de busca — mesmo log (stdout), tag [search]. Os handlers
-/// rodam sob o lock do State (serializados), então as linhas de um trace não se intercalam
-/// com as de outra requisição. Use `pfx` pra desenhar a árvore (├─, │, └─).
-fn slog(line: &str) { println!("[{}] [search] {line}", now_stamp()); }
+/// Trace hierárquico de pipeline (mesmo stdout, tag livre). Os handlers rodam sob o lock do
+/// State (serializados), então as linhas de um trace não se intercalam com as de outra
+/// requisição. Use `pfx` pra desenhar a árvore (├─, │, └─). `slog` mantém a tag [search]
+/// (compat); novos pipelines (ingest, etc.) usam [tlog] direto com a tag deles.
+fn tlog(tag: &str, line: &str) { println!("[{}] [{tag}] {line}", now_stamp()); }
+fn slog(line: &str) { tlog("search", line); }
 
 /// Últimas `n` linhas de um arquivo de log (pro painel de Logs do ValHalla).
 fn tail_lines(path: &str, n: usize) -> String {
@@ -1427,6 +1528,7 @@ fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Ba
 /// Em ambos os modos: grava ragfiles_dir/<name>-tokenized.json e carrega em memoria.
 /// Limite de tamanho: --max-upload (default 1 GB). Estoura -> HTTP 413.
 fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State) -> (u16, String) {
+    let t0 = std::time::Instant::now();
     if body.len() > state.max_upload {
         return (413, json!({"error": format!("upload excede limite de {} bytes (--max-upload)", state.max_upload)}).to_string());
     }
@@ -1478,10 +1580,16 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
         (filename, body.to_vec(), fields)
     };
 
+    let via = if is_multipart { "multipart" } else { "raw" };
+    tlog("ingest", &format!("┌─ ingest_upload via={via} filename={filename:?} bytes={}", content_bytes.len()));
+
     // conteudo precisa ser UTF-8 pra tokenizar como texto
     let text = match std::str::from_utf8(&content_bytes) {
         Ok(s) => s.to_string(),
-        Err(e) => return (400, json!({"error": format!("arquivo nao e' UTF-8: {e}")}).to_string()),
+        Err(e) => {
+            tlog("ingest", &format!("   └─ FALHOU: arquivo não é UTF-8 ({e})"));
+            return (400, json!({"error": format!("arquivo nao e' UTF-8: {e}")}).to_string());
+        }
     };
 
     let name = safe_name(&fields.get("name").cloned()
@@ -1495,6 +1603,10 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     let source_label = format!("<upload:{filename}>");
     // append=true (query/field): acumula na base existente em vez de sobrescrever.
     let append: bool = fields.get("append").map(|s| s != "false" && s != "0").unwrap_or(false);
+    tlog("ingest", &format!("   ├─ destino: {collection}/{name} driver={} chunk={chunk_size}{}{}",
+                            driver_override.unwrap_or("auto"),
+                            if max_chunks > 0 { format!(" max_chunks={max_chunks}") } else { String::new() },
+                            if append { " append" } else { "" }));
 
     // persiste em ragfiles_dir/<collection>/<name>-tokenized.json
     let rag_dir = Path::new(&state.ragfiles_dir).join(&collection);
@@ -1505,49 +1617,66 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
 
     // append so' faz sentido se a base ja existe; senao cria normal (sem erro).
     let did_append = append && out_path.exists();
+    let tk = std::time::Instant::now();
     let value = if did_append {
         let existing_str = match std::fs::read_to_string(&out_path) {
             Ok(s) => s,
-            Err(e) => return (500, json!({"error": format!("ler base p/ append {}: {e}", out_path.display())}).to_string()),
+            Err(e) => { tlog("ingest", &format!("   └─ FALHOU: ler base p/ append: {e}"));
+                        return (500, json!({"error": format!("ler base p/ append {}: {e}", out_path.display())}).to_string()); }
         };
         let existing: Value = match serde_json::from_str(&existing_str) {
             Ok(v) => v,
-            Err(e) => return (400, json!({"error": format!("base existente nao e' JSON valido: {e}")}).to_string()),
+            Err(e) => { tlog("ingest", &format!("   └─ FALHOU: base existente não é JSON válido: {e}"));
+                        return (400, json!({"error": format!("base existente nao e' JSON valido: {e}")}).to_string()); }
         };
         match ingestor::tokenize_content_append(&existing, &text, &source_label, Path::new(&state.drivers_dir)) {
-            Ok(v) => v, Err(e) => return (400, json!({"error": e}).to_string()),
+            Ok(v) => v,
+            Err(e) => { tlog("ingest", &format!("   └─ FALHOU na tokenização: {e}"));
+                        return (400, json!({"error": e}).to_string()); }
         }
     } else {
         match ingestor::tokenize_content(
             &text, &filename, &source_label,
             Path::new(&state.drivers_dir), driver_override, chunk_size, max_chunks, with_text,
         ) {
-            Ok(v) => v, Err(e) => return (400, json!({"error": e}).to_string()),
+            Ok(v) => v,
+            Err(e) => { tlog("ingest", &format!("   └─ FALHOU na tokenização: {e}"));
+                        return (400, json!({"error": e}).to_string()); }
         }
     };
+    tlog("ingest", &format!("   ├─ tokenizado em {:.0}ms (texto {} bytes)",
+                            tk.elapsed().as_secs_f64() * 1000.0, text.len()));
     let mut buf = Vec::new();
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     if let Err(e) = serde::Serialize::serialize(&value, &mut ser) {
         return (500, json!({"error": format!("serialize JSON: {e}")}).to_string());
     }
+    let json_bytes = buf.len();
     if let Err(e) = std::fs::write(&out_path, &buf) {
+        tlog("ingest", &format!("   └─ FALHOU ao gravar {}: {e}", out_path.display()));
         return (500, json!({"error": format!("gravar {}: {e}", out_path.display())}).to_string());
     }
     let saved_to = std::fs::canonicalize(&out_path).map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string());
+    tlog("ingest", &format!("   ├─ salvo: {saved_to} ({json_bytes} bytes)"));
 
     let base = match RagBase::from_str(&String::from_utf8(buf).unwrap_or_default()) {
-        Ok(b) => b, Err(e) => return (400, json!({"error": e}).to_string()),
+        Ok(b) => b,
+        Err(e) => { tlog("ingest", &format!("   └─ FALHOU ao carregar como RagBase: {e}"));
+                    return (400, json!({"error": e}).to_string()); }
     };
     let n = base.n_chunks;
     let corpus = base.corpus.clone();
     insert_base(&mut state.bases, &collection, name.clone(), base);
+    let total = total_bases(&state.bases);
+    tlog("ingest", &format!("   └─ carregado: {collection}/{name} ({n} chunks) · total={total} bases ({:.0}ms)",
+                            t0.elapsed().as_secs_f64() * 1000.0));
     (200, json!({"ok": true, "collection": collection, "name": name, "filename": filename,
                  "corpus": corpus, "n_chunks": n, "bytes": content_bytes.len(),
                  "appended": did_append,
-                 "bases": total_bases(&state.bases), "saved_to": saved_to,
-                 "via": if is_multipart { "multipart" } else { "raw" }}).to_string())
+                 "bases": total, "saved_to": saved_to,
+                 "via": via}).to_string())
 }
 
 /// Decodificacao MINIMA de percent-encoding pra query string (RFC 3986).
