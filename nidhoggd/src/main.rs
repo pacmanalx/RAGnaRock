@@ -50,11 +50,13 @@ struct Config {
     dir: String,         // raiz do conhecimento persistente
     cadence: u64,        // segundos entre ciclos
     cfg_path: String,
+    cors_origin: String, // CORS: vazio = sem header (same-origin safe); senão ecoa o valor
 }
 impl Default for Config {
     fn default() -> Self {
         Config { port: DEFAULT_PORT, ragd_api: DEFAULT_RAGD_API.to_string(), on: false, level: 0,
-                 dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string() }
+                 dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string(),
+                 cors_origin: String::new() }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -72,6 +74,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "level"    => cfg.level = level_num(v),
             "dir"      => cfg.dir = v.to_string(),
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
+            "cors_origin" => cfg.cors_origin = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
         }
     }
@@ -286,7 +289,7 @@ fn help() {
 uso:
   nidhoggd [--config <arq>] [--port {DEFAULT_PORT}] [--ragd <url>]
   config: --config <arq>, senão ./nidhogg.cfg, senão defaults.
-          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|propositivo), dir, cadence
+          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|propositivo), dir, cadence, cors_origin
   nasce DESLIGADO (precisa de IA). Liga pelo ValHalla ou pelo cfg.
 rotas:
   GET  /health
@@ -343,17 +346,35 @@ fn main() {
     let server = Server::http(&addr).unwrap_or_else(|e| { eprintln!("erro ao subir em {addr}: {e}"); std::process::exit(1); });
     println!("🕸  API do módulo em http://{addr}/  · /health /api/nidhogg /api/nidhogg/collections");
 
+    // CORS: vazio (default) = same-origin, nenhum header emitido. ValHalla fala com o
+    // nidhoggd via proxy server-side no ragd, então o browser nunca bate aqui direto.
+    // Setar `cors_origin` no cfg só se for expor a 11497 a um front em outra origem.
+    let cors_origin = cfg.cors_origin.clone();
+    let cors_header = |resp: &mut Response<std::io::Cursor<Vec<u8>>>| {
+        if !cors_origin.is_empty() {
+            resp.add_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], cors_origin.as_bytes()).unwrap());
+        }
+    };
+
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
         let full = req.url().to_string();
         let path = full.split('?').next().unwrap_or("").to_string();
+        // preflight CORS: só responde quando habilitado; senão segue o fluxo normal
+        if method == Method::Options && !cors_origin.is_empty() {
+            let mut resp = Response::from_string("").with_status_code(204);
+            cors_header(&mut resp);
+            resp.add_header(Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap());
+            resp.add_header(Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap());
+            let _ = req.respond(resp);
+            continue;
+        }
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);
         let (code, payload) = route(&method, &path, &body, &state);
         let mut resp = Response::from_string(payload).with_status_code(code);
         resp.add_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
-        // CORS liberado (11497 pode ser consumida direto por outras ferramentas)
-        resp.add_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap());
+        cors_header(&mut resp);
         let _ = req.respond(resp);
     }
 }
