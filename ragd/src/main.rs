@@ -73,7 +73,8 @@ struct State {
     thesaurus_dir: String,      // pasta dos dicionários por-PALAVRA (subdir/CODE com inuse.flag)
     word_syn: HashMap<String, Vec<String>>,   // palavra -> sinônimos (união dos dicionários ATIVOS)
     nidhogg_url: String,        // URL do daemon de módulos (nidhoggd:11497) — só pro proxy do console
-    sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via SESSION_TTL)
+    sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via session_ttl)
+    session_ttl: u64,                     // validade da sessão em segundos (configurável; default 12h)
     collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
 }
 
@@ -96,6 +97,7 @@ struct Config {
     cache_dir: String,
     thesaurus_dir: String,
     nidhogg_url: String,
+    session_ttl: u64,  // validade da sessão do console em segundos (default 12h)
     dev: bool,         // --dev: aceita credenciais padrão admin/admin (só pra desenvolvimento)
 }
 impl Default for Config {
@@ -115,6 +117,7 @@ impl Default for Config {
             cache_dir: "cache".to_string(),
             thesaurus_dir: DEFAULT_THESAURUS_DIR.to_string(),
             nidhogg_url: "http://127.0.0.1:11497".to_string(),
+            session_ttl: 12 * 3600,
             dev: false,
         }
     }
@@ -154,6 +157,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "cache_dir"   => cfg.cache_dir = v.to_string(),
             "thesaurus_dir" => cfg.thesaurus_dir = v.to_string(),
             "nidhogg_url" => cfg.nidhogg_url = v.to_string(),
+            "session_ttl" => if let Ok(n) = v.parse() { cfg.session_ttl = n },
             other => eprintln!("config:{}: chave desconhecida {other:?}", lineno + 1),
         }
     }
@@ -589,6 +593,7 @@ fn main() {
         nidhogg_url: cfg.nidhogg_url.clone(),
         collection_profiles: RwLock::new(HashMap::new()),
         sessions: HashMap::new(),
+        session_ttl: cfg.session_ttl,
     }));
 
     // 4) dashboard / supervisório numa thread separada (porta de controle)
@@ -655,8 +660,6 @@ fn main() {
 
 // ----------------------------- dashboard (porta de controle) -----------------------------
 
-const SESSION_TTL: u64 = 12 * 3600;   // sessão válida por 12h
-
 /// Gera um token de sessão (16 bytes de /dev/urandom em hex; fallback temporal).
 fn gen_token() -> String {
     let mut buf = [0u8; 16];
@@ -681,9 +684,9 @@ fn cookie_val(headers: &[(String, String)], key: &str) -> Option<String> {
 }
 
 /// Sessão válida = cookie vh_session presente e não expirado.
-fn session_ok(headers: &[(String, String)], sessions: &HashMap<String, Instant>) -> bool {
+fn session_ok(headers: &[(String, String)], sessions: &HashMap<String, Instant>, ttl: u64) -> bool {
     match cookie_val(headers, "vh_session") {
-        Some(t) => sessions.get(&t).map(|created| created.elapsed().as_secs() < SESSION_TTL).unwrap_or(false),
+        Some(t) => sessions.get(&t).map(|created| created.elapsed().as_secs() < ttl).unwrap_or(false),
         None => false,
     }
 }
@@ -1502,9 +1505,10 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
             respond_json(req, 403, json!({"error": "credenciais padrão não permitidas fora do modo dev. Altere admin_user/admin_pass no ragnarock.cfg ou inicie com --dev."}).to_string(), None);
         } else if u == st.admin_user && p == st.admin_pass {
             let tok = gen_token();
-            st.sessions.retain(|_, t| t.elapsed().as_secs() < SESSION_TTL);   // limpa expiradas
+            let ttl = st.session_ttl;
+            st.sessions.retain(|_, t| t.elapsed().as_secs() < ttl);   // limpa expiradas
             st.sessions.insert(tok.clone(), Instant::now());
-            let cookie = format!("vh_session={tok}; HttpOnly; Path=/; Max-Age={SESSION_TTL}; SameSite=Strict");
+            let cookie = format!("vh_session={tok}; HttpOnly; Path=/; Max-Age={ttl}; SameSite=Strict");
             println!("[{}] [valhalla] {ip} login OK (user={u})", now_stamp());
             respond_json(req, 200, json!({"ok": true, "user": u}).to_string(), Some(&cookie));
         } else {
@@ -1524,7 +1528,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     }
 
     // demais /api/* exigem sessão válida
-    let authed = { let st = state.read(); session_ok(&headers, &st.sessions) };
+    let authed = { let st = state.read(); session_ok(&headers, &st.sessions, st.session_ttl) };
     if !authed {
         println!("[{}] [valhalla] {ip} {method:?} {path} -> 401 (sem sessão)", now_stamp());
         respond_json(req, 401, json!({"error": "sessão necessária", "login": true}).to_string(), None);
