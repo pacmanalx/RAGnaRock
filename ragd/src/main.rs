@@ -2136,7 +2136,10 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
         for (s, &d) in &base.index { dim2syl.insert(d, s.as_str()); }
         let vocab_used = base.idf.iter().filter(|(_, &v)| v > 0.0).count();
         let mut idfs: Vec<(usize, f64)> = base.idf.iter().map(|(&d, &v)| (d, v)).collect();
-        idfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // idf desc, COM desempate estável por dim asc: idf vem de um HashMap (ordem de
+        // iteração não-determinística) e muitas sílabas raras empatam no idf máximo — sem
+        // o desempate, o top_idf reembaralharia a cada chamada (fere o "determinístico").
+        idfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
         let top_idf: Vec<Value> = idfs.into_iter().take(top_n).map(|(d, v)| {
             json!({"dim": d, "syllable": dim2syl.get(&d).copied().unwrap_or("?"), "idf": v})
         }).collect();
@@ -2159,7 +2162,8 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
     let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
     for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
     let mut uidfs: Vec<(usize, f64)> = prof.uidf.iter().map(|(&d, &v)| (d, v)).collect();
-    uidfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // idf desc + desempate estável por dim asc (mesma razão do modo base: top_uidf reproduzível).
+    uidfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
     let top_uidf: Vec<Value> = uidfs.into_iter().take(top_n).map(|(d, v)| {
         json!({"dim": d, "syllable": udim2syl.get(&d).copied().unwrap_or("?"), "uidf": v})
     }).collect();
