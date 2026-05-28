@@ -75,6 +75,8 @@ struct State {
     nidhogg_url: String,        // URL do daemon de módulos (nidhoggd:11497) — só pro proxy do console
     sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via session_ttl)
     session_ttl: u64,                     // validade da sessão em segundos (configurável; default 12h)
+    max_bases: usize,                     // teto de bases (0 = sem limite); OOM guard no ingest
+    max_chunks_per_base: usize,           // teto de chunks por base (0 = sem limite); OOM guard no ingest
     collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
 }
 
@@ -98,6 +100,8 @@ struct Config {
     thesaurus_dir: String,
     nidhogg_url: String,
     session_ttl: u64,  // validade da sessão do console em segundos (default 12h)
+    max_bases: usize,  // teto de bases carregadas (0 = sem limite); recusa ingest de base NOVA além disso
+    max_chunks_per_base: usize, // teto de chunks por base (0 = sem limite); recusa ingest acima disso
     dev: bool,         // --dev: aceita credenciais padrão admin/admin (só pra desenvolvimento)
 }
 impl Default for Config {
@@ -118,6 +122,8 @@ impl Default for Config {
             thesaurus_dir: DEFAULT_THESAURUS_DIR.to_string(),
             nidhogg_url: "http://127.0.0.1:11497".to_string(),
             session_ttl: 12 * 3600,
+            max_bases: 0,
+            max_chunks_per_base: 0,
             dev: false,
         }
     }
@@ -158,6 +164,8 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "thesaurus_dir" => cfg.thesaurus_dir = v.to_string(),
             "nidhogg_url" => cfg.nidhogg_url = v.to_string(),
             "session_ttl" => if let Ok(n) = v.parse() { cfg.session_ttl = n },
+            "max_bases"   => if let Ok(n) = v.parse() { cfg.max_bases = n },
+            "max_chunks_per_base" => if let Ok(n) = v.parse() { cfg.max_chunks_per_base = n },
             other => eprintln!("config:{}: chave desconhecida {other:?}", lineno + 1),
         }
     }
@@ -431,6 +439,47 @@ fn insert_base(b: &mut Bases, coll: &str, name: String, base: RagBase) {
     b.entry(coll.to_string()).or_default().insert(name, base);
 }
 
+/// [#13] OOM guard: recusa um ingest que criaria uma base NOVA além do teto `max_bases`
+/// (0 = sem limite). Sobrescrever/append de base já existente não conta como nova.
+fn base_count_cap_ok(b: &Bases, coll: &str, name: &str, max_bases: usize) -> Result<(), String> {
+    if max_bases == 0 { return Ok(()); }
+    let exists = b.get(coll).map(|m| m.contains_key(name)).unwrap_or(false);
+    if !exists && total_bases(b) >= max_bases {
+        return Err(format!("limite de {max_bases} bases atingido (max_bases no cfg) — \
+                            remova bases ou aumente o teto"));
+    }
+    Ok(())
+}
+
+/// Grava o JSON tokenizado de uma base com duas salvaguardas:
+///  - [#13] recusa ANTES de gravar se a base excede `max_chunks_per_base` (0 = sem limite);
+///  - [#12] se já existe arquivo no destino, copia pra `<arquivo>.bak` antes de sobrescrever
+///    (best-effort: falha no backup não aborta a gravação, só avisa). O `.bak` é ignorado pelo
+///    autoload (não termina em `-tokenized.json`) e pelo git (`*.bak`), então é só rede de proteção.
+fn write_base_json(out_path: &Path, buf: &[u8], n_chunks: usize, max_chunks_per_base: usize) -> Result<(), String> {
+    chunk_cap_ok(n_chunks, max_chunks_per_base)?;
+    if out_path.exists() {
+        let bak = std::path::PathBuf::from(format!("{}.bak", out_path.display()));
+        if let Err(e) = std::fs::copy(out_path, &bak) {
+            eprintln!("aviso: backup {} falhou: {e} (gravando mesmo assim)", bak.display());
+        }
+    }
+    std::fs::write(out_path, buf).map_err(|e| format!("gravar {}: {e}", out_path.display()))
+}
+
+/// Conta os chunks de um JSON tokenizado já montado (pelo array `chunks`).
+fn value_n_chunks(v: &Value) -> usize {
+    v.get("chunks").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0)
+}
+
+/// [#13] OOM guard: única fonte de verdade do teto de chunks por base (0 = sem limite).
+fn chunk_cap_ok(n_chunks: usize, max_chunks_per_base: usize) -> Result<(), String> {
+    if max_chunks_per_base > 0 && n_chunks > max_chunks_per_base {
+        return Err(format!("base com {n_chunks} chunks excede o limite max_chunks_per_base={max_chunks_per_base} (cfg)"));
+    }
+    Ok(())
+}
+
 /// Carrega um `<name>-tokenized.json` na coleção `coll`. Devolve true se entrou.
 fn load_base_file(bases: &mut Bases, coll: &str, path: &Path) -> bool {
     let fname = match path.file_name().and_then(|x| x.to_str()) { Some(f) => f, None => return false };
@@ -594,6 +643,8 @@ fn main() {
         collection_profiles: RwLock::new(HashMap::new()),
         sessions: HashMap::new(),
         session_ttl: cfg.session_ttl,
+        max_bases: cfg.max_bases,
+        max_chunks_per_base: cfg.max_chunks_per_base,
     }));
 
     // 4) dashboard / supervisório numa thread separada (porta de controle)
@@ -1652,8 +1703,8 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
          body_bytes: &[u8], state: &mut State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     match (method, path) {
-        (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
-        (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases),
+        (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
+        (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state),
         (Method::Delete, p) if p.starts_with("/bases/") => {
             let name = &p["/bases/".len()..];
@@ -1680,7 +1731,7 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
 ///       chunk?, driver?, with_text?, max_chunks?}     tokeniza usando o driver
 ///                                                      apontado por 'driver' ou
 ///                                                      auto-detectado pela ext.
-fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) -> (u16, String) {
+fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, max_bases: usize, max_chunks_per_base: usize) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
@@ -1692,12 +1743,17 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) 
     let collection = v["collection"].as_str().unwrap_or(DEFAULT_COLLECTION).to_string();
     let raw_mode = v["raw"].as_bool().unwrap_or(false);
 
+    // [#13] OOM guard: recusa base nova além do teto antes de carregar/tokenizar.
+    if let Err(e) = base_count_cap_ok(bases, &collection, &name, max_bases) {
+        return (413, json!({"error": e}).to_string());
+    }
+
     let mut saved_to: Option<String> = None;
     let res: Result<RagBase, String> = if raw_mode {
         let path = match v["path"].as_str() {
             Some(p) => p, None => return (400, json!({"error": "raw=true exige 'path' (arquivo bruto)"}).to_string()),
         };
-        ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to)
+        ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to, max_chunks_per_base)
     } else if let Some(p) = v["path"].as_str() {
         RagBase::load(p)
     } else if !v["data"].is_null() {
@@ -1708,6 +1764,10 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) 
     match res {
         Ok(b) => {
             let n = b.n_chunks;
+            // [#13] modos path/data pulam o writer; aplica o mesmo teto de chunks aqui.
+            if let Err(e) = chunk_cap_ok(n, max_chunks_per_base) {
+                return (413, json!({"error": e}).to_string());
+            }
             insert_base(bases, &collection, name.clone(), b);
             let mut r = Map::new();
             r.insert("ok".into(), json!(true));
@@ -1728,7 +1788,7 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) 
 /// 'name' default = derive_base_name(path) (path achatado, ex: logic_path__03_histogram_py).
 /// 'driver' default = auto pela extensao (fallback PTBR).
 /// Sempre grava o JSON tokenizado em ragfiles_dir/<name>-tokenized.json.
-fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases) -> (u16, String) {
+fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, max_bases: usize, max_chunks_per_base: usize) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
@@ -1740,8 +1800,13 @@ fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Ba
     let name = safe_name(&v["name"].as_str().map(|s| s.to_string())
         .unwrap_or_else(|| ingestor::derive_base_name(Path::new(path))));
 
+    // [#13] OOM guard: recusa base nova além do teto antes de tokenizar.
+    if let Err(e) = base_count_cap_ok(bases, &collection, &name, max_bases) {
+        return (413, json!({"error": e}).to_string());
+    }
+
     let mut saved_to: Option<String> = None;
-    match ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to) {
+    match ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to, max_chunks_per_base) {
         Ok(b) => {
             let n = b.n_chunks;
             let corpus = b.corpus.clone();
@@ -1851,6 +1916,12 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
                             if max_chunks > 0 { format!(" max_chunks={max_chunks}") } else { String::new() },
                             if append { " append" } else { "" }));
 
+    // [#13] OOM guard: recusa base nova além do teto antes de qualquer trabalho de I/O.
+    if let Err(e) = base_count_cap_ok(&state.bases, &collection, &name, state.max_bases) {
+        tlog("ingest", &format!("   └─ RECUSADO: {e}"));
+        return (413, json!({"error": e}).to_string());
+    }
+
     // persiste em ragfiles_dir/<collection>/<name>-tokenized.json
     let rag_dir = Path::new(&state.ragfiles_dir).join(&collection);
     if let Err(e) = std::fs::create_dir_all(&rag_dir) {
@@ -1896,9 +1967,11 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
         return (500, json!({"error": format!("serialize JSON: {e}")}).to_string());
     }
     let json_bytes = buf.len();
-    if let Err(e) = std::fs::write(&out_path, &buf) {
-        tlog("ingest", &format!("   └─ FALHOU ao gravar {}: {e}", out_path.display()));
-        return (500, json!({"error": format!("gravar {}: {e}", out_path.display())}).to_string());
+    // [#12] backup .bak antes de sobrescrever + [#13] recusa se exceder max_chunks_per_base.
+    if let Err(e) = write_base_json(&out_path, &buf, value_n_chunks(&value), state.max_chunks_per_base) {
+        tlog("ingest", &format!("   └─ FALHOU/RECUSADO ao gravar {}: {e}", out_path.display()));
+        let code = if e.contains("max_chunks_per_base") { 413 } else { 500 };
+        return (code, json!({"error": e}).to_string());
     }
     let saved_to = std::fs::canonicalize(&out_path).map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string());
@@ -1958,6 +2031,7 @@ fn ingest_raw_to_base(
     name: &str,
     body: &Value,
     saved_to: &mut Option<String>,
+    max_chunks_per_base: usize,
 ) -> Result<RagBase, String> {
     let chunk_size = body["chunk"].as_u64().unwrap_or(2048) as usize;
     let max_chunks = body["max_chunks"].as_u64().unwrap_or(0) as usize;
@@ -1982,7 +2056,8 @@ fn ingest_raw_to_base(
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     use serde::Serialize;
     value.serialize(&mut ser).map_err(|e| format!("serialize JSON: {e}"))?;
-    std::fs::write(&out_path, &buf).map_err(|e| format!("gravar {}: {e}", out_path.display()))?;
+    // [#12] backup .bak antes de sobrescrever + [#13] recusa se exceder max_chunks_per_base.
+    write_base_json(&out_path, &buf, value_n_chunks(&value), max_chunks_per_base)?;
     *saved_to = Some(std::fs::canonicalize(&out_path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string()));

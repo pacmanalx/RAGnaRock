@@ -30,6 +30,14 @@ autoload     = true        # scan ragfiles_dir on boot and load every base
 #   hybrid  — drop cached tokens to cut RAM, re-read on demand
 storage = memory
 
+# OOM guards (0 = unlimited). Ingestion is refused with a clear error when a cap
+# would be exceeded; boot auto-load is never capped (existing data always loads).
+#   max_bases            — max total bases across all collections
+#   max_chunks_per_base  — max chunks a single base may hold
+# In tight-RAM deployments, pair these with `storage = hybrid`.
+max_bases           = 0
+max_chunks_per_base = 0
+
 # ── Admin credentials (ValHalla console + protected endpoints) ───────────────
 # SECURITY: the daemon REFUSES to start a usable session with admin/admin unless
 # launched with the `--dev` flag. Change BOTH before any real deployment.

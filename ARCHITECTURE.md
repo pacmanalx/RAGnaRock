@@ -545,8 +545,9 @@ level when `accept_gate=on` — §5.4).
 
 ## 7. Appendix — failure modes
 
-**Obvious:** corrupted base JSON (write a `.bak` before overwrite, validate on load) · OOM (use `hybrid`,
-[FUTURE] base/chunk caps) · AI down (levels ≥1 degrade to level 0) · ragd down (Nidhogg's keepalive degrades
+**Obvious:** corrupted base JSON (`.bak` written before overwrite; invalid JSON is skipped+logged on load,
+boot never crashes — #12) · OOM (use `hybrid`; configurable `max_bases` / `max_chunks_per_base` caps refuse
+oversized ingests — #13) · AI down (levels ≥1 degrade to level 0) · ragd down (Nidhogg's keepalive degrades
 gracefully, cached status).
 
 **Non-obvious (Kimi/Codex):** divergent syllabification between ingestion and search (same driver/vocab is
