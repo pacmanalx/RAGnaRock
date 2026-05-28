@@ -46,6 +46,10 @@ vega2/
 # ── Build artifacts ──
 **/target/
 **/node_modules/
+**/__pycache__/
+
+# ── Spikes / experimentos locais (não fazem parte do core OSS) ──
+spike_mmap/
 
 # ── Logs / temporários / OS ──
 *.log
