@@ -357,6 +357,16 @@
       </div>
       <div id="cfg-key-out" class="muted" style="margin-top:6px"></div>
     </div>
+    <div class="panel">
+      <h2>Credenciais do console <span id="cred-warn" style="color:#d29922;font-size:12px;font-weight:normal;text-transform:none;display:none">⚠ usando padrão — login recusado fora do --dev</span></h2>
+      <p class="muted" style="margin:0 0 12px">Guardadas no ragnarock.cfg. Entram em vigor imediatamente (sem restart).</p>
+      <div class="toolbar">
+        <div><label>usuário</label><input id="cfg-adm-user" style="width:160px" autocomplete="off" spellcheck="false"></div>
+        <div><label>nova senha</label><input id="cfg-adm-pass" type="password" style="width:160px" autocomplete="new-password" placeholder="(deixe em branco pra não alterar)"></div>
+        <div><button class="go" onclick="saveCreds()">salvar</button></div>
+        <div class="grow muted" id="cfg-creds-out" style="align-self:center"></div>
+      </div>
+    </div>
     <div class="panel" style="text-align:center">
       <button class="go" style="padding:12px 30px;font-size:14px" onclick="doRestart()">⟳ Reiniciar / aplicar configurações</button>
       <div class="muted" style="margin-top:8px">Mata e sobe o RAGnaRock (aplica storage do cfg e <b>libera RAM de fato</b>). Você precisará logar de novo.</div>
@@ -421,6 +431,7 @@ async function doLogin(e){
   try{
     const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({user:$('#lg-user').value,pass:$('#lg-pass').value})});
+    if(r.status===403){const j=await r.json().catch(()=>({}));$('#lg-err').textContent=j.error||'credenciais padrão recusadas — altere no .cfg ou use --dev';return;}
     if(r.status===401){$('#lg-err').textContent='credenciais inválidas';return;}
     if(!r.ok){$('#lg-err').textContent='erro '+r.status;return;}
     hideLogin();$('#lg-pass').value='';driversLoaded=false;perfLoaded=false;dictsLoaded=false;
@@ -447,11 +458,14 @@ function selectTab(name){
 async function loadConfig(){
   let c;try{c=await jget('/api/config')}catch(e){return}
   $('#cfg-storage').value=c.storage;
+  const adminBadge=c.admin_is_default?` <span style="color:#d29922">⚠ padrão</span>`:(c.dev_mode?` <span style="color:var(--dim)">[dev]</span>`:'');
   $('#cfg-info').innerHTML=`<b>config</b><span>${esc(c.config_path)}</span><b>storage</b><span>${c.storage}</span>
     <b>drivers_dir</b><span>${esc(c.drivers_dir)}</span><b>ragfiles_dir</b><span>${esc(c.ragfiles_dir)}</span>
-    <b>max upload</b><span>${c.max_upload_mb} MB</span><b>admin</b><span>${esc(c.admin_user)}</span>
+    <b>max upload</b><span>${c.max_upload_mb} MB</span><b>admin</b><span>${esc(c.admin_user)}${adminBadge}</span>
     <b>cache de expansões</b><span>${c.expansions_entries??0} entradas · ${esc(c.cache_dir||'cache')}/expansions.json</span>
     <b>dicionários</b><span>${c.dicts_active??0} ativo(s) · ${nf(c.word_syn_entries??0)} palavras · ${esc(c.thesaurus_dir||'thesaurus')}</span>`;
+  if(document.activeElement!==$('#cfg-adm-user'))$('#cfg-adm-user').value=c.admin_user||'';
+  const credWarn=$('#cred-warn');if(credWarn)credWarn.style.display=c.admin_is_default?'inline':'none';
   const act=c.active_provider||'none';
   $('#cfg-active').textContent=act;
   $('#cfg-active').style.color=act==='none'?'var(--dim)':'var(--ok)';
@@ -467,6 +481,14 @@ async function loadConfig(){
     b.textContent=on?'✓ ativo (desativar)':'ativar';
     b.style.borderColor=on?'var(--ok)':'var(--line)'; b.style.color=on?'var(--ok)':'var(--acc)';
   }
+}
+async function saveCreds(){
+  const u=$('#cfg-adm-user').value.trim(), p=$('#cfg-adm-pass').value.trim();
+  if(!u&&!p){$('#cfg-creds-out').innerHTML='<span style="color:var(--warn)">preencha ao menos um campo</span>';return;}
+  const b={};if(u)b.admin_user=u;if(p)b.admin_pass=p;
+  try{const r=await jpost('/api/config',b);$('#cfg-creds-out').innerHTML='<span style="color:var(--ok)">'+r.notes.join(' · ')+'</span>';loadConfig();}
+  catch(e){$('#cfg-creds-out').innerHTML='<span style="color:#ff6b6b">erro: '+esc(e.message)+'</span>';}
+  $('#cfg-adm-pass').value='';
 }
 async function doRestart(){
   if(!confirm('Reiniciar o RAGnaRock? Ele cai e volta em alguns segundos; você loga de novo.'))return;

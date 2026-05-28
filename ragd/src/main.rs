@@ -42,6 +42,11 @@ fn safe_name(n: &str) -> String {
 /// Mapa de bases agrupadas por coleção: collection -> name -> RagBase.
 type Bases = HashMap<String, HashMap<String, RagBase>>;
 
+/// Retorna true se user/pass são as credenciais padrão não alteradas.
+fn is_default_creds(user: &str, pass: &str) -> bool {
+    user == "admin" && pass == "admin"
+}
+
 /// Estado compartilhado entre as rotas (API + dashboard, via Arc<RwLock<State>>).
 /// [#6] **Outer lock = parking_lot::RwLock<State>** (fair, sem PoisonError):
 ///   - rotas read-only (search/chunk/list/health/profile/stats) pegam `.read()` → N paralelas;
@@ -57,6 +62,7 @@ struct State {
     started: Instant,
     admin_user: String,
     admin_pass: String,
+    dev: bool,         // true = aceita admin/admin; false = recusa credenciais padrão
     log_file: String,
     config_path: String,        // cfg de onde lemos / onde persistimos mudanças do painel
     anthropic_key: String,      // chave p/ acoplar Claude (vazio = não cadastrada)
@@ -90,6 +96,7 @@ struct Config {
     cache_dir: String,
     thesaurus_dir: String,
     nidhogg_url: String,
+    dev: bool,         // --dev: aceita credenciais padrão admin/admin (só pra desenvolvimento)
 }
 impl Default for Config {
     fn default() -> Self {
@@ -108,6 +115,7 @@ impl Default for Config {
             cache_dir: "cache".to_string(),
             thesaurus_dir: DEFAULT_THESAURUS_DIR.to_string(),
             nidhogg_url: "http://127.0.0.1:11497".to_string(),
+            dev: false,
         }
     }
 }
@@ -519,6 +527,7 @@ fn main() {
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
             "--no-autoload" => no_autoload = true,
+            "--dev" => cfg.dev = true,
             "--storage" => cfg.storage = it.next().expect("--storage memory|hybrid").clone(),
             "--preload" => {
                 if let Some((n, p)) = it.next().expect("--preload nome=caminho").split_once('=') {
@@ -557,6 +566,7 @@ fn main() {
         bases, drivers_dir: cfg.drivers_dir.clone(), ragfiles_dir: cfg.ragfiles_dir.clone(),
         max_upload, started: Instant::now(),
         admin_user: cfg.admin_user.clone(), admin_pass: cfg.admin_pass.clone(),
+        dev: cfg.dev,
         log_file: cfg.log_file.clone(),
         config_path: cfg_path.clone().unwrap_or_else(|| "ragnarock.cfg".to_string()),
         anthropic_key: cfg.anthropic_key.clone(),
@@ -585,7 +595,16 @@ fn main() {
     let dash_addr = format!("0.0.0.0:{}", cfg.dash_port);
     match Server::http(&dash_addr) {
         Ok(dash) => {
-            println!("⚔  ValHalla (console) em http://{dash_addr}/  (login: {} / ****)", cfg.admin_user);
+            if cfg.dev {
+                println!("⚔  ValHalla (console) em http://{dash_addr}/  (login: {} / ****) [MODO DEV]", cfg.admin_user);
+            } else {
+                println!("⚔  ValHalla (console) em http://{dash_addr}/  (login: {} / ****)", cfg.admin_user);
+            }
+            if is_default_creds(&cfg.admin_user, &cfg.admin_pass) && !cfg.dev {
+                eprintln!("⚠  ATENÇÃO: credenciais padrão admin/admin detectadas.");
+                eprintln!("   Login no ValHalla será RECUSADO até que você altere admin_user/admin_pass");
+                eprintln!("   no ragnarock.cfg (ou via painel Config) — ou suba com --dev p/ desenvolvimento.");
+            }
             let st = state.clone();
             thread::spawn(move || { for req in dash.incoming_requests() { handle_dashboard(req, &st); } });
         }
@@ -1307,6 +1326,8 @@ fn config_json(st: &State) -> String {
         "drivers_dir": st.drivers_dir, "ragfiles_dir": st.ragfiles_dir,
         "max_upload_mb": st.max_upload / (1024 * 1024),
         "admin_user": st.admin_user,
+        "admin_is_default": is_default_creds(&st.admin_user, &st.admin_pass),
+        "dev_mode": st.dev,
         "anthropic_key_set": !st.anthropic_key.is_empty(), "anthropic_key": st.anthropic_key,
         "openai_key_set": !st.openai_key.is_empty(), "openai_key": st.openai_key,
         "active_provider": st.active_provider,
@@ -1364,6 +1385,14 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
     };
     let mut notes: Vec<String> = vec![];
     let mut reload = false;
+    if let Some(u) = v["admin_user"].as_str() { let u = u.trim(); if !u.is_empty() {
+        st.admin_user = u.to_string(); set_cfg_key(&st.config_path, "admin_user", u);
+        notes.push(format!("admin_user → {u}"));
+    }}
+    if let Some(p) = v["admin_pass"].as_str() { let p = p.trim(); if !p.is_empty() {
+        st.admin_pass = p.to_string(); set_cfg_key(&st.config_path, "admin_pass", p);
+        notes.push("admin_pass atualizada".into());
+    }}
     if let Some(s) = v["storage"].as_str() {
         let s = s.to_lowercase();
         if s != "memory" && s != "hybrid" {
@@ -1468,7 +1497,10 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
         let v: Value = serde_json::from_str(&body_str).unwrap_or(json!({}));
         let (u, p) = (v["user"].as_str().unwrap_or(""), v["pass"].as_str().unwrap_or(""));
         let mut st = state.write();
-        if u == st.admin_user && p == st.admin_pass {
+        if is_default_creds(&st.admin_user, &st.admin_pass) && !st.dev {
+            println!("[{}] [valhalla] {ip} login RECUSADO — credenciais padrão fora do --dev (user={u})", now_stamp());
+            respond_json(req, 403, json!({"error": "credenciais padrão não permitidas fora do modo dev. Altere admin_user/admin_pass no ragnarock.cfg ou inicie com --dev."}).to_string(), None);
+        } else if u == st.admin_user && p == st.admin_pass {
             let tok = gen_token();
             st.sessions.retain(|_, t| t.elapsed().as_secs() < SESSION_TTL);   // limpa expiradas
             st.sessions.insert(tok.clone(), Instant::now());
@@ -2557,11 +2589,13 @@ fn help() {
 uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
        [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
-       [--max-upload {DEFAULT_MAX_UPLOAD}] [--no-autoload] [--preload nome=caminho.json ...]
+       [--max-upload {DEFAULT_MAX_UPLOAD}] [--no-autoload] [--dev]
+       [--preload nome=caminho.json ...]
 
   config: --config <arq>, senao /etc/ragnarock/ragnarock.cfg, senao ./ragnarock.cfg, senao defaults.
           (chaves: api_port, dash_port, drivers_dir, ragfiles_dir, max_upload, autoload, admin_user, admin_pass)
-  duas portas: API (default {DEFAULT_PORT}) + dashboard/supervisorio (default {DEFAULT_DASH_PORT}, Basic Auth admin/admin).
+  duas portas: API (default {DEFAULT_PORT}) + dashboard/supervisorio (default {DEFAULT_DASH_PORT}, login por sessao).
+  seguranca: credenciais admin/admin sao recusadas a menos que --dev seja passado. Troque no .cfg ou pelo painel.
   por padrao carrega TODAS as bases de ragfiles-dir no boot (cada subdir = colecao).
   --no-autoload sobe vazio (p/ ingerir do zero); --preload adiciona bases por cima.
 
