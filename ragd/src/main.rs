@@ -2226,27 +2226,25 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
         searched.push(entry);
         merged.extend(local);
     }
-    // BOOST DE RECÊNCIA (princípio único pra "novo não perde p/ velho em empate"):
-    // score = coverage × (1 + ALPHA · exp(-age / HALF_LIFE)). Sessão nova ganha leve
-    // multiplicador, velha aproxima de 1.0. ALPHA=0.10 (boost máx 10%), HALF_LIFE=7 dias.
-    // mtime=0 (desconhecido) → fator=1.0 (sem boost; fallback neutro).
-    const REC_ALPHA: f64 = 0.10;
-    const REC_HALF_LIFE: f64 = 7.0 * 86400.0;
+    // RECÊNCIA COMO DESEMPATE (não multiplicador). A relevância (coverage honesta) é a
+    // chave PRIMÁRIA; a recência só decide quando coverage/span/cos empatam — aí o mais
+    // novo ganha. Motivo: o multiplicador antigo (coverage × fator) fazia uma base recente
+    // de coverage MENOR superar conteúdo mais relevante de outra coleção (a memória de
+    // sessão, regravada a cada turno, vencia livros/código). Como tie-breaker puro, a
+    // recência resolve o caso pra que foi criada (turnos de mesma coverage: novo > velho)
+    // sem distorcer o ranking entre coleções. mtime=0 (desconhecido) ordena por último.
     let now = rag::now_secs();
-    let recency = |mtime: u64| -> f64 {
+    const REC_HALF_LIFE: f64 = 7.0 * 86400.0;
+    let recency = |mtime: u64| -> f64 {   // só p/ exibir o fator no hit (transparência)
         if mtime == 0 { return 1.0; }
         let age = (now.saturating_sub(mtime)) as f64;
-        1.0 + REC_ALPHA * (-age / REC_HALF_LIFE).exp()
+        1.0 + 0.10 * (-age / REC_HALF_LIFE).exp()
     };
-    // ordena pelo SCORE BOOSTED; matchpoint exibido continua = coverage honesta (campo
-    // `recency` no hit dá transparência do fator). mtime desempata final (mais novo ganha).
     merged.sort_by(|a, b| {
-        let sa = a.0 * recency(a.1);
-        let sb = b.0 * recency(b.1);
-        sb.partial_cmp(&sa).unwrap()
+        b.0.partial_cmp(&a.0).unwrap()                 // coverage PURA desc (relevância manda)
             .then(a.2.cmp(&b.2))                        // span asc (proximidade)
             .then(b.3.partial_cmp(&a.3).unwrap())       // cos desc
-            .then(b.1.cmp(&a.1))                        // mtime desc (recência puro p/ desempate)
+            .then(b.1.cmp(&a.1))                        // mtime desc (recência só desempata)
     });
     let hits: Vec<Value> = merged.into_iter().take(k).enumerate().map(|(i, (_cov, mt, _sp, _cos, mut o))| {
         o.insert("recency".into(), json!(format!("{:.3}", recency(mt))));
