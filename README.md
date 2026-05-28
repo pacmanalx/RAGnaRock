@@ -103,6 +103,12 @@ python3 python_concept/search_rag.py my_corpus-tokenized.json "my query" -k 5
 > Project convention: **every script/binary invoked with no arguments prints help** — it never runs
 > with silent defaults.
 
+**Configuration:** the daemon reads an optional `ragnarock.cfg` from its working directory. Copy
+[`ragnarock.cfg.example`](ragnarock.cfg.example) to `ragnarock.cfg` and edit — every key is optional
+and documented inline. The real `ragnarock.cfg` is gitignored (it holds the admin password and API
+keys); **never commit it**. Change the default `admin/admin` credentials before any real deployment —
+the daemon refuses to open a session with them unless started with `--dev`.
+
 ---
 
 ## Daemon API (HTTP JSON)

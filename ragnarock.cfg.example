@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ragnarock.cfg — RAGnaRock daemon configuration (EXAMPLE)
+#
+# Copy this file to `ragnarock.cfg` (same directory the daemon runs from) and
+# edit. The real `ragnarock.cfg` is gitignored — NEVER commit it (it holds your
+# admin password and API keys).
+#
+#   cp ragnarock.cfg.example ragnarock.cfg
+#
+# Format: one `key = value` per line. Lines starting with `#` are comments.
+# An inline comment must be preceded by a space (` #`) so passwords like `#x`
+# survive. Unknown keys are reported and ignored. Every key below is OPTIONAL;
+# omit a key to keep its built-in default (shown here).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Network ──────────────────────────────────────────────────────────────────
+api_port  = 11499          # HTTP JSON API (ragd)
+dash_port = 11498          # ValHalla web console
+
+# ── Storage / data paths ─────────────────────────────────────────────────────
+drivers_dir  = drivers     # language drivers (*.drv)
+ragfiles_dir = ragfiles    # tokenized bases; one subdir per collection (auto-loaded on boot)
+cache_dir    = cache       # thesaurus expansion cache
+thesaurus_dir = thesaurus  # multilingual dictionaries
+max_upload   = 52428800    # max /ingest_upload body in bytes (50 MiB)
+autoload     = true        # scan ragfiles_dir on boot and load every base
+
+# storage mode:
+#   memory  — keep chunk text in RAM (fastest; default)
+#   hybrid  — drop cached tokens to cut RAM, re-read on demand
+storage = memory
+
+# ── Admin credentials (ValHalla console + protected endpoints) ───────────────
+# SECURITY: the daemon REFUSES to start a usable session with admin/admin unless
+# launched with the `--dev` flag. Change BOTH before any real deployment.
+admin_user = admin
+admin_pass = admin
+
+# Session lifetime for the console login, in seconds (default 12h). Sessions live
+# in RAM only, so a daemon restart invalidates them all; each login mints a fresh token.
+session_ttl = 43200
+
+# ── AI provider (optional — only for thesaurus expansion / Nidhogg) ──────────
+# Leave keys empty to run fully offline (RAGnaRock needs no neural net to search).
+anthropic_key   =          # sk-ant-...
+openai_key      =          # sk-...
+active_provider = none      # none | anthropic | openai
+
+# ── Nidhogg intelligence layer (separate daemon, default off) ────────────────
+nidhogg_url = http://127.0.0.1:11497
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_file       = /tmp/ragd-all.log
+log_utc_offset = -3         # hours from UTC for log timestamps (-3 = America/Sao_Paulo)
+
+# ── Notes ────────────────────────────────────────────────────────────────────
+# `--dev` is a COMMAND-LINE flag, not a config key. It relaxes the admin/admin
+# refusal above for local development only. Never use it on a real deployment.
