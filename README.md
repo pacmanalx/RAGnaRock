@@ -125,6 +125,13 @@ the daemon refuses to open a session with them unless started with `--dev`.
 Formal contract for the 3 APIs (ragd, ValHalla, nidhoggd): **[`JSONCONTRACT.md`](JSONCONTRACT.md)**.
 Runnable `curl` examples: **[`ragd/json_samples/`](ragd/json_samples/)**.
 
+**Plug it into an agent (MCP):** a reference MCP server that exposes `ragd` as native tools (search,
+chunk, list, ingest) to opencode, Claude Code and Kimi for Code lives in
+**[`examples/mcp/`](examples/mcp/)**.
+
+The syllabifier — the token's algorithm, with ~90 golden cases and a conformance test — is specified
+in **[`specs/SYLLABLE.md`](specs/SYLLABLE.md)**.
+
 ---
 
 ## Status
