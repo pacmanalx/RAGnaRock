@@ -993,6 +993,93 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+// ============================================================================
+// LITERAL FALLBACK (Issue #38) — quarto estágio da cascata do search_expand.
+// Dispara quando dict/cache/IA todos retornam vazio E a query tem tokens com
+// dígitos (códigos de ticket, normas, SKUs, preços). O motor silábico é cego
+// pra identificadores alfanuméricos; este fallback varre `chunk.text` em RAM
+// procurando as needles literais. Sem indexação extra, custo só quando ativa.
+// ============================================================================
+
+/// Extrai tokens alfanuméricos QUE CONTÊM AO MENOS UM DÍGITO. Esse é o gate
+/// que diferencia "oe-6016", "RFC1918", "30012", "R$1500" de palavras naturais.
+/// Palavra pura (sem dígito) NÃO vira needle — pra essas o pipeline silábico
+/// já é o caminho certo, e dispará-las aqui seria ruído.
+fn extract_alnum_needles(q: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has_digit = false;
+    let push_if = |cur: &mut String, has_digit: &mut bool, out: &mut Vec<String>| {
+        if *has_digit && cur.chars().count() >= 2 {
+            let lc = cur.to_lowercase();
+            if !out.contains(&lc) { out.push(lc); }
+        }
+        cur.clear(); *has_digit = false;
+    };
+    for c in q.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            cur.push(c);
+            if c.is_ascii_digit() { has_digit = true; }
+        } else {
+            push_if(&mut cur, &mut has_digit, &mut out);
+        }
+    }
+    push_if(&mut cur, &mut has_digit, &mut out);
+    out
+}
+
+/// Faz busca literal `text.to_lowercase().contains(needle)` em todos os chunks
+/// do escopo. Score = nº de needles distintos casados / total de needles.
+/// Retorna hits no shape do /search (matchpoint, coverage, chunk, start, snippet,
+/// rank, via=literal_fallback). Vazio se nenhum chunk casar nenhum needle.
+fn literal_fallback(needles: &[String], bases: &Bases, coll: Option<&str>, base_pat: &str, k: usize) -> Vec<Value> {
+    if needles.is_empty() { return vec![]; }
+    let mut hits: Vec<(f64, usize, Value)> = Vec::new();
+    let scope = resolve_scope(bases, coll, base_pat);
+    for (cn, bn) in scope {
+        let b = match get_base(bases, &cn, &bn) { Some(b) => b, None => continue };
+        if !b.has_text { continue; }
+        for ch in &b.chunks {
+            let text = match &ch.text { Some(t) => t, None => continue };
+            let lc = text.to_lowercase();
+            let matched: Vec<&String> = needles.iter().filter(|n| lc.contains(n.as_str())).collect();
+            if matched.is_empty() { continue; }
+            let score = matched.len() as f64 / needles.len() as f64;
+            // snippet: janela ±100 chars em torno da primeira ocorrência
+            let needle = matched[0];
+            let pos = lc.find(needle.as_str()).unwrap_or(0);
+            let start = pos.saturating_sub(100);
+            let end = (pos + needle.len() + 100).min(text.len());
+            // ajusta start/end pra fronteira de char UTF-8 (text.find dá byte index)
+            let start = text.char_indices().take_while(|(i,_)| *i <= start).last().map(|(i,_)| i).unwrap_or(0);
+            let end = text.char_indices().find(|(i,_)| *i >= end).map(|(i,_)| i).unwrap_or(text.len());
+            let snippet = format!("…{}…", &text[start..end]);
+            hits.push((score, matched.len(), json!({
+                "collection": cn,
+                "base": bn,
+                "corpus": b.corpus,
+                "matchpoint": score,
+                "coverage": score,
+                "span": matched.len(),
+                "cos": 0.0,
+                "chunk": ch.id,
+                "start": ch.start,
+                "snippet": snippet,
+                "needles_matched": matched.iter().map(|s| (**s).clone()).collect::<Vec<_>>(),
+            })));
+        }
+    }
+    // ordem: score ↓ · nº de needles distintos ↓
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(b.1.cmp(&a.1)));
+    hits.into_iter().take(k).enumerate().map(|(i, (.., mut h))| {
+        if let Some(o) = h.as_object_mut() {
+            o.insert("rank".into(), json!(i + 1));
+            o.insert("via".into(), json!("literal_fallback"));
+        }
+        h
+    }).collect()
+}
+
 /// POST /api/search_expand — busca COM expansão por IA: expande a query, roda a busca léxica
 /// pra original + variantes, e mescla por (coleção,base,chunk) com peso maior no termo original.
 fn search_expand(body: &str, st: &State) -> (u16, String) {
@@ -1028,7 +1115,31 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
         let provider = st.active_provider.clone();
         let key = match provider.as_str() { "anthropic" => st.anthropic_key.clone(), "openai" => st.openai_key.clone(), _ => String::new() };
         if provider == "none" || key.is_empty() {
-            slog("   └─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 IA indisponível (sem provider) · 400");
+            // [Issue #38] Quarto estágio: literal_fallback. Se a query tem tokens
+            // alfanuméricos com dígito (ticket OE-6016, norma RFC1918, preço 1500),
+            // o motor silábico é cego mas o grep literal acha. Só dispara aqui,
+            // depois que dict/cache/IA falharam — não substitui a busca silábica
+            // pra texto natural, complementa onde ela é estruturalmente cega.
+            let needles = extract_alnum_needles(query);
+            if !needles.is_empty() {
+                let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
+                let base_lit = v["base"].as_str().unwrap_or("*").to_string();
+                let coll_lit = v["collection"].as_str().map(|s| s.to_string());
+                let lit_hits = literal_fallback(&needles, &st.bases, coll_lit.as_deref(), &base_lit, k_lit);
+                if !lit_hits.is_empty() {
+                    slog(&format!("   └─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 IA=∅ → 🔎 literal {needles:?} · {} hit(s)", lit_hits.len()));
+                    return (200, json!({
+                        "query": query,
+                        "source": "literal_fallback",
+                        "needles": needles,
+                        "expansions": [],
+                        "hits": lit_hits,
+                    }).to_string());
+                }
+                slog(&format!("   └─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 IA=∅ → 🔎 literal {needles:?} · 0 hit(s) · 400"));
+            } else {
+                slog("   └─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 IA indisponível (sem provider) · 400");
+            }
             return (400, json!({"error": "nenhum dicionário ativo, sem cache e sem provider de IA — ative um dicionário na aba Dicionários ou um provider na aba Config (ou semeie cache/expansions.json)"}).to_string());
         }
         slog(&format!("   ├─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 aciona IA ({provider})"));
