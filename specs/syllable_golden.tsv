@@ -1,0 +1,127 @@
+# RAGnaRock — golden cases de silabação (conformance do tokenizer)
+# Formato: <palavra><TAB><sílabas separadas por espaço>
+# Linhas começando com '#' ou vazias são ignoradas.
+# Estes são casos onde o silabador do ragd CASA com a silabação de consenso do PT-BR.
+# As divergências conhecidas (ditongos nasais etc.) estão documentadas em SYLLABLE.md,
+# fora deste conjunto — aqui só entram casos que o tokenizer deve manter para sempre.
+# Validador: `cargo test -p ragd syllable_golden` (lê este arquivo).
+
+# --- CV simples ---
+casa	ca sa
+bola	bo la
+gato	ga to
+mesa	me sa
+
+# --- coda (consoante fecha a sílaba anterior) ---
+porta	por ta
+campo	cam po
+mar	mar
+festa	fes ta
+verde	ver de
+carta	car ta
+
+# --- dígrafos ch / lh / nh = um único som no ataque ---
+chave	cha ve
+chuva	chu va
+palha	pa lha
+molho	mo lho
+ninho	ni nho
+sonho	so nho
+vinho	vi nho
+banho	ba nho
+lenha	le nha
+rainha	rai nha
+
+# --- qu / gu + vogal alta: u mudo ---
+quente	quen te
+aquilo	a qui lo
+quase	qua se
+querer	que rer
+aquele	a que le
+quilo	qui lo
+tranquilo	tran qui lo
+guerra	guer ra
+guitarra	gui tar ra
+linguiça	lin gui ça
+
+# --- gu / qu com u pronunciado (gua / guar / guen) ---
+água	á gua
+guardar	guar dar
+linguagem	lin gua gem
+aguentar	a guen tar
+
+# --- ditongos (vogal fraca i/u junta) ---
+pouso	pou so
+coisa	coi sa
+muito	mui to
+pai	pai
+boi	boi
+cai	cai
+rei	rei
+lei	lei
+herói	he rói
+céu	céu
+
+# --- hiato (vogal forte + forte separa) ---
+coala	co a la
+poeta	po e ta
+moeda	mo e da
+aeroporto	a e ro por to
+voo	vo o
+enjoo	en jo o
+caatinga	ca a tin ga
+
+# --- í / ú acentuado QUEBRA o ditongo (força hiato) ---
+saída	sa í da
+país	pa ís
+saúde	sa ú de
+baú	ba ú
+egoísta	e go ís ta
+juízo	ju í zo
+raízes	ra í zes
+aí	a í
+baía	ba í a
+
+# --- clusters mudo+líquida ficam juntos no ataque ---
+prato	pra to
+broto	bro to
+flor	flor
+globo	glo bo
+regra	re gra
+livro	li vro
+grande	gran de
+prova	pro va
+preto	pre to
+
+# --- clusters complexos: coda fica com a sílaba anterior ---
+abstrato	abs tra to
+transporte	trans por te
+instante	ins tan te
+perspectiva	pers pec ti va
+
+# --- vogais acentuadas (sem mudar a contagem de sílabas) ---
+café	ca fé
+você	vo cê
+história	his tó ria
+família	fa mí lia
+série	sé rie
+espécie	es pé cie
+estômago	es tô ma go
+árvore	ár vo re
+fácil	fá cil
+índio	ín dio
+português	por tu guês
+oásis	o á sis
+
+# --- ç (tratado como consoante comum) ---
+praça	pra ça
+moço	mo ço
+açúcar	a çú car
+peça	pe ça
+cabeça	ca be ça
+
+# --- ataques iniciais incomuns (mantidos no início da palavra) ---
+pneu	pneu
+gnomo	gno mo
+ritmo	rit mo
+irmã	ir mã

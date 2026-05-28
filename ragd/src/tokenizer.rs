@@ -161,3 +161,35 @@ pub fn syllable_seq(text: &str) -> Vec<String> {
     }
     seq
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [#32] Conformance: cada palavra de `specs/syllable_golden.tsv` deve silabificar
+    /// EXATAMENTE como o golden. É a rede contra regressão do silabador (o coração do
+    /// projeto). As divergências conhecidas (ditongos nasais etc.) NÃO estão no golden —
+    /// estão documentadas em `specs/SYLLABLE.md`. Rode com `cargo test`.
+    #[test]
+    fn syllable_golden() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../specs/syllable_golden.tsv");
+        let txt = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("não consegui ler {path}: {e}"));
+        let mut n = 0;
+        let mut fails: Vec<String> = Vec::new();
+        for line in txt.lines() {
+            let line = line.trim_end();
+            if line.trim().is_empty() || line.trim_start().starts_with('#') { continue; }
+            let (w, exp) = line.split_once('\t')
+                .unwrap_or_else(|| panic!("linha sem TAB: {line:?}"));
+            let exp = exp.trim();
+            let got = syllabify(w).join(" ");
+            n += 1;
+            if got != exp {
+                fails.push(format!("  {w:?}: esperado {exp:?}, obteve {got:?}"));
+            }
+        }
+        assert!(fails.is_empty(), "{} de {n} golden cases divergiram:\n{}", fails.len(), fails.join("\n"));
+        assert!(n >= 90, "esperava ≥90 golden cases, li só {n} — golden.tsv truncado?");
+    }
+}

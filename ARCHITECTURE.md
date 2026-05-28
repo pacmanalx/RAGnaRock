@@ -96,8 +96,9 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
   "Élrond"→"elrond" — an accent does **not** create a distinct dimension.
 
 > The PoCs `python_concept/` and `rust_concept/` are a **frozen reference** (historical validation); the
-> living spec is `ragd`'s. **[FUTURE]** golden cases (words with consensus syllabification) to harden the
-> syllabifier against regression.
+> living spec is `ragd`'s. Full rules, ~90 golden cases and the conformance test (`cargo test
+> syllable_golden`) live in **[`specs/SYLLABLE.md`](specs/SYLLABLE.md)** — including the documented
+> divergences (nasal diphthongs etc.).
 
 ---
 

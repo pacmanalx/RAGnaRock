@@ -94,8 +94,9 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
   "Élrond"→"elrond" — acento **não** cria dimensão distinta.
 
 > As PoCs `python_concept/` e `rust_concept/` são **referência congelada** (validação histórica); a spec
-> viva é a do `ragd`. **[FUTURO]** casos-de-ouro (palavras com silabação consensual) pra blindar o
-> silabador contra regressão.
+> viva é a do `ragd`. Regras completas, ~90 casos-de-ouro e o teste de conformance (`cargo test
+> syllable_golden`) vivem em **[`specs/SYLLABLE.md`](specs/SYLLABLE.md)** — incluindo as divergências
+> documentadas (ditongos nasais etc.).
 
 ---
 
