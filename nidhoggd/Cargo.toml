@@ -1,6 +1,6 @@
 [package]
 name = "nidhoggd"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Níðhöggr — camada de inteligência do RAGnaRock. Worm autônomo que come o conhecimento das coleções via API. Daemon de módulos (porta 11497)."
 
