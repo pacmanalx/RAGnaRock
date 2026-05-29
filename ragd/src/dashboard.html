@@ -107,6 +107,7 @@
   .keyfield input{width:100%;padding-right:42px}
   .keyfield .eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:3px 6px;color:var(--dim)}
   .keyfield .eye:hover{color:var(--acc)}
+  .mask{-webkit-text-security:disc;text-security:disc}  /* mascara sem type=password → não dispara "salvar senha" do Chrome */
   .keybtns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
   .keybtns button{flex:0 0 auto}
 </style>
@@ -279,95 +280,124 @@
       <p class="muted" style="margin:0">O daemon de inteligência (porta 11497) não está respondendo. É um <b>processo separado</b> (opcional) — instale/suba o <code>nidhoggd</code> pra ativar esta camada. O resto do RAGnaRock segue 100%.</p>
     </div>
     <div id="nid-on" style="display:none">
-      <div class="panel">
-        <h2>🐉 Níðhöggr · <span id="nid-state" class="muted" style="text-transform:none"></span></h2>
-        <p class="muted" style="margin:0 0 12px">O worm do bem que <b>come o conhecimento</b> das coleções e o destila num saber que <b>sobrevive à deleção da coleção</b>. Nasce desligado — <b>precisa e consome IA</b> nos níveis ≥ Consciente.</p>
-        <div class="toolbar">
-          <div><label>worm</label>
-            <button class="go" id="nid-toggle" onclick="nidToggle()">ligar</button></div>
+      <!-- Tier 1 — faixa de comando: estado + on/off + cadência; diagnóstico discreto embaixo -->
+      <div class="panel" style="margin:0 0 18px">
+        <div class="toolbar" style="align-items:center">
+          <div class="grow" id="nid-state" style="font-size:15px">—</div>
+          <div><button class="go" id="nid-toggle" onclick="nidToggle()">ligar</button></div>
           <div><label>cadência (s)</label><input id="nid-cadence" type="number" min="10" step="10" style="width:90px"></div>
           <div><button class="go ghost" onclick="nidSetCadence()">aplicar</button></div>
-          <div class="grow muted" id="nid-msg" style="align-self:center"></div>
         </div>
+        <div class="muted" id="nid-diag" style="font-size:11.5px;margin-top:10px;border-top:1px solid var(--line);padding-top:8px">carregando…</div>
+        <div class="muted" id="nid-msg" style="font-size:12px;margin-top:6px"></div>
       </div>
-      <div class="panel">
-        <h2>Nível de inteligência <span class="muted" style="text-transform:none">— quanto mais alto, mais pensa e mais IA consome</span></h2>
-        <div id="nid-levels" class="dlist" style="max-height:none"></div>
-      </div>
-      <div class="split">
-        <div class="panel">
+      <!-- Tier 2 | Tier 3 — duas colunas principais (Nível mais largo) -->
+      <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:18px;align-items:stretch">
+        <div class="panel" style="margin:0;display:flex;flex-direction:column">
+          <h2>Nível de inteligência <span class="muted" style="text-transform:none;font-weight:normal">— clique pra selecionar; “Detalhes” abre a tela do nível</span></h2>
+          <div id="nid-levels" class="dlist" style="flex:1;min-height:160px;max-height:56vh"></div>
+        </div>
+        <div class="panel" style="margin:0;display:flex;flex-direction:column">
           <h2>Acesso por coleção <span class="muted" style="text-transform:none">— onde o worm pode se alimentar</span></h2>
           <p class="muted" style="margin:0 0 10px">Desligue coleções já mastigadas pra ele não re-varrer N vezes. O conhecimento destilado permanece mesmo desligando aqui.</p>
-          <div id="nid-colls" class="dlist" style="max-height:calc(100vh - 360px)"><span class="muted">carregando…</span></div>
-        </div>
-        <div class="panel">
-          <h2>Status</h2>
-          <div class="kv" id="nid-info"><b>carregando…</b><span></span></div>
+          <div id="nid-colls" class="dlist" style="flex:1;min-height:160px;max-height:56vh"><span class="muted">carregando…</span></div>
         </div>
       </div>
     </div>
   </section>
 
+  <!-- NIDHOGG · DETALHES DO NÍVEL (tela secundária, fora da nav; aberta pelo card do nível) -->
+  <section class="tabpanel" data-panel="nidviz">
+    <div class="panel">
+      <div class="toolbar">
+        <div><button class="go ghost" onclick="selectTab('nidhogg')">← voltar ao Nidhogg</button></div>
+        <div class="grow"><h2 style="border:none;margin:0;padding:0">Detalhes <span id="nv-lvlname" class="muted" style="text-transform:none;font-weight:normal">· nível —</span></h2></div>
+        <div id="nv-pick"><label>coleção</label><select id="nv-coll" onchange="renderNidViz()"></select></div>
+      </div>
+      <p class="muted" id="nv-lvldesc" style="margin:8px 0 0"></p>
+      <div id="nv-tabs" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px"></div>
+    </div>
+    <!-- NÍVEL 0 (minerador · sem IA): conhecimento destilado + galeria de gráficos -->
+    <div id="nv-l0">
+      <div class="panel">
+        <h2>Conhecimento destilado <span class="muted" style="text-transform:none">— o que o worm já mastigou (camada 0 · sem IA)</span></h2>
+        <p class="muted" style="margin:0 0 10px">Artefatos inspecionáveis a olho nu: a <b>assinatura silábica</b> de cada coleção (as sílabas raras que a distinguem) e a anatomia das bases. Esse saber <b>sobrevive à deleção da coleção</b>.</p>
+        <div id="nid-knowledge"><span class="muted">carregando…</span></div>
+      </div>
+      <div class="panel">
+        <h2 id="nv-title">—</h2>
+        <p class="muted" id="nv-desc" style="margin:0 0 14px"></p>
+        <div id="nv-stage" style="min-height:360px"></div>
+      </div>
+    </div>
+    <!-- NÍVEIS ≥1 (com IA): funcionalidades do nível -->
+    <div id="nv-future" class="panel" style="display:none"></div>
+  </section>
+
   <!-- CONFIG -->
   <section class="tabpanel" data-panel="config">
-    <div class="split">
-      <div class="panel">
-        <h2>Armazenamento</h2>
-        <p class="muted" style="margin:0 0 12px">
-          <b style="color:#3fb950">memory</b> = cacheia tokens (rápido, +RAM) ·
-          <b style="color:#d29922">hybrid</b> = recomputa candidatos (−RAM; busca ampla mais lenta).
-          Trocar <b>recarrega as bases</b> (alguns segundos).</p>
-        <div class="toolbar">
-          <div><label>modo</label><select id="cfg-storage">
-            <option value="memory">memory (full RAM)</option>
-            <option value="hybrid">hybrid (disco)</option></select></div>
-          <div><button class="go" onclick="setStorage()">aplicar</button></div>
-          <div class="grow muted" id="cfg-storage-out" style="align-self:center"></div>
+    <!-- Tier 1 — diagnóstico do daemon (read-only), faixa fina no topo -->
+    <div class="panel" style="margin:0 0 18px">
+      <h2 style="border:none;margin:0 0 8px;padding:0">Daemon <span class="muted" style="text-transform:none;font-weight:normal">— leitura, só diagnóstico</span></h2>
+      <div class="muted" id="cfg-info" style="font-size:11.5px;display:flex;flex-wrap:wrap;gap:4px 16px">carregando…</div>
+    </div>
+    <!-- Tier 2 — settings principais: Chaves de API (hero) | Armazenamento + Credenciais -->
+    <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:18px;align-items:stretch">
+      <div class="panel" style="margin:0">
+        <h2>Chaves de API <span class="muted" style="text-transform:none">— acoplar LLM · <b id="cfg-active">—</b> ativo (só um por vez)</span></h2>
+        <p class="muted" style="margin:0 0 14px">Guardadas no config do servidor (persistem). <b>Regra: só um provider ativo por vez.</b> Testar faz uma chamada real (lista de modelos) via wget. O campo já vem preenchido pra edição.</p>
+        <div class="keyrow">
+          <label>Anthropic / Claude <span id="cfg-anthropic-st" class="muted" style="text-transform:none"></span></label>
+          <div class="keyfield"><input id="cfg-anthropic" type="text" class="mask" spellcheck="false" autocomplete="off" placeholder="sk-ant-...">
+            <button type="button" class="eye" id="eye-anthropic" onclick="toggleEye('anthropic')" title="mostrar/ocultar">👁</button></div>
+          <div class="keybtns">
+            <button class="go" onclick="saveKey('anthropic')">salvar</button>
+            <button class="go ghost" onclick="testKey('anthropic')">testar</button>
+            <button class="go ghost" id="cfg-act-anthropic" onclick="toggleActive('anthropic')">ativar</button>
+            <button class="go ghost" onclick="clearKey('anthropic')">remover</button>
+          </div>
+        </div>
+        <div class="keyrow">
+          <label>OpenAI / Codex <span id="cfg-openai-st" class="muted" style="text-transform:none"></span></label>
+          <div class="keyfield"><input id="cfg-openai" type="text" class="mask" spellcheck="false" autocomplete="off" placeholder="sk-...">
+            <button type="button" class="eye" id="eye-openai" onclick="toggleEye('openai')" title="mostrar/ocultar">👁</button></div>
+          <div class="keybtns">
+            <button class="go" onclick="saveKey('openai')">salvar</button>
+            <button class="go ghost" onclick="testKey('openai')">testar</button>
+            <button class="go ghost" id="cfg-act-openai" onclick="toggleActive('openai')">ativar</button>
+            <button class="go ghost" onclick="clearKey('openai')">remover</button>
+          </div>
+        </div>
+        <div id="cfg-key-out" class="muted" style="margin-top:6px"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:18px">
+        <div class="panel" style="margin:0">
+          <h2>Armazenamento</h2>
+          <p class="muted" style="margin:0 0 12px">
+            <b style="color:#3fb950">memory</b> = cacheia tokens (rápido, +RAM) ·
+            <b style="color:#d29922">hybrid</b> = recomputa candidatos (−RAM; busca ampla mais lenta).
+            Trocar <b>recarrega as bases</b> (alguns segundos).</p>
+          <div class="toolbar">
+            <div><label>modo</label><select id="cfg-storage">
+              <option value="memory">memory (full RAM)</option>
+              <option value="hybrid">hybrid (disco)</option></select></div>
+            <div><button class="go" onclick="setStorage()">aplicar</button></div>
+            <div class="grow muted" id="cfg-storage-out" style="align-self:center"></div>
+          </div>
+        </div>
+        <div class="panel" style="margin:0">
+          <h2>Credenciais do console <span id="cred-warn" style="color:#d29922;font-size:12px;font-weight:normal;text-transform:none;display:none">⚠ usando padrão — login recusado fora do --dev</span></h2>
+          <p class="muted" style="margin:0 0 12px">Guardadas no ragnarock.cfg. Entram em vigor imediatamente (sem restart).</p>
+          <div class="toolbar">
+            <div><label>usuário</label><input id="cfg-adm-user" style="width:160px" autocomplete="off" spellcheck="false"></div>
+            <div><label>nova senha</label><input id="cfg-adm-pass" type="text" class="mask" style="width:160px" autocomplete="off" placeholder="(deixe em branco pra não alterar)"></div>
+            <div><button class="go" onclick="saveCreds()">salvar</button></div>
+            <div class="grow muted" id="cfg-creds-out" style="align-self:center"></div>
+          </div>
         </div>
       </div>
-      <div class="panel">
-        <h2>Daemon (leitura)</h2>
-        <div class="kv" id="cfg-info"><b>carregando…</b><span></span></div>
-      </div>
     </div>
-    <div class="panel">
-      <h2>Chaves de API <span class="muted" style="text-transform:none">— acoplar LLM · <b id="cfg-active">—</b> ativo (só um por vez)</span></h2>
-      <p class="muted" style="margin:0 0 14px">Guardadas no config do servidor (persistem). <b>Regra: só um provider ativo por vez.</b> Testar faz uma chamada real (lista de modelos) via wget. O campo já vem preenchido pra edição.</p>
-      <div class="keyrow">
-        <label>Anthropic / Claude <span id="cfg-anthropic-st" class="muted" style="text-transform:none"></span></label>
-        <div class="keyfield"><input id="cfg-anthropic" type="password" spellcheck="false" autocomplete="off" placeholder="sk-ant-...">
-          <button type="button" class="eye" id="eye-anthropic" onclick="toggleEye('anthropic')" title="mostrar/ocultar">👁</button></div>
-        <div class="keybtns">
-          <button class="go" onclick="saveKey('anthropic')">salvar</button>
-          <button class="go ghost" onclick="testKey('anthropic')">testar</button>
-          <button class="go ghost" id="cfg-act-anthropic" onclick="toggleActive('anthropic')">ativar</button>
-          <button class="go ghost" onclick="clearKey('anthropic')">remover</button>
-        </div>
-      </div>
-      <div class="keyrow">
-        <label>OpenAI / Codex <span id="cfg-openai-st" class="muted" style="text-transform:none"></span></label>
-        <div class="keyfield"><input id="cfg-openai" type="password" spellcheck="false" autocomplete="off" placeholder="sk-...">
-          <button type="button" class="eye" id="eye-openai" onclick="toggleEye('openai')" title="mostrar/ocultar">👁</button></div>
-        <div class="keybtns">
-          <button class="go" onclick="saveKey('openai')">salvar</button>
-          <button class="go ghost" onclick="testKey('openai')">testar</button>
-          <button class="go ghost" id="cfg-act-openai" onclick="toggleActive('openai')">ativar</button>
-          <button class="go ghost" onclick="clearKey('openai')">remover</button>
-        </div>
-      </div>
-      <div id="cfg-key-out" class="muted" style="margin-top:6px"></div>
-    </div>
-    <div class="panel">
-      <h2>Credenciais do console <span id="cred-warn" style="color:#d29922;font-size:12px;font-weight:normal;text-transform:none;display:none">⚠ usando padrão — login recusado fora do --dev</span></h2>
-      <p class="muted" style="margin:0 0 12px">Guardadas no ragnarock.cfg. Entram em vigor imediatamente (sem restart).</p>
-      <div class="toolbar">
-        <div><label>usuário</label><input id="cfg-adm-user" style="width:160px" autocomplete="off" spellcheck="false"></div>
-        <div><label>nova senha</label><input id="cfg-adm-pass" type="password" style="width:160px" autocomplete="new-password" placeholder="(deixe em branco pra não alterar)"></div>
-        <div><button class="go" onclick="saveCreds()">salvar</button></div>
-        <div class="grow muted" id="cfg-creds-out" style="align-self:center"></div>
-      </div>
-    </div>
-    <div class="panel" style="text-align:center">
+    <div class="panel" style="text-align:center;margin-top:18px">
       <button class="go" style="padding:12px 30px;font-size:14px" onclick="doRestart()">⟳ Reiniciar / aplicar configurações</button>
       <div class="muted" style="margin-top:8px">Mata e sobe o RAGnaRock (aplica storage do cfg e <b>libera RAM de fato</b>). Você precisará logar de novo.</div>
     </div>
@@ -449,6 +479,7 @@ function selectTab(name){
   if(name==='drivers'&&!driversLoaded){loadDrivers();driversLoaded=true;}
   if(name==='dict'&&!dictsLoaded){loadDicts();dictsLoaded=true;}
   if(name==='nidhogg'){loadNidhogg();}
+  if(name==='nidviz'){loadNidViz();}
   if(name==='perf'&&!perfLoaded){doHist();perfLoaded=true;}
   if(name==='logs'){loadLogs();}
   if(name==='config'){loadConfig();}
@@ -459,11 +490,10 @@ async function loadConfig(){
   let c;try{c=await jget('/api/config')}catch(e){return}
   $('#cfg-storage').value=c.storage;
   const adminBadge=c.admin_is_default?` <span style="color:#d29922">⚠ padrão</span>`:(c.dev_mode?` <span style="color:var(--dim)">[dev]</span>`:'');
-  $('#cfg-info').innerHTML=`<b>config</b><span>${esc(c.config_path)}</span><b>storage</b><span>${c.storage}</span>
-    <b>drivers_dir</b><span>${esc(c.drivers_dir)}</span><b>ragfiles_dir</b><span>${esc(c.ragfiles_dir)}</span>
-    <b>max upload</b><span>${c.max_upload_mb} MB</span><b>admin</b><span>${esc(c.admin_user)}${adminBadge}</span>
-    <b>cache de expansões</b><span>${c.expansions_entries??0} entradas · ${esc(c.cache_dir||'cache')}/expansions.json</span>
-    <b>dicionários</b><span>${c.dicts_active??0} ativo(s) · ${nf(c.word_syn_entries??0)} palavras · ${esc(c.thesaurus_dir||'thesaurus')}</span>`;
+  $('#cfg-info').innerHTML=`<span>storage <b>${c.storage}</b></span><span>admin <b>${esc(c.admin_user)}</b>${adminBadge}</span>`
+    +`<span>max upload ${c.max_upload_mb} MB</span><span>cache ${c.expansions_entries??0} expansões</span>`
+    +`<span>dicionários ${c.dicts_active??0} ativo(s) · ${nf(c.word_syn_entries??0)} palavras</span>`
+    +`<span style="opacity:.7">${esc(c.config_path)}</span><span style="opacity:.7">${esc(c.drivers_dir)}</span><span style="opacity:.7">${esc(c.ragfiles_dir)}</span>`;
   if(document.activeElement!==$('#cfg-adm-user'))$('#cfg-adm-user').value=c.admin_user||'';
   const credWarn=$('#cred-warn');if(credWarn)credWarn.style.display=c.admin_is_default?'inline':'none';
   const act=c.active_provider||'none';
@@ -508,8 +538,8 @@ async function doRestart(){
   setTimeout(()=>{clearInterval(t);location.reload();},90000);
 }
 function toggleEye(which){
-  const el=$('#cfg-'+which), b=$('#eye-'+which), show=el.type==='password';
-  el.type=show?'text':'password'; b.textContent=show?'🙈':'👁';
+  const el=$('#cfg-'+which), b=$('#eye-'+which), masked=el.classList.contains('mask');
+  el.classList.toggle('mask'); b.textContent=masked?'🙈':'👁';  // masked→revela (🙈); revelado→mascara (👁)
 }
 async function toggleActive(prov){
   const cur=$('#cfg-active').textContent;
@@ -842,31 +872,257 @@ async function loadDicts(){
   }catch(e){$('#list-dict-on').innerHTML='<span class="muted">erro '+e.message+'</span>'}
 }
 // ---- Nidhogg (camada de inteligência; módulo na 11497 via proxy do ragd) ----
+let _nid=null;   // último estado de /api/nidhogg (level/levels/cadence) — base do disclaimer de IA
 async function loadNidhogg(){
   let d; try{d=await jget('/api/nidhogg')}catch(e){return}
   const off=!d.online;
   $('#nid-offline').style.display=off?'block':'none';
   $('#nid-on').style.display=off?'none':'block';
   if(off)return;
+  _nid=d;
   const on=!!d.on;
-  $('#nid-state').innerHTML=on?`<b style="color:var(--ok)">LIGADO</b> · nível <b style="color:var(--acc)">${esc(d.level_name)}</b>`:'<b style="color:var(--dim)">desligado</b>';
+  const curLv=(d.levels||[]).find(l=>l.n===d.level)||{};
+  $('#nid-state').innerHTML=`${on?'<b style="color:var(--ok)">● LIGADO</b>':'<b style="color:var(--dim)">○ desligado</b>'} · nível <b style="color:var(--acc)">${esc(d.level_name)}</b> <span class="muted" style="font-size:12px">${curLv.ia?'🧠 com IA':'⚙ sem IA'}</span>`;
   $('#nid-toggle').textContent=on?'desligar':'ligar';
   $('#nid-cadence').value=d.cadence_secs||300;
   $('#nid-levels').innerHTML=(d.levels||[]).map(l=>`
     <div class="dcard" style="cursor:pointer;${l.n===d.level?'border-color:var(--acc);background:#0d1117':''}" onclick="nidSetLevel(${l.n})">
-      <span><span class="lang">${l.n===d.level?'● ':'○ '}${esc(l.name)}</span> <span class="sub">${l.ia?'🧠 usa IA':'⚙ sem IA'}</span> <span class="sub">— ${esc(l.desc)}</span></span></div>`).join('');
-  $('#nid-info').innerHTML=`<b>módulo</b><span>${esc(d.module)} v${esc(d.version)} · 🟢 online</span>
-    <b>ragd (corpus)</b><span>${d.ragd_online?'🟢 online':'🔴 offline'} · ${esc(d.ragd_api||'')}</span>
-    <b>conhecimento</b><span>${d.collections_known??0} coleção(ões) · ${esc(d.dir||'')}</span>
-    <b>último ciclo</b><span>${esc(d.last_cycle||'—')}</span>`;
+      <span><span class="lang">${l.n===d.level?'● ':'○ '}${esc(l.name)}</span> <span class="sub">${l.ia?'🧠 usa IA':'⚙ sem IA'}</span> <span class="sub">— ${esc(l.desc)}</span></span>
+      <button class="go ghost" style="padding:3px 10px;flex:0 0 auto" onclick="event.stopPropagation();openNidViz(${l.n})">Detalhes →</button></div>`).join('');
+  $('#nid-diag').innerHTML=`módulo <b>${esc(d.module)} v${esc(d.version)}</b> 🟢 · ragd ${d.ragd_online?'🟢 online':'🔴 offline'} <span style="opacity:.7">${esc(d.ragd_api||'')}</span> · ${d.collections_known??0} coleção(ões) conhecidas · último ciclo <b>${esc(d.last_cycle||'—')}</b> · <span style="opacity:.7">${esc(d.dir||'')}</span>`;
   loadNidColls();
+}
+// Disclaimer de consumo de IA: bloqueante e OBRIGATÓRIO ao ENTRAR no estado on+nível-com-IA.
+// Honesto por design — ligar no nível 'burro' (camada 0) NÃO consome IA, então NÃO confirma.
+function nidLevelUsesAI(n){ const l=(_nid&&_nid.levels||[]).find(x=>x.n===n); return !!(l&&l.ia); }
+async function nidAiConfirm(n){
+  const l=(_nid&&_nid.levels||[]).find(x=>x.n===n);
+  let prov='none'; try{const c=await jget('/api/config');prov=c.active_provider||'none';}catch(e){}
+  const provTxt = (prov&&prov!=='none')
+    ? `Provider de IA ativo: ${prov.toUpperCase()}.`
+    : '⚠ NENHUM provider de IA ativo — configure um na aba Config antes, ou a mineração vai falhar.';
+  return confirm(
+    `⚠ ESTE NÍVEL CONSOME IA\n\n`+
+    `O nível "${l?l.name:n}" pensa com IA: a cada ciclo (cadência ${_nid?_nid.cadence_secs||300:300}s) ele faz `+
+    `chamadas PAGAS ao LLM para cada coleção ligada.\n\n`+
+    `${provTxt}\n\nDeseja continuar?`);
 }
 async function nidToggle(){
   const d=await jget('/api/nidhogg').catch(()=>null); if(!d||!d.online)return;
+  const turningOn=!d.on;
+  if(turningOn && nidLevelUsesAI(d.level)){ if(!await nidAiConfirm(d.level))return; }  // liga já num nível com IA
   try{await jpost('/api/nidhogg',{on:!d.on})}catch(e){$('#nid-msg').textContent='erro '+e.message;return}
   loadNidhogg();refresh();
 }
-async function nidSetLevel(n){ try{await jpost('/api/nidhogg',{level:n})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} loadNidhogg(); }
+async function nidSetLevel(n){
+  if(nidLevelUsesAI(n) && _nid && _nid.on){ if(!await nidAiConfirm(n))return; }  // sobe pra nível com IA estando LIGADO
+  try{await jpost('/api/nidhogg',{level:n})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} loadNidhogg();
+}
+async function loadNidKnowledge(d){
+  if(d===undefined){ try{d=await jget('/api/nidhogg/knowledge')}catch(e){$('#nid-knowledge').innerHTML='<span class="muted">erro</span>';return} }
+  if(!d){$('#nid-knowledge').innerHTML='<span class="muted">erro</span>';return}
+  const cs=(d.collections||[]).filter(c=>c.knowledge&&c.knowledge.length);
+  if(!cs.length){$('#nid-knowledge').innerHTML='<span class="muted">nada destilado ainda — ligue uma coleção acima e aguarde a cadência.</span>';return}
+  $('#nid-knowledge').innerHTML=cs.map(c=>{
+    const root=(c.knowledge||[]).find(k=>k.type==='RootIndex'), dict=(c.knowledge||[]).find(k=>k.type==='CorpusDict');
+    const rc=root?root.content:{}, roots=(rc.salient_roots||[]);
+    const chips=roots.map(r=>`<span class="pill" title="dim ${r.dim} · uidf ${(+r.uidf).toFixed(2)}">${esc(r.syllable)}</span>`).join(' ');
+    const bases=(dict&&dict.content&&dict.content.bases)||[];
+    const rows=bases.slice().sort((a,b)=>b.n_chunks-a.n_chunks).map(b=>
+      `<tr><td class="f">${esc(b.corpus||b.name)}</td><td class="right">${b.n_chunks}</td><td class="right">${b.vocab_size}</td></tr>`).join('');
+    return `<div class="dcard" style="flex-direction:column;align-items:stretch;cursor:default;gap:9px;margin-bottom:9px">
+      <div class="kv">
+        <b>coleção</b><span class="lang">${esc(c.collection)}</span>
+        <b>bases · chunks</b><span>${rc.bases_count??'?'} · ${rc.total_chunks??'?'}</span>
+        <b>vocab unificado</b><span>${rc.unified_vocab_size??'?'} sílabas</span>
+        <b>saturação</b><span>${((+c.saturation||0)*100).toFixed(0)}% <span class="muted">(placeholder na camada 0)</span></span>
+        <b>source_hash</b><span class="muted" style="font-family:monospace">${esc(c.source_hash||'—')}</span>
+        <b>último ciclo</b><span>${esc(c.updated||'—')}</span>
+      </div>
+      ${chips?`<div><div class="muted" style="font-size:11px;margin-bottom:5px">assinatura silábica — ${roots.length} sílabas mais salientes (raras = o léxico próprio)</div><div style="display:flex;flex-wrap:wrap;gap:5px">${chips}</div></div>`:''}
+      ${rows?`<details><summary class="muted" style="cursor:pointer;font-size:11px">anatomia — ${bases.length} base(s)</summary><table style="margin-top:6px"><thead><tr><th>corpus</th><th class="right">chunks</th><th class="right">vocab</th></tr></thead><tbody>${rows}</tbody></table></details>`:''}
+    </div>`;
+  }).join('');
+}
+// ---- Nidhogg · Sala de gráficos (camada 0, sem IA, tudo na unha) -------------------
+// Catálogo. ready=false → travado por falta de dado do MOTOR (df/freq ou vocab-por-base),
+// honesto por design: o gráfico que falta PUXA a próxima feature do ragd, não fingimos.
+const NV_PAL=['#58a6ff','#3fb950','#d29922','#8a9a4d','#bc8cff','#f778ba','#39c5cf','#ff7b72'];
+const NV_CHARTS=[
+  {k:'cloud',ic:'☁',name:'Nuvem silábica',perColl:true,ready:true,
+   desc:'As sílabas mais salientes da coleção, tamanho ∝ uidf (raridade). É a assinatura lexical da obra — o léxico que só ela tem. (RootIndex)'},
+  {k:'sun',ic:'🌅',name:'Sunburst coleção→base',perColl:false,ready:true,
+   desc:'Anel interno = coleções, externo = bases; arco ∝ nº de chunks. Panorâmica de todo o acervo de uma vez. (CorpusDict)'},
+  {k:'tree',ic:'▦',name:'Treemap de bases',perColl:true,ready:true,
+   desc:'Cada retângulo é uma base; área ∝ nº de chunks. A anatomia de tamanho da coleção. (CorpusDict)'},
+  {k:'scat',ic:'◔',name:'Anatomia (chunks × vocab)',perColl:false,ready:true,
+   desc:'Cada bolha é uma base: X = nº de chunks, Y = tamanho do vocabulário. Densidade léxica por base no acervo todo. (CorpusDict)'},
+  {k:'idfdf',ic:'🔒',name:'Scatter idf × df',perColl:false,ready:false,
+   desc:'Cada sílaba como bolha (X=df, Y=idf): a fronteira da raridade que o tf-idf usa. PRECISA de df/freq por sílaba — o /profile hoje só expõe uidf.'},
+  {k:'zipf',ic:'🔒',name:'Curva de Zipf',perColl:true,ready:false,
+   desc:'Distribuição de frequência das sílabas (lei de potência do corpus). PRECISA do ranking de freq completo — não exposto na camada 0.'},
+  {k:'heat',ic:'🔒',name:'Heatmap sílaba × base',perColl:false,ready:false,
+   desc:'Intensidade de cada sílaba por base. PRECISA do vetor de vocab por base (dims) — feature do motor (histograma por base no /profile).'},
+  {k:'dend',ic:'🔒',name:'Dendrograma / Jaccard',perColl:false,ready:false,
+   desc:'Parentesco lexical entre bases por distância de cosseno (agrupa as obras-irmãs). PRECISA dos vetores por base — feature do motor.'},
+];
+let _nidk=[], _nvActive='cloud', _nvLevel=0;
+// O que CADA nível ≥1 oferecerá (esqueleto rodando; funcionalidades nas issues #22→#24).
+const NV_LVL_FEATURES={
+  1:['Resumo destilado por coleção (sobrevive à deleção da coleção)','Insights de conteúdo — colecionáveis soltos (personagens, locais, eventos)','Cartões de conhecimento consultáveis'],
+  2:['Grafo navegável de entidades e relações','Ego-grafo: a história pela ótica de um nó (Frodo, ou a tabela `aluno`)','Encaixe de dimensões entre ingestões/projetos'],
+  3:['Detecção de furos e lacunas na base','Sugestões e comentários — código e livros','Aprimoramento autônomo da base de conhecimento'],
+};
+async function ensureNid(){ if(_nid&&_nid.levels)return _nid; try{_nid=await jget('/api/nidhogg')}catch(e){} return _nid; }
+function openNidViz(level){ _nvLevel=+level||0; selectTab('nidviz'); }
+async function loadNidViz(){
+  await ensureNid();
+  const lv=((_nid&&_nid.levels)||[]).find(l=>l.n===_nvLevel)||{n:_nvLevel,name:'—',ia:_nvLevel>0,desc:''};
+  $('#nv-lvlname').textContent=`· nível ${lv.n} — ${esc(lv.name)} ${lv.ia?'🧠':'⚙'}`;
+  $('#nv-lvldesc').textContent=lv.desc||'';
+  const isL0=(_nvLevel===0);
+  $('#nv-l0').style.display=isL0?'':'none';
+  $('#nv-future').style.display=isL0?'none':'block';
+  $('#nv-tabs').style.display=isL0?'flex':'none';
+  $('#nv-pick').style.display=isL0?'':'none';
+  if(!isL0){
+    const feats=NV_LVL_FEATURES[_nvLevel]||[];
+    $('#nv-future').innerHTML=`<h2 style="color:var(--warn)">🚧 Nível ${lv.n} · ${esc(lv.name)} — ainda não implementado</h2>
+      <p class="muted" style="margin:0 0 12px">${esc(lv.desc)}</p>
+      <p class="muted" style="margin:0 0 6px">Quando ligado, este nível vai oferecer:</p>
+      <div class="dlist" style="min-height:0;max-height:none">${feats.map(f=>`<div class="dcard" style="cursor:default"><span>• ${esc(f)}</span></div>`).join('')}</div>
+      <p class="muted" style="margin-top:14px;font-size:11px">🧠 Consome IA (tokens) a cada ciclo. O esqueleto do worm já roda; as funcionalidades entram nas issues #22→#24. A tela já existe pra puxar a implementação. 🪨</p>`;
+    return;
+  }
+  // Nível 0: busca o conhecimento UMA vez e alimenta o painel destilado + a galeria.
+  let d=null; try{d=await jget('/api/nidhogg/knowledge')}catch(e){}
+  loadNidKnowledge(d);
+  _nidk=((d&&d.collections)||[]).filter(c=>c.knowledge&&c.knowledge.length).map(c=>{
+    const dict=(c.knowledge||[]).find(k=>k.type==='CorpusDict');
+    const root=(c.knowledge||[]).find(k=>k.type==='RootIndex');
+    const bases=((dict&&dict.content&&dict.content.bases)||[]).map(b=>({name:b.name,corpus:b.corpus,n:+b.n_chunks||0,vocab:+b.vocab_size||0}));
+    return {collection:c.collection, root, bases};
+  });
+  const sel=$('#nv-coll'); const prev=sel.value;
+  sel.innerHTML=_nidk.map(c=>`<option value="${esc(c.collection)}">${esc(c.collection)}</option>`).join('');
+  if(prev&&_nidk.some(c=>c.collection===prev)) sel.value=prev;
+  $('#nv-tabs').innerHTML=NV_CHARTS.map(ch=>`<button class="go ${ch.k===_nvActive?'':'ghost'}" style="padding:4px 11px;${ch.ready?'':'opacity:.6'}" onclick="setNvChart('${ch.k}')" title="${esc(ch.desc)}">${ch.ic} ${esc(ch.name)}</button>`).join('');
+  renderNidViz();
+}
+function setNvChart(k){ _nvActive=k;
+  $('#nv-tabs').querySelectorAll('button').forEach((b,i)=>b.classList.toggle('ghost',NV_CHARTS[i].k!==k));
+  renderNidViz();
+}
+function renderNidViz(){
+  const ch=NV_CHARTS.find(c=>c.k===_nvActive)||NV_CHARTS[0];
+  $('#nv-title').textContent=ch.ic+' '+ch.name;
+  $('#nv-desc').textContent=ch.desc;
+  $('#nv-pick').style.display=ch.perColl?'':'none';
+  const st=$('#nv-stage');
+  if(!_nidk.length){st.innerHTML='<span class="muted">nada destilado ainda — ligue uma coleção no Nidhogg e aguarde a cadência.</span>';return;}
+  if(!ch.ready){st.innerHTML=vizLocked(ch);return;}
+  const coll=$('#nv-coll').value||_nidk[0].collection;
+  st.innerHTML = ch.k==='cloud'?vizCloud(coll) : ch.k==='sun'?vizSunburst() : ch.k==='tree'?vizTreemap(coll) : ch.k==='scat'?vizScatter() : vizLocked(ch);
+}
+// helpers de cor/geometria
+function nvLerp(a,b,t){t=Math.max(0,Math.min(1,t));
+  const P=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16));
+  const pa=P(a),pb=P(b),c=pa.map((v,i)=>Math.round(v+(pb[i]-v)*t));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;}
+function nvCol(i){return NV_PAL[i%NV_PAL.length];}
+function nvTrunc(s,n){s=s||'';return s.length>n?s.slice(0,Math.max(1,n-1))+'…':s;}
+function nvPol(cx,cy,r,a){return [cx+r*Math.cos(a), cy+r*Math.sin(a)];}
+function nvArc(cx,cy,ri,ro,a0,a1,fill,title){
+  if(a1-a0<1e-4) return '';
+  a1=Math.min(a1, a0+2*Math.PI-1e-3);            // evita arco degenerado de 360°
+  const large=(a1-a0)>Math.PI?1:0;
+  const [x0,y0]=nvPol(cx,cy,ro,a0),[x1,y1]=nvPol(cx,cy,ro,a1);
+  const [x2,y2]=nvPol(cx,cy,ri,a1),[x3,y3]=nvPol(cx,cy,ri,a0);
+  const d=`M${x0.toFixed(2)} ${y0.toFixed(2)} A${ro} ${ro} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)} `
+        +`L${x2.toFixed(2)} ${y2.toFixed(2)} A${ri} ${ri} 0 ${large} 0 ${x3.toFixed(2)} ${y3.toFixed(2)} Z`;
+  return `<path d="${d}" fill="${fill}" stroke="#0d1117" stroke-width="1"><title>${esc(title)}</title></path>`;
+}
+// treemap binário (split recursivo pelo eixo maior) — sempre correto, visual ok p/ poucas bases
+function nvTreemap(items,x,y,w,h,out){
+  if(!items.length) return;
+  if(items.length===1){out.push({x,y,w,h,it:items[0]});return;}
+  const tot=items.reduce((s,i)=>s+i.v,0);
+  const a=[],b=[]; let acc=0;
+  for(const it of items){ if(acc<tot/2 || !a.length){a.push(it);acc+=it.v;} else b.push(it); }
+  if(!b.length){b.push(a.pop());}
+  const frac=a.reduce((s,i)=>s+i.v,0)/tot;
+  if(w>=h){const wa=w*frac; nvTreemap(a,x,y,wa,h,out); nvTreemap(b,x+wa,y,w-wa,h,out);}
+  else {const ha=h*frac; nvTreemap(a,x,y,w,ha,out); nvTreemap(b,x,y+ha,w,h-ha,out);}
+}
+function vizLocked(ch){
+  return `<div class="dcard" style="flex-direction:column;align-items:stretch;cursor:default;border-color:var(--warn);gap:8px">
+    <div><span class="lang" style="color:var(--warn)">🔒 ${esc(ch.name)} — travado</span></div>
+    <p class="muted" style="margin:0">${esc(ch.desc)}</p>
+    <p class="muted" style="margin:0;font-size:11px">A camada 0 não tem esse dado <b>de propósito</b> — destrava quando o motor (ragd) expuser o que falta. A tela pede a feature, não o contrário. 🪨</p>
+  </div>`;
+}
+function vizCloud(coll){
+  const c=_nidk.find(x=>x.collection===coll); const roots=(c&&c.root&&c.root.content&&c.root.content.salient_roots)||[];
+  if(!roots.length) return '<span class="muted">esta coleção não tem sílabas salientes destiladas.</span>';
+  const us=roots.map(r=>+r.uidf), mn=Math.min(...us), span=(Math.max(...us)-mn)||1;
+  const spans=roots.map(r=>{const t=(+r.uidf-mn)/span, fs=(13+t*30).toFixed(1), col=nvLerp('#7d8590','#58a6ff',t);
+    return `<span title="dim ${r.dim} · uidf ${(+r.uidf).toFixed(2)}" style="font-size:${fs}px;color:${col};line-height:1.5;font-weight:${t>0.6?'bold':'normal'}">${esc(r.syllable)}</span>`;}).join(' ');
+  return `<div style="display:flex;flex-wrap:wrap;gap:4px 15px;align-items:baseline;padding:12px 4px">${spans}</div>
+    <p class="muted" style="font-size:11px;margin-top:14px">${roots.length} sílabas · maior = mais rara (uidf alto) = mais distintiva da obra. Sem nenhuma IA: a raridade faz o trabalho sozinha.</p>`;
+}
+function vizSunburst(){
+  const cx=190,cy=175,r0=55,r1=105,r2=158;
+  const cols=_nidk.map(c=>({...c, n:c.bases.reduce((s,b)=>s+b.n,0)})).filter(c=>c.n>0);
+  const grand=cols.reduce((s,c)=>s+c.n,0)||1;
+  let ang=-Math.PI/2, paths=[];
+  cols.forEach((c,ci)=>{
+    const span=(c.n/grand)*2*Math.PI, a0=ang, a1=ang+span, base=nvCol(ci);
+    paths.push(nvArc(cx,cy,r0,r1,a0,a1,base,`${c.collection} · ${c.n} chunks`));
+    let ba=a0;
+    c.bases.slice().sort((x,y)=>y.n-x.n).forEach((b,bi)=>{
+      const bs=(b.n/c.n)*span;
+      paths.push(nvArc(cx,cy,r1,r2,ba,ba+bs,nvLerp(base,'#0d1117',Math.min(0.6,bi*0.13)),`${b.corpus||b.name} · ${b.n} chunks`));
+      ba+=bs;
+    });
+    ang=a1;
+  });
+  const legend=cols.map((c,ci)=>`<span class="pill" style="border-color:${nvCol(ci)}"><span style="color:${nvCol(ci)}">●</span> ${esc(c.collection)} · ${c.n}</span>`).join(' ');
+  return `<svg viewBox="0 0 380 350" style="width:100%;max-height:430px;font:11px var(--mono)">${paths.join('')}
+    <text x="${cx}" y="${cy-3}" text-anchor="middle" fill="#c9d1d9" font-size="22" font-weight="bold">${grand}</text>
+    <text x="${cx}" y="${cy+14}" text-anchor="middle" fill="#7d8590" font-size="10">chunks</text></svg>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">${legend}</div>`;
+}
+function vizTreemap(coll){
+  const c=_nidk.find(x=>x.collection===coll); const bases=((c&&c.bases)||[]).slice().sort((a,b)=>b.n-a.n);
+  if(!bases.length) return '<span class="muted">esta coleção não tem bases destiladas.</span>';
+  const items=bases.map(b=>({v:Math.max(b.n,1),label:b.corpus||b.name,n:b.n,vocab:b.vocab}));
+  const W=1000,H=440,out=[]; nvTreemap(items,0,0,W,H,out);
+  const rects=out.map((r,i)=>{const big=r.w>72&&r.h>26, fill=nvLerp('#1f6feb','#0d2138',Math.min(0.85,i*0.07));
+    return `<g><rect x="${(r.x+1).toFixed(1)}" y="${(r.y+1).toFixed(1)}" width="${Math.max(0,r.w-2).toFixed(1)}" height="${Math.max(0,r.h-2).toFixed(1)}" fill="${fill}" stroke="#0d1117"><title>${esc(r.it.label)} · ${r.it.n} chunks · vocab ${r.it.vocab}</title></rect>`
+      +(big?`<text x="${(r.x+8).toFixed(1)}" y="${(r.y+19).toFixed(1)}" fill="#c9d1d9" font-size="13">${esc(nvTrunc(r.it.label,Math.floor(r.w/8)))}</text><text x="${(r.x+8).toFixed(1)}" y="${(r.y+35).toFixed(1)}" fill="#9fb3c8" font-size="12">${r.it.n} chunks</text>`:'')+`</g>`;}).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-height:460px;font:12px var(--mono)">${rects}</svg>`;
+}
+function vizScatter(){
+  const pts=[]; _nidk.forEach((c,ci)=>c.bases.forEach(b=>pts.push({x:b.n,y:b.vocab,ci,label:b.corpus||b.name,coll:c.collection})));
+  if(!pts.length) return '<span class="muted">sem bases destiladas.</span>';
+  const W=720,H=430,pad=58;
+  const xmax=Math.max(...pts.map(p=>p.x),1), ymax=Math.max(...pts.map(p=>p.y),1);
+  const sx=v=>pad+(v/xmax)*(W-pad-24), sy=v=>H-pad-(v/ymax)*(H-pad-24);
+  let g='';
+  for(let i=0;i<=4;i++){const gx=pad+i/4*(W-pad-24), gy=H-pad-i/4*(H-pad-24);
+    g+=`<line x1="${pad}" y1="${gy.toFixed(1)}" x2="${W-24}" y2="${gy.toFixed(1)}" stroke="#2b3340"/>`
+      +`<text x="${pad-8}" y="${(gy+4).toFixed(1)}" text-anchor="end" fill="#7d8590" font-size="10">${Math.round(ymax*i/4)}</text>`
+      +`<text x="${gx.toFixed(1)}" y="${H-pad+16}" text-anchor="middle" fill="#7d8590" font-size="10">${Math.round(xmax*i/4)}</text>`;}
+  const dots=pts.map(p=>`<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="5" fill="${nvCol(p.ci)}" fill-opacity="0.85" stroke="#0d1117"><title>${esc(p.label)} (${esc(p.coll)}) · ${p.x} chunks · vocab ${p.y}</title></circle>`).join('');
+  const legend=_nidk.map((c,ci)=>`<span class="pill" style="border-color:${nvCol(ci)}"><span style="color:${nvCol(ci)}">●</span> ${esc(c.collection)}</span>`).join(' ');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-height:440px;font:11px var(--mono)">
+    <line x1="${pad}" y1="${H-pad}" x2="${W-24}" y2="${H-pad}" stroke="#7d8590"/>
+    <line x1="${pad}" y1="24" x2="${pad}" y2="${H-pad}" stroke="#7d8590"/>
+    ${g}${dots}
+    <text x="${(W+pad)/2}" y="${H-12}" text-anchor="middle" fill="#9fb3c8" font-size="11">nº de chunks →</text>
+    <text x="16" y="${H/2}" text-anchor="middle" fill="#9fb3c8" font-size="11" transform="rotate(-90 16 ${H/2})">tamanho do vocabulário →</text>
+  </svg><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${legend}</div>`;
+}
 async function nidSetCadence(){ const c=+$('#nid-cadence').value||300; try{await jpost('/api/nidhogg',{cadence:c})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} $('#nid-msg').textContent='cadência aplicada'; }
 async function loadNidColls(){
   let d; try{d=await jget('/api/nidhogg/collections')}catch(e){$('#nid-colls').innerHTML='<span class="muted">erro</span>';return}
