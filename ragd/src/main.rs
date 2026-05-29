@@ -2164,17 +2164,42 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
     let mut uidfs: Vec<(usize, f64)> = prof.uidf.iter().map(|(&d, &v)| (d, v)).collect();
     // idf desc + desempate estável por dim asc (mesma razão do modo base: top_uidf reproduzível).
     uidfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-    let top_uidf: Vec<Value> = uidfs.into_iter().take(top_n).map(|(d, v)| {
+    let top: Vec<(usize, f64)> = uidfs.into_iter().take(top_n).collect();
+    let top_uidf: Vec<Value> = top.iter().map(|&(d, v)| {
         json!({"dim": d, "syllable": udim2syl.get(&d).copied().unwrap_or("?"), "uidf": v})
     }).collect();
     let total_chunks: usize = inner.values().map(|b| b.n_chunks).sum();
-    (200, json!({
+    let mut resp = json!({
         "scope": "collection",
         "collection": coll,
         "bases": inner.len(), "chunks": total_chunks,
         "unified_vocab_size": prof.uvocab.len(),
         "top_uidf": top_uidf,
-    }).to_string())
+    });
+    // dims-por-base (heatmap/dendrograma): só quando pedido (&vectors=1). Pra cada base, o
+    // vetor nas dims SALIENTES (ordem do top_uidf), peso = tf-idf no espaço unificado da
+    // coleção. Determinístico (bases ordenadas por nome) — alinha 1:1 com top_uidf.
+    if query_param(query, "vectors").map(|s| s == "1" || s == "true").unwrap_or(false) {
+        let salient_dims: Vec<usize> = top.iter().map(|&(d, _)| d).collect();
+        let mut names: Vec<&String> = inner.keys().collect();
+        names.sort();
+        let base_vectors: Vec<Value> = names.iter().map(|name| {
+            let base = inner.get(*name).unwrap();
+            let m = prof.remap.get(*name).map(|v| v.as_slice()).unwrap_or(&[]);
+            let mut gtf: HashMap<usize, f64> = HashMap::new();
+            for ch in &base.chunks {
+                for (&ld, &cnt) in &ch.vec {
+                    if ld < m.len() { *gtf.entry(m[ld]).or_insert(0.0) += cnt; }
+                }
+            }
+            let vec: Vec<f64> = salient_dims.iter()
+                .map(|d| gtf.get(d).copied().unwrap_or(0.0) * prof.uidf.get(d).copied().unwrap_or(0.0))
+                .collect();
+            json!({"name": name, "corpus": base.corpus, "n_chunks": base.n_chunks, "vec": vec})
+        }).collect();
+        resp["base_vectors"] = json!(base_vectors);
+    }
+    (200, resp.to_string())
 }
 
 /// DELETE /collections/{name}?purge=true — apaga uma coleção inteira da memória.

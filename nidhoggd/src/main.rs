@@ -378,9 +378,12 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
     let total_chunks: u64 = bases.iter().map(|b| b["n_chunks"].as_u64().unwrap_or(0)).sum();
 
     // 2) /profile?collection — vocabulário unificado + sílabas salientes (top_uidf).
-    let prof: Value = serde_json::from_str(&http_get_t(&format!("{api}/profile?collection={coll}&top=40"), 30)?).ok()?;
+    let prof: Value = serde_json::from_str(&http_get_t(&format!("{api}/profile?collection={coll}&top=40&vectors=1"), 30)?).ok()?;
     let salient = prof["top_uidf"].as_array().cloned().unwrap_or_default();
     let unified_vocab = prof["unified_vocab_size"].as_u64().unwrap_or(0);
+    // dims-por-base (heatmap/dendrograma): vetor tf-idf de cada base nas dims salientes,
+    // alinhado 1:1 com `salient` (top_uidf). Vem do /profile&vectors=1.
+    let base_vectors = prof["base_vectors"].as_array().cloned().unwrap_or_default();
 
     // Pilar 1 — RootIndex: as sílabas/dims mais salientes (rankeadas por uidf). É a
     // IDENTIDADE LÉXICA da coleção: o que a distingue das outras.
@@ -406,7 +409,8 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
         "content": {
             "unified_vocab_size": unified_vocab,
             "bases": per_base,
-            "note": "dims compartilhadas/únicas e oov por base são [FUTURO]: o /profile só expõe top_idf, não o vocab completo por base"
+            "base_vectors": base_vectors,   // [{name,corpus,n_chunks,vec[]}] alinhado às dims salientes (heatmap/dendrograma)
+            "note": "base_vectors = tf-idf por base nas dims salientes (alinhado ao salient_roots). vocab completo por base e oov ainda [FUTURO]"
         }
     });
 

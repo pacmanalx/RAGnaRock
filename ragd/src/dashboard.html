@@ -108,6 +108,9 @@
   .keyfield .eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:3px 6px;color:var(--dim)}
   .keyfield .eye:hover{color:var(--acc)}
   .mask{-webkit-text-security:disc;text-security:disc}  /* mascara sem type=password → não dispara "salvar senha" do Chrome */
+  .zoomctl{display:flex;gap:6px;align-items:center;margin-bottom:8px}
+  .zoomvp{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:6px;background:#0b0e13;height:62vh;cursor:grab}
+  .zoomcv{transform-origin:0 0;will-change:transform;padding:10px}
   .keybtns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
   .keybtns button{flex:0 0 auto}
 </style>
@@ -961,10 +964,10 @@ const NV_CHARTS=[
    desc:'Cada sílaba como bolha (X=df, Y=idf): a fronteira da raridade que o tf-idf usa. PRECISA de df/freq por sílaba — o /profile hoje só expõe uidf.'},
   {k:'zipf',ic:'🔒',name:'Curva de Zipf',perColl:true,ready:false,
    desc:'Distribuição de frequência das sílabas (lei de potência do corpus). PRECISA do ranking de freq completo — não exposto na camada 0.'},
-  {k:'heat',ic:'🔒',name:'Heatmap sílaba × base',perColl:false,ready:false,
-   desc:'Intensidade de cada sílaba por base. PRECISA do vetor de vocab por base (dims) — feature do motor (histograma por base no /profile).'},
-  {k:'dend',ic:'🔒',name:'Dendrograma / Jaccard',perColl:false,ready:false,
-   desc:'Parentesco lexical entre bases por distância de cosseno (agrupa as obras-irmãs). PRECISA dos vetores por base — feature do motor.'},
+  {k:'heat',ic:'▥',name:'Heatmap sílaba × base',perColl:true,ready:true,
+   desc:'Intensidade de cada sílaba saliente por base (tf-idf normalizado por base). Mostra qual léxico acende em qual obra. (dims-por-base)'},
+  {k:'dend',ic:'⑃',name:'Dendrograma de bases',perColl:true,ready:true,
+   desc:'Parentesco lexical: agrupa as bases por cosseno no subespaço das sílabas salientes (UPGMA). As obras-irmãs caem no mesmo galho. (dims-por-base)'},
 ];
 let _nidk=[], _nvActive='cloud', _nvLevel=0;
 // O que CADA nível ≥1 oferecerá (esqueleto rodando; funcionalidades nas issues #22→#24).
@@ -1001,7 +1004,8 @@ async function loadNidViz(){
     const dict=(c.knowledge||[]).find(k=>k.type==='CorpusDict');
     const root=(c.knowledge||[]).find(k=>k.type==='RootIndex');
     const bases=((dict&&dict.content&&dict.content.bases)||[]).map(b=>({name:b.name,corpus:b.corpus,n:+b.n_chunks||0,vocab:+b.vocab_size||0}));
-    return {collection:c.collection, root, bases};
+    const bvec=((dict&&dict.content&&dict.content.base_vectors)||[]).map(b=>({name:b.name,corpus:b.corpus,n_chunks:+b.n_chunks||0,vec:(b.vec||[]).map(Number)}));
+    return {collection:c.collection, root, bases, bvec};
   });
   const sel=$('#nv-coll'); const prev=sel.value;
   sel.innerHTML=_nidk.map(c=>`<option value="${esc(c.collection)}">${esc(c.collection)}</option>`).join('');
@@ -1022,7 +1026,9 @@ function renderNidViz(){
   if(!_nidk.length){st.innerHTML='<span class="muted">nada destilado ainda — ligue uma coleção no Nidhogg e aguarde a cadência.</span>';return;}
   if(!ch.ready){st.innerHTML=vizLocked(ch);return;}
   const coll=$('#nv-coll').value||_nidk[0].collection;
-  st.innerHTML = ch.k==='cloud'?vizCloud(coll) : ch.k==='sun'?vizSunburst() : ch.k==='tree'?vizTreemap(coll) : ch.k==='scat'?vizScatter() : vizLocked(ch);
+  const html = ch.k==='cloud'?vizCloud(coll) : ch.k==='sun'?vizSunburst() : ch.k==='tree'?vizTreemap(coll)
+             : ch.k==='scat'?vizScatter() : ch.k==='heat'?vizHeatmap(coll) : ch.k==='dend'?vizDendro(coll) : vizLocked(ch);
+  mountStage(html);
 }
 // helpers de cor/geometria
 function nvLerp(a,b,t){t=Math.max(0,Math.min(1,t));
@@ -1122,6 +1128,86 @@ function vizScatter(){
     <text x="${(W+pad)/2}" y="${H-12}" text-anchor="middle" fill="#9fb3c8" font-size="11">nº de chunks →</text>
     <text x="16" y="${H/2}" text-anchor="middle" fill="#9fb3c8" font-size="11" transform="rotate(-90 16 ${H/2})">tamanho do vocabulário →</text>
   </svg><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${legend}</div>`;
+}
+// ---- zoom/pan genérico do palco (viewBox via CSS transform; sem lib) -----------------
+let _zk={s:1,tx:0,ty:0}, _nvDrag=null;
+function nvApplyZoom(){const cv=$('#nv-cv');if(cv)cv.style.transform=`translate(${_zk.tx}px,${_zk.ty}px) scale(${_zk.s})`;const z=$('#nv-zlbl');if(z)z.textContent=Math.round(_zk.s*100)+'%';}
+function nvZoom(f){_zk.s=Math.max(0.2,Math.min(8,_zk.s*f));nvApplyZoom();}
+function nvZoomReset(){_zk={s:1,tx:0,ty:0};nvApplyZoom();}
+function mountStage(html){
+  $('#nv-stage').innerHTML=`<div class="zoomctl"><span class="muted" style="font-size:11px;margin-right:auto">arraste pra mover · scroll pra zoom</span>`
+    +`<button class="go ghost" style="padding:2px 10px" onclick="nvZoom(1/1.25)">−</button>`
+    +`<span class="muted" id="nv-zlbl" style="min-width:46px;text-align:center">100%</span>`
+    +`<button class="go ghost" style="padding:2px 10px" onclick="nvZoom(1.25)">+</button>`
+    +`<button class="go ghost" style="padding:2px 10px" onclick="nvZoomReset()">⟲ reset</button></div>`
+    +`<div class="zoomvp" id="nv-vp"><div class="zoomcv" id="nv-cv">${html}</div></div>`;
+  _zk={s:1,tx:0,ty:0}; nvApplyZoom();
+  const vp=$('#nv-vp');
+  vp.onwheel=e=>{e.preventDefault();const r=vp.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    const ns=Math.max(0.2,Math.min(8,_zk.s*(e.deltaY<0?1.15:1/1.15)));
+    _zk.tx=mx-(mx-_zk.tx)*(ns/_zk.s); _zk.ty=my-(my-_zk.ty)*(ns/_zk.s); _zk.s=ns; nvApplyZoom();};
+  vp.onmousedown=e=>{_nvDrag={x:e.clientX,y:e.clientY,tx:_zk.tx,ty:_zk.ty};vp.style.cursor='grabbing';e.preventDefault();};
+}
+window.addEventListener('mousemove',e=>{if(!_nvDrag)return;_zk.tx=_nvDrag.tx+(e.clientX-_nvDrag.x);_zk.ty=_nvDrag.ty+(e.clientY-_nvDrag.y);nvApplyZoom();});
+window.addEventListener('mouseup',()=>{if(_nvDrag){_nvDrag=null;const vp=$('#nv-vp');if(vp)vp.style.cursor='grab';}});
+// ---- heatmap sílaba × base (dims-por-base, normalizado por base) ----------------------
+function vizHeatmap(coll){
+  const c=_nidk.find(x=>x.collection===coll);
+  const roots=(c&&c.root&&c.root.content&&c.root.content.salient_roots)||[];
+  const bv=(c&&c.bvec)||[];
+  if(!roots.length||!bv.length) return '<span class="muted">sem vetores destilados nesta coleção — re-minere com o ragd atualizado (aguarde a cadência) e volte.</span>';
+  const S=roots.length, B=bv.length;
+  const colmax=bv.map(b=>{let m=1e-9;(b.vec||[]).forEach(v=>{const a=Math.abs(v);if(a>m)m=a});return m;});
+  const cell=18, lblW=72, botH=(B<=40?100:14), top=6;
+  const W=lblW+B*cell, H=top+S*cell+botH;
+  let g='';
+  for(let s=0;s<S;s++){
+    g+=`<text x="${lblW-6}" y="${top+s*cell+13}" text-anchor="end" fill="#c9d1d9" font-size="12">${esc(roots[s].syllable)}</text>`;
+    for(let j=0;j<B;j++){
+      const v=((bv[j].vec||[])[s]||0)/colmax[j];
+      const fill=v<=0?'#10151c':nvLerp('#13233a','#58a6ff',v);
+      g+=`<rect x="${lblW+j*cell}" y="${top+s*cell}" width="${cell-1}" height="${cell-1}" fill="${fill}"><title>${esc(roots[s].syllable)} × ${esc(bv[j].corpus||bv[j].name)} = ${v.toFixed(2)}</title></rect>`;
+    }
+  }
+  if(B<=40) for(let j=0;j<B;j++){const x=lblW+j*cell+cell/2, y=top+S*cell+8;
+    g+=`<text x="${x}" y="${y}" fill="#7d8590" font-size="10" transform="rotate(60 ${x} ${y})">${esc(nvTrunc(bv[j].corpus||bv[j].name,16))}</text>`;}
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;font:11px var(--mono)">${g}</svg>`
+    +`<p class="muted" style="font-size:11px;margin-top:8px">${S} sílabas salientes × ${B} base(s) · intensidade = tf-idf normalizado por base (coluna)${B>40?' · nomes ocultos (passe o mouse / use o zoom)':''}.</p>`;
+}
+// ---- dendrograma de bases (UPGMA sobre cosseno no subespaço saliente) -----------------
+function vizDendro(coll){
+  const c=_nidk.find(x=>x.collection===coll);
+  const all=(c&&c.bvec)||[];
+  if(all.length<2) return '<span class="muted">precisa de ≥2 bases com vetores destilados.</span>';
+  const CAP=100; let bv=all, capped=false;
+  if(all.length>CAP){bv=all.slice().sort((a,b)=>(b.n_chunks||0)-(a.n_chunks||0)).slice(0,CAP);capped=true;}
+  const n=bv.length, vecs=bv.map(b=>b.vec||[]);
+  const norm=vecs.map(v=>Math.sqrt(v.reduce((s,x)=>s+x*x,0))||1e-9);
+  const key=(a,b)=>a<b?a+'_'+b:b+'_'+a, dist={}, size={}, nd={};
+  for(let i=0;i<n;i++){size[i]=1;nd[i]={leaf:true,label:bv[i].corpus||bv[i].name};
+    for(let j=i+1;j<n;j++){let dot=0;const a=vecs[i],b=vecs[j],L=Math.min(a.length,b.length);for(let k=0;k<L;k++)dot+=a[k]*b[k];dist[key(i,j)]=1-dot/(norm[i]*norm[j]);}}
+  let active=[...Array(n).keys()], nextId=n;
+  while(active.length>1){
+    let bi=active[0],bj=active[1],bd=Infinity;
+    for(let x=0;x<active.length;x++)for(let y=x+1;y<active.length;y++){const a=active[x],b=active[y],d=dist[key(a,b)];if(d<bd){bd=d;bi=a;bj=b;}}
+    const si=size[bi],sj=size[bj];
+    active.forEach(k=>{if(k===bi||k===bj)return;dist[key(nextId,k)]=(si*dist[key(bi,k)]+sj*dist[key(bj,k)])/(si+sj);});
+    nd[nextId]={merge:true,h:bd/2,left:nd[bi],right:nd[bj]}; size[nextId]=si+sj;
+    active=active.filter(k=>k!==bi&&k!==bj); active.push(nextId); nextId++;
+  }
+  const root=nd[nextId-1], maxH=root.h||1, leaves=[];
+  (function walk(t){if(t.leaf)leaves.push(t);else{walk(t.left);walk(t.right);}})(root);
+  const rowH=20, padT=10, lblW=10, plotW=540, leafX=lblW+plotW;
+  const H=padT*2+leaves.length*rowH, xOf=h=>lblW+plotW*(1-h/maxH);
+  leaves.forEach((lf,i)=>{lf.y=padT+i*rowH+rowH/2; lf.x=leafX;});
+  let g='';
+  (function place(t){ if(t.leaf){g+=`<text x="${leafX+6}" y="${t.y+4}" fill="#c9d1d9" font-size="11">${esc(nvTrunc(t.label,28))}</text>`;return;}
+    place(t.left);place(t.right); t.y=(t.left.y+t.right.y)/2; t.x=xOf(t.h);
+    g+=`<path d="M${t.x} ${t.left.y} H${t.left.x} M${t.x} ${t.right.y} H${t.right.x} M${t.x} ${t.left.y} V${t.right.y}" stroke="#58a6ff" fill="none" stroke-width="1.2"/>`;
+  })(root);
+  const W=leafX+200;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;font:11px var(--mono)">${g}</svg>`
+    +`<p class="muted" style="font-size:11px;margin-top:8px">Parentesco por cosseno no subespaço das sílabas salientes (UPGMA) · encontro mais à direita = mais parecidas.${capped?` <b>Mostrando as ${CAP} maiores de ${all.length} bases</b> (clustering O(n²)).`:''}</p>`;
 }
 async function nidSetCadence(){ const c=+$('#nid-cadence').value||300; try{await jpost('/api/nidhogg',{cadence:c})}catch(e){$('#nid-msg').textContent='erro '+e.message;return} $('#nid-msg').textContent='cadência aplicada'; }
 async function loadNidColls(){
