@@ -98,6 +98,42 @@ COMPOSE = {
         "bridge": ("https://download.freedict.org/dictionaries/eng-por/0.3/freedict-eng-por-0.3.src.tar.xz",
                    "fd_eng_por.tar.xz", "eng-por/eng-por.tei"),
     },
+    "ESEN": {  # query ES -> alvo EN. ponte = traducao spa->eng; expande com sinonimos ES antes
+        "kind": "cross", "lang_query": "es", "lang_target": "en",
+        "source": "composicao: ESES (sinonimos) + FreeDict spa-eng (traducao)",
+        "source_url": "https://download.freedict.org/dictionaries/spa-eng/",
+        "license": "deriva de ESES + FreeDict spa-eng (copyleft) — VERIFICAR",
+        "syn_mono": "ESES",
+        "bridge": ("https://download.freedict.org/dictionaries/spa-eng/0.3.1/freedict-spa-eng-0.3.1.src.tar.xz",
+                   "fd_spa_eng.tar.xz", "spa-eng/spa-eng.tei"),
+    },
+    "ESPT": {  # query ES -> alvo PT
+        "kind": "cross", "lang_query": "es", "lang_target": "pt",
+        "source": "composicao: ESES (sinonimos) + FreeDict spa-por (traducao)",
+        "source_url": "https://download.freedict.org/dictionaries/spa-por/",
+        "license": "deriva de ESES + FreeDict spa-por (copyleft) — VERIFICAR",
+        "syn_mono": "ESES",
+        "bridge": ("https://download.freedict.org/dictionaries/spa-por/0.2.1/freedict-spa-por-0.2.1.src.tar.xz",
+                   "fd_spa_por.tar.xz", "spa-por/spa-por.tei"),
+    },
+    "ENES": {  # query EN -> alvo ES
+        "kind": "cross", "lang_query": "en", "lang_target": "es",
+        "source": "composicao: ENEN (sinonimos) + FreeDict eng-spa (traducao)",
+        "source_url": "https://download.freedict.org/dictionaries/eng-spa/",
+        "license": "deriva de ENEN (dominio publico) + FreeDict eng-spa (copyleft) — VERIFICAR",
+        "syn_mono": "ENEN",
+        "bridge": ("https://download.freedict.org/dictionaries/eng-spa/2025.11.23/freedict-eng-spa-2025.11.23.src.tar.xz",
+                   "fd_eng_spa.tar.xz", "eng-spa/eng-spa.tei"),
+    },
+    "PTES": {  # query PT -> alvo ES
+        "kind": "cross", "lang_query": "pt", "lang_target": "es",
+        "source": "composicao: PTBR (sinonimos) + FreeDict por-spa (traducao)",
+        "source_url": "https://download.freedict.org/dictionaries/por-spa/",
+        "license": "deriva de PTBR + FreeDict por-spa (copyleft) — VERIFICAR",
+        "syn_mono": "PTBR",
+        "bridge": ("https://download.freedict.org/dictionaries/por-spa/2025.11.23/freedict-por-spa-2025.11.23.src.tar.xz",
+                   "fd_por_spa.tar.xz", "por-spa/por-spa.tei"),
+    },
 }
 
 
@@ -279,7 +315,7 @@ def load_bridge_tei(url, fname, member, refetch=False):
             continue
         word = clean_term(re.sub(r"<.*?>", "", orth.group(1)))
         trans = [clean_term(re.sub(r"<.*?>", "", q)) for q in
-                 re.findall(r'<cit type="trans">.*?<quote>(.*?)</quote>', body, re.S)]
+                 re.findall(r'<cit type="trans"[^>]*>.*?<quote>(.*?)</quote>', body, re.S)]
         trans = [t for t in trans if t]
         if word and trans:
             d.setdefault(word, []).extend(trans)
