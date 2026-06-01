@@ -1167,6 +1167,25 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     slog(&format!("┌─ search_expand q={query:?} escopo={}/{} k={}",
                   v["collection"].as_str().unwrap_or("*"), v["base"].as_str().unwrap_or("*"),
                   v["k"].as_u64().unwrap_or(8)));
+    // [Issue #38 → 1ª classe] Needle alfanumérico-com-dígito (marcador/ticket/código): o motor
+    // silábico é estruturalmente cego (ex "M31May-23h28" → só "m-may-h") e a expansão por IA é
+    // INÚTIL (vira sinônimo de ruído). Grep literal ANTES da cascata, INDEPENDENTE de provider.
+    // Acha → encerra aqui; não acha → segue a cascata normal (texto natural).
+    let needles_lit = extract_alnum_needles(query);
+    if !needles_lit.is_empty() {
+        let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
+        let base_lit = v["base"].as_str().unwrap_or("*").to_string();
+        let coll_lit = v["collection"].as_str().map(|s| s.to_string());
+        let lit_hits = literal_fallback(&needles_lit, &st.bases, coll_lit.as_deref(), &base_lit, k_lit);
+        if !lit_hits.is_empty() {
+            slog(&format!("   └─ 🔎 literal (1ª classe) {needles_lit:?} · {} hit(s) · encerra", lit_hits.len()));
+            return (200, json!({
+                "query": query, "source": "literal", "needles": needles_lit,
+                "expansions": [], "hits": lit_hits,
+            }).to_string());
+        }
+        slog(&format!("   ├─ 🔎 literal {needles_lit:?} · 0 hit(s) · segue cascata"));
+    }
     // Cascata de expansão (do mais barato pro mais caro):
     //   1) DICIONÁRIOS por-palavra ATIVOS (instantâneo, zero custo) — se houver, encerra aqui.
     //   2) CACHE por-query (cache/expansions.json) — hit instantâneo.
@@ -2386,17 +2405,44 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
             .then(b.3.partial_cmp(&a.3).unwrap())       // cos desc
             .then(b.1.cmp(&a.1))                        // mtime desc (recência só desempata)
     });
-    let hits: Vec<Value> = merged.into_iter().take(k).enumerate().map(|(i, (_cov, mt, _sp, _cos, mut o))| {
+    let syllabic: Vec<Value> = merged.into_iter().take(k).map(|(_cov, mt, _sp, _cos, mut o)| {
         o.insert("recency".into(), json!(format!("{:.3}", recency(mt))));
-        o.insert("rank".into(), json!(i + 1));
         Value::Object(o)
     }).collect();
 
+    // [Issue #38 → 1ª classe] Needle alfanumérico-com-dígito (marcador/ticket/código): o motor
+    // silábico é estruturalmente cego (ex "M31May-23h28" → só "m-may-h"); o grep literal acha.
+    // Roda no /search direto (ValHalla usa /search puro), INDEPENDENTE de provider de IA. Match
+    // exato manda → vem na frente; merge dedup por (collection,base,chunk) com os silábicos.
+    let needles = extract_alnum_needles(query);
+    let mut hits: Vec<Value> = if needles.is_empty() {
+        syllabic
+    } else {
+        let lit = literal_fallback(&needles, bases, coll_pat, pattern, k);
+        if lit.is_empty() {
+            syllabic
+        } else {
+            let key = |h: &Value| (h["collection"].as_str().unwrap_or("").to_string(),
+                                   h["base"].as_str().unwrap_or("").to_string(),
+                                   h["chunk"].as_i64().unwrap_or(-1));
+            let seen: std::collections::HashSet<_> = lit.iter().map(&key).collect();
+            let mut out = lit;
+            for h in syllabic { if !seen.contains(&key(&h)) { out.push(h); } }
+            out.truncate(k);
+            out
+        }
+    };
+    // (re)numera rank após o eventual merge literal
+    for (i, h) in hits.iter_mut().enumerate() {
+        if let Some(o) = h.as_object_mut() { o.insert("rank".into(), json!(i + 1)); }
+    }
+
     let scope_label: Vec<Value> = pairs.iter().map(|(c, n)| json!(format!("{c}/{n}"))).collect();
-    let resp = json!({
+    let mut resp = json!({
         "query": query, "query_syllables": syllables,
         "scope": scope_label, "searched": searched, "hits": hits
     });
+    if !needles.is_empty() { resp["needles"] = json!(needles); }
     (200, resp.to_string())
 }
 
