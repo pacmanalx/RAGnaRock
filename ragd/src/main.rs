@@ -2207,8 +2207,9 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
             let m = prof.remap.get(*name).map(|v| v.as_slice()).unwrap_or(&[]);
             let mut gtf: HashMap<usize, f64> = HashMap::new();
             for ch in &base.chunks {
-                for (&ld, &cnt) in &ch.vec {
-                    if ld < m.len() { *gtf.entry(m[ld]).or_insert(0.0) += cnt; }
+                for &(ld, cnt) in &ch.vec {
+                    let ld = ld as usize;
+                    if ld < m.len() { *gtf.entry(m[ld]).or_insert(0.0) += cnt as f64; }
                 }
             }
             let vec: Vec<f64> = salient_dims.iter()

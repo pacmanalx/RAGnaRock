@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use rayon::prelude::*;
 use crate::tokenizer::{normalize, syllabify, words};
-use crate::vector::cosine_tfidf;
+use crate::vector::{cosine_tfidf, SparseVec};
 use crate::chunk::find_chars;
 
 const PROX_SCALE: f64 = 8.0;
@@ -218,7 +218,8 @@ pub fn snippet(text: &str, query: &str) -> String {
 // ------------------------------- a base RAG ----------------------------------
 pub struct Chunk {
     pub id: usize, pub start: usize, pub len: usize, pub tokens: usize, pub oov: usize,
-    pub vec: HashMap<usize, f64>, pub norm: f64, pub text: Option<String>,
+    /// [#42] pares (dim, contagem) ORDENADOS por dim — ver `vector::SparseVec`.
+    pub vec: SparseVec, pub norm: f64, pub text: Option<String>,
     /// cache: sílabas por palavra do chunk (pro rerank). Calculado 1× no load —
     /// antes era refeito (re-silabado) a CADA query. Vazio quando o chunk não tem texto.
     pub words: Vec<Vec<String>>,
@@ -260,9 +261,20 @@ impl RagBase {
         let chunks: Vec<Chunk> = v.get("chunks").and_then(|x| x.as_array())
             .ok_or("falta 'chunks'")?
             .iter().enumerate().map(|(i, c)| {
-                let vec = c["vec"].as_object().map(|o| o.iter()
-                    .filter_map(|(k, val)| Some((k.parse::<usize>().ok()?, val.as_f64()?)))
-                    .collect()).unwrap_or_default();
+                // [#42] coleta DIRETO no Vec (nada de HashMap intermediário: o pico de RAM
+                // do load é o que mais dói com 335 bases) + capacidade exata + ordenação,
+                // que é o que o `cosine_tfidf` exige pra buscar binário.
+                let vec: SparseVec = c["vec"].as_object().map(|o| {
+                    let mut v: SparseVec = Vec::with_capacity(o.len());
+                    for (k, val) in o {
+                        if let (Ok(d), Some(c)) = (k.parse::<u32>(), val.as_f64()) {
+                            v.push((d, c as f32));
+                        }
+                    }
+                    v.sort_unstable_by_key(|&(d, _)| d);
+                    v.shrink_to_fit();
+                    v
+                }).unwrap_or_default();
                 let text = c["text"].as_str().map(|s| s.to_string());
                 Chunk {
                     id: i,
@@ -470,7 +482,7 @@ impl RagBase {
         for (s, &d) in &self.index { dim2syl.insert(d, s.as_str()); }
         // dimensões presentes no chunk (= as que podem convergir no cosseno)
         let chunk_dims: std::collections::HashSet<usize> = self.chunks.get(cid)
-            .map(|c| c.vec.keys().copied().collect()).unwrap_or_default();
+            .map(|c| c.vec.iter().map(|&(d, _)| d as usize).collect()).unwrap_or_default();
         // histograma da query (contagem por dimensão) + flag de convergência
         let lower = query.to_lowercase();
         let mut qc: HashMap<usize, u32> = HashMap::new();
@@ -487,7 +499,7 @@ impl RagBase {
             "hit": chunk_dims.contains(d),   // dim também no chunk → contribui pro cosseno
         })).collect();
         let chunk: Vec<Value> = self.chunks.get(cid)
-            .map(|ch| ch.vec.iter().map(|(d, v)| json!({"dim": d, "c": *v})).collect())
+            .map(|ch| ch.vec.iter().map(|&(d, v)| json!({"dim": d as usize, "c": v})).collect())
             .unwrap_or_default();
 
         // matched filter: query deslizando sobre a sequência de sílabas do chunk
@@ -578,7 +590,8 @@ pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionP
         let mut bt: Vec<HashMap<usize, u32>> = Vec::with_capacity(base.chunks.len());
         for ch in &base.chunks {
             let mut tf: HashMap<usize, u32> = HashMap::with_capacity(ch.vec.len());
-            for (&ld, &cnt) in &ch.vec {
+            for &(ld, cnt) in &ch.vec {
+                let ld = ld as usize;
                 if ld < m.len() { tf.insert(m[ld], cnt as u32); }
             }
             flat.push(tf.clone());
@@ -642,9 +655,12 @@ pub fn weighting_unified(qt: &QueryTerms, p: &CollectionProfile) -> Vec<f64> {
 pub fn cosine_unified(qvec: &HashMap<usize, f64>, qnorm: f64, chunk: &Chunk, remap: &[usize], unorm: f64) -> f64 {
     if unorm == 0.0 { return 0.0; }
     let mut dot = 0.0;
-    for (&ld, &cnt) in &chunk.vec {
+    // [#42] este caminho NAO pode iterar a query: ela vive em dims GLOBAIS e o chunk em
+    // dims LOCAIS. Segue chunk-driven, remapeando cada par e sondando a query no hash.
+    for &(ld, cnt) in &chunk.vec {
+        let ld = ld as usize;
         if ld >= remap.len() { continue; }
-        if let Some(&wq) = qvec.get(&remap[ld]) { dot += wq * cnt; }
+        if let Some(&wq) = qvec.get(&remap[ld]) { dot += wq * cnt as f64; }
     }
     dot / (qnorm * unorm)
 }
@@ -657,7 +673,7 @@ mod tests {
             vocab.iter().enumerate().map(|(i, s)| (s.to_string(), i)).collect();
         let chunks: Vec<Chunk> = chunks.iter().enumerate().map(|(i, dims)| Chunk {
             id: i, start: 0, len: 0, tokens: 0, oov: 0,
-            vec: dims.iter().map(|&d| (d, 1.0)).collect(),
+            vec: { let mut v: SparseVec = dims.iter().map(|&d| (d as u32, 1.0_f32)).collect(); v.sort_unstable_by_key(|&(d, _)| d); v },
             norm: 1.0, text: None, words: Vec::new(),
         }).collect();
         let n = chunks.len();

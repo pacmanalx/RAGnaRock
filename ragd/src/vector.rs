@@ -38,6 +38,15 @@ pub fn compute_idf(tfs: &[HashMap<usize, u32>], n_docs: usize) -> HashMap<usize,
     df.into_iter().map(|(d, dfd)| (d, ((n + 1.0) / dfd as f64).ln())).collect()
 }
 
+/// [#42] Vetor esparso do chunk: pares `(dim, contagem)` ORDENADOS por dim.
+///
+/// Substitui `HashMap<usize, f64>`. Medido em 335 livros / 123.547 chunks: o índice de
+/// recall inteiro custava ~19× o JSON em disco, quase tudo overhead por entrada de hash
+/// (alocação de heap, load-factor, 8 bytes de chave). Aqui cada entrada são 8 bytes
+/// contíguos — `u32` cobre o vocabulário com folga e a contagem é inteira, exata em `f32`
+/// até 2^24 (o maior tf real do corpus é da ordem de centenas).
+pub type SparseVec = Vec<(u32, f32)>;
+
 /// Norma L2 do vetor tf-idf (peso = count*idf). 0 -> 1.0 (igual ao Python).
 pub fn tfidf_norm(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> f64 {
     let mut s = 0.0;
@@ -61,11 +70,19 @@ pub fn tfidf_norm(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> f64 {
 /// no tf cru do chunk. Caminho quente intocado e formato do JSON preservado.
 ///
 /// `qw2` = tf_q ⊙ idf²  ·  `qn` = ‖tf_q ⊙ idf‖  ·  `ctf` = tf_c cru  ·  `cn` = ‖tf_c ⊙ idf‖
-pub fn cosine_tfidf(qw2: &HashMap<usize, f64>, qn: f64, ctf: &HashMap<usize, f64>, cn: f64) -> f64 {
-    let (small, big) = if qw2.len() > ctf.len() { (ctf, qw2) } else { (qw2, ctf) };
-    let mut dot = 0.0;
-    for (d, v) in small {
-        if let Some(w) = big.get(d) { dot += v * w; }
+///
+/// [#42] O chunk guarda `SparseVec` (pares ORDENADOS por dim). A query tem poucas dims e o
+/// chunk tem centenas, então iteramos a QUERY e caçamos por busca binária — O(q·log c) em
+/// memória contígua, em vez de sondar hash por entrada. O acumulador é `f64` de propósito:
+/// a contagem é inteira (exata em f32 até 2^24), então manter o dot em f64 deixa o ranking
+/// bit-a-bit igual ao do `HashMap<usize,f64>` — qualquer divergência vira sinal de bug.
+pub fn cosine_tfidf(qw2: &HashMap<usize, f64>, qn: f64, ctf: &SparseVec, cn: f64) -> f64 {
+    let mut dot = 0.0_f64;
+    for (&d, &v) in qw2 {
+        let key = d as u32;
+        if let Ok(i) = ctf.binary_search_by_key(&key, |&(dim, _)| dim) {
+            dot += v * ctf[i].1 as f64;
+        }
     }
     dot / (qn * cn)
 }
@@ -99,8 +116,11 @@ mod tests {
     }
 
     fn tf(pairs: &[(usize, u32)]) -> HashMap<usize, u32> { pairs.iter().copied().collect() }
-    fn cnt(pairs: &[(usize, u32)]) -> HashMap<usize, f64> {
-        pairs.iter().map(|&(d, c)| (d, c as f64)).collect()
+    /// [#42] vetor do chunk no formato empacotado: pares ordenados por dim.
+    fn cnt(pairs: &[(usize, u32)]) -> SparseVec {
+        let mut v: SparseVec = pairs.iter().map(|&(d, c)| (d as u32, c as f32)).collect();
+        v.sort_unstable_by_key(|&(d, _)| d);
+        v
     }
 
     /// O invariante que faltava: query IGUAL ao chunk tem de dar cosseno EXATAMENTE 1.
