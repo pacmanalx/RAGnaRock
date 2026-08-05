@@ -137,6 +137,12 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
 
 1. **Recall (sparse tf-idf cosine):** tokenize the query into syllables → tf vector weighted by `idf` →
    cosine against each chunk (iterate the smaller vector; only shared dims count). Take the `recall_n` candidates.
+   A chunk's `vec` holds **raw counts** while its `norm` is the **tf-idf** norm — different scales. To make
+   the cosine close over `[0,1]`, `ragd` folds the `idf` **twice** on the query side, via the identity
+   `Σ (tf_q·idf)(tf_c·idf) = Σ (tf_q·idf²)·tf_c`: the extra weight is free (computed once per search) and
+   the hot path still dots against raw `tf`. **The `python_concept`/`rust_concept` PoCs still use the old
+   scheme** (query tf-idf × raw chunk tf over a tf-idf norm), which is not a cosine and exceeds 1 — the
+   JSONs remain interchangeable field by field, but **rankings diverge** as of 2026-08-05.
 2. **Rerank (proximity phonetic matched filter):** over the candidates, measure the **smallest window**
    that covers a match of each query word (proximity), **ignoring monosyllables** (stopwords), with optional
    soundex (`phonetic`). Score combines coverage + proximity. Returns top-`k`.

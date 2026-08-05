@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use rayon::prelude::*;
 use crate::tokenizer::{normalize, syllabify, words};
-use crate::vector::cosine;
+use crate::vector::cosine_tfidf;
 use crate::chunk::find_chars;
 
 const PROX_SCALE: f64 = 8.0;
@@ -320,14 +320,18 @@ impl RagBase {
                 }
             }
         }
-        let mut qvec: HashMap<usize, f64> = HashMap::new();
+        // O chunk guarda tf CRU e norma tf-idf. Pra fechar o cosseno de verdade, a query sai
+        // daqui com o idf DOBRADO (tf_q·idf²): `Σ (tf_q·idf)(tf_c·idf) = Σ (tf_q·idf²)·tf_c`.
+        // A NORMA continua sendo a do vetor tf-idf honesto (‖tf_q·idf‖) — ver `cosine_tfidf`.
+        let mut qw2: HashMap<usize, f64> = HashMap::new();
+        let mut s = 0.0;
         for (d, c) in &tf {
-            let w = *c as f64 * self.idf.get(d).copied().unwrap_or(0.0);
-            if w != 0.0 { qvec.insert(*d, w); }
+            let idf = self.idf.get(d).copied().unwrap_or(0.0);
+            let w = *c as f64 * idf;
+            if w != 0.0 { qw2.insert(*d, w * idf); s += w * w; }
         }
-        let s: f64 = qvec.values().map(|v| v * v).sum();
         let qnorm = if s == 0.0 { 1.0 } else { s.sqrt() };
-        (qvec, qnorm, syls, oov)
+        (qw2, qnorm, syls, oov)
     }
 
     pub fn search(&self, query: &str, k: usize, rerank: bool, recall_n: usize, phonetic: bool, weights: Option<&[f64]>) -> (Vec<Hit>, Info) {
@@ -339,7 +343,7 @@ impl RagBase {
         // recall (estágio 1): cosseno em todos os chunks. Paraleliza com rayon só em
         // base grande — em base pequena o overhead de fan-out não compensa.
         let score_one = |cid: usize, c: &Chunk| -> Option<(f64, usize)> {
-            let s = cosine(&qvec, qnorm, &c.vec, c.norm);
+            let s = cosine_tfidf(&qvec, qnorm, &c.vec, c.norm);
             if s > 0.0 { Some((s, cid)) } else { None }
         };
         let mut scored: Vec<(f64, usize)> = if self.chunks.len() >= PAR_RECALL_MIN {
@@ -604,14 +608,17 @@ pub fn query_vec_unified(query: &str, p: &CollectionProfile) -> (HashMap<usize, 
             if let Some(&gd) = p.uvocab.get(&ns) { *tf.entry(gd).or_insert(0) += 1; }
         }
     }
-    let mut qvec: HashMap<usize, f64> = HashMap::new();
+    // Mesmo esquema do `query_vec`: idf DOBRADO no lado da query (aqui o uidf, da coleção),
+    // porque o chunk entra no dot com tf cru e o denominador é a norma tf-idf unificada.
+    let mut qw2: HashMap<usize, f64> = HashMap::new();
     let mut sum = 0.0;
     for (&gd, &c) in &tf {
-        let w = c as f64 * p.uidf.get(&gd).copied().unwrap_or(0.0);
-        if w != 0.0 { qvec.insert(gd, w); sum += w * w; }
+        let uidf = p.uidf.get(&gd).copied().unwrap_or(0.0);
+        let w = c as f64 * uidf;
+        if w != 0.0 { qw2.insert(gd, w * uidf); sum += w * w; }
     }
     let qnorm = sum.sqrt();
-    (qvec, if qnorm == 0.0 { 1.0 } else { qnorm })
+    (qw2, if qnorm == 0.0 { 1.0 } else { qnorm })
 }
 
 /// Peso por termo na escala da COLEÇÃO (uidf) — mesma fórmula do `term_weights` local, só que
@@ -629,8 +636,9 @@ pub fn weighting_unified(qt: &QueryTerms, p: &CollectionProfile) -> Vec<f64> {
 }
 
 /// Cosseno de um chunk (vec em dims LOCAIS) contra a query (espaço GLOBAL), remapeando
-/// on-the-fly via `remap` + idf unificado. Replica o esquema do `cosine` atual: dot da
-/// query tf-idf com o tf cru do chunk, sobre qnorm × norma tf-idf unificada do chunk.
+/// on-the-fly via `remap` + idf unificado. Mesmo esquema do `cosine_tfidf`: o `qvec` chega
+/// com o uidf DOBRADO (tf_q·uidf², de `query_vec_unified`) e bate no tf CRU do chunk, sobre
+/// qnorm (‖tf_q·uidf‖) × norma tf-idf unificada do chunk. Assim o cosseno fecha em [0,1].
 pub fn cosine_unified(qvec: &HashMap<usize, f64>, qnorm: f64, chunk: &Chunk, remap: &[usize], unorm: f64) -> f64 {
     if unorm == 0.0 { return 0.0; }
     let mut dot = 0.0;
@@ -682,10 +690,11 @@ mod tests {
         bases.insert("b".to_string(), mk_base(&["do", "ga"], &[&[0, 1]]));
         let p = build_collection_profile(&bases);
         let g_do = p.uvocab["do"];
-        // query (espaço global) = só "do"
+        // query (espaço global) = só "do". Contrato do `cosine_unified`: o vetor entra com o
+        // uidf DOBRADO (tf·uidf²) e a norma é a do vetor tf-idf honesto (‖tf·uidf‖).
         let qw = p.uidf[&g_do];
         let mut qvec = HashMap::new();
-        qvec.insert(g_do, qw);
+        qvec.insert(g_do, qw * qw);
         let qnorm = qw.abs().max(1e-12);
         // chunk de "b" tem "do" no dim LOCAL 0 → remapeado casa a query global
         let s_b = cosine_unified(&qvec, qnorm, &bases["b"].chunks[0], &p.remap["b"], p.unorms["b"][0]);

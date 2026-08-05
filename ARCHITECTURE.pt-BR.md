@@ -135,6 +135,12 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
 
 1. **Recall (cosseno tf-idf esparso):** tokeniza a query em sílabas → vetor tf ponderado por `idf` →
    cosseno contra cada chunk (itera o vetor menor; só dims em comum contam). Pega os `recall_n` candidatos.
+   O `vec` do chunk guarda **contagem crua** e sua `norm` é a do vetor **tf-idf** — escalas diferentes.
+   Para o cosseno fechar em `[0,1]`, o `ragd` dobra o `idf` no lado da **query**, usando a identidade
+   `Σ (tf_q·idf)(tf_c·idf) = Σ (tf_q·idf²)·tf_c`: o peso extra sai de graça (calculado uma vez por busca)
+   e o caminho quente segue batendo no `tf` cru. **As PoCs `python_concept`/`rust_concept` ainda usam o
+   esquema antigo** (tf-idf da query × tf cru, sobre norma tf-idf), que não é cosseno e passa de 1 —
+   os JSONs seguem intercambiáveis campo a campo, mas os **rankings divergem** a partir de 05/ago/2026.
 2. **Rerank (matched filter fonético por proximidade):** sobre os candidatos, mede a **menor janela**
    que cobre um casamento de cada palavra da query (proximidade), **ignorando monossílabos** (stopwords),
    com soundex opcional (`phonetic`). Score combina cobertura + proximidade. Devolve top-`k`.
