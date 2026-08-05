@@ -48,7 +48,8 @@ Referência **formal** das APIs HTTP/JSON dos três daemons. Para **exemplos exe
   "rerank": true,       // estágio 2 (proximidade); false = só recall (default true)
   "recall_n": 20,       // candidatos do recall por base que vão ao rerank (default 20)
   "phonetic": false,    // casa por SOM (SOUNDEX): "Aslan" acha "Aslam" (default false)
-  "unified": false      // [#8] usa o vocab+idf unificado da COLEÇÃO (idf de repo); cross-linguagem; default false
+  "unified": true       // [#8] vocab+idf unificado da COLEÇÃO (idf de repo); cross-linguagem.
+                        // DEFAULT quando o escopo tem coleção com >1 base; passe false pra forçar idf local
 }
 ```
 **Response:**

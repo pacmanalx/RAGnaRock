@@ -2270,18 +2270,25 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
             coll_pat.unwrap_or("*"))}).to_string());
     }
 
-    // [#8] modo unificado por coleção (opt-in via body.unified): vocab+idf de repo, em cache,
-    // auto-invalidado por fingerprint (nº bases, total chunks). Sem ele, recall local de sempre.
-    let unified = v["unified"].as_bool().unwrap_or(false);
     // [#5] PESO unificado no rerank: coleção com >1 base NO ESCOPO ganha perfil (idf de coleção,
     // cacheado por fingerprint) pra que o peso por termo use a escala da COLEÇÃO — termo ausente
     // numa base não some do denominador (corrige o "1.0 falso" per-arquivo) e a escala fica
     // consistente entre bases. Busca de 1 base usa peso local (fallback no finish). O recall
-    // unificado (opt-in) reusa o mesmo perfil.
+    // unificado reusa o mesmo perfil.
     let mut scope_count: HashMap<&str, usize> = HashMap::new();
     for (c, _) in &pairs { *scope_count.entry(c.as_str()).or_insert(0) += 1; }
     let build_colls: Vec<String> = scope_count.iter()
         .filter(|(_, n)| **n > 1).map(|(c, _)| c.to_string()).collect();
+    // [#8] RECALL unificado por coleção: vocab+idf da coleção, em cache auto-invalidado por
+    // fingerprint (nº bases, total chunks).
+    //
+    // DEFAULT desde 05/ago/2026 (era opt-in). Sem ele cada base pontua na SUA escala de raridade
+    // e o merge cross-base compara números incomparáveis: "whale" abandonava Moby Dick — onde a
+    // sílaba é comum, idf 0,038 — e subia em obras onde é rara (Mabinogion, 0,471). Medido em
+    // 335 livros, identificação da obra certa no top-1: 45% local → 65% unificado, +17ms no p50
+    // e +0,5 GB de perfil cacheado. Ligado só quando há coleção com >1 base no escopo — busca de
+    // base única não tem o que unificar. Opt-out explícito com "unified": false.
+    let unified = v["unified"].as_bool().unwrap_or(!build_colls.is_empty());
     // [#6] check fingerprint sob READ primeiro (N searches paralelas não esperam aqui); só pega
     // WRITE rapidinho se precisa rebuild — minimiza tempo de exclusão.
     let stale: Vec<String> = {

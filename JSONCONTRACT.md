@@ -49,7 +49,8 @@ specification; that one is the tutorial.
   "rerank": true,       // stage 2 (proximity); false = recall only (default true)
   "recall_n": 20,       // recall candidates per base sent to rerank (default 20)
   "phonetic": false,    // match by SOUND (SOUNDEX): "Aslan" finds "Aslam" (default false)
-  "unified": false      // [#8] use the COLLECTION-unified vocab+idf (repo idf); cross-language; default false
+  "unified": true       // [#8] COLLECTION-unified vocab+idf (repo idf); cross-language.
+                        // DEFAULT when the scope has a collection with >1 base; pass false to force local idf
 }
 ```
 **Response:**

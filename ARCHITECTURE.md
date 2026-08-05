@@ -152,12 +152,18 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
   to 4). Applied **only to terms of ≤3 syllables** (names/spelling variants: `"Aslan"`→`"Aslam"`); long terms
   discriminate by their own syllable sequence (avoids false matches like `ressurreição`~`rigorosa`).
   Computed **once per query** (not per candidate). It is a `ragd` feature — it does not exist in the frozen PoCs.
-- **Collection-unified recall (`unified:true`, opt-in — [#8]):** instead of each base's local idf, the recall
+- **Collection-unified recall (`unified`, DEFAULT when the scope has a collection with >1 base — [#8]):** instead of each base's local idf, the recall
   runs in a per-collection **unified space** — a `CollectionProfile` (vocab merged from the bases' drivers +
   idf recomputed over the whole collection = "repo idf"), built in memory and cached, auto-invalidated by a
   fingerprint `(n_bases, total_chunks)`. Each chunk's `vec` is remapped local→global on the fly. Lets a query
   match across **files of different languages** (e.g. Python + Rust in the same collection) with a
-  discriminative repo idf. Default **off** (per-request flag); the rerank stage is unchanged.
+  discriminative repo idf. The rerank stage is unchanged.
+  **Became the default on 2026-08-05.** Without it each base scores on its own rarity scale and the
+  cross-base merge compares incomparable numbers: measured over 335 books, `"whale"` abandoned Moby Dick —
+  where the syllable is common (idf 0.038) — and rose in works where it is rare (Mabinogion, 0.471).
+  Correct-work identification at top-1: **45% local → 65% unified**, costing +17 ms p50 and +0.5 GB of
+  cached profile. Enabled only when a collection has **>1 base in scope** (a single base has nothing to
+  unify); explicit opt-out with `"unified": false`.
 - **Scatter-gather:** `/search` resolves the scope (`collection` + wildcard on `base`: `"sda"`, `"sd*"`,
   `"*"`), searches each matching base (parallelized with rayon when there's >1 base) and **merges by matchpoint**.
 - **Hit:** `{ collection, base, corpus, path, chunk, matchpoint, mf, span, cos, start, snippet }` — the
