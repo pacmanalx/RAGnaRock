@@ -2180,12 +2180,49 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
     let prof = rag::build_collection_profile(inner);
     let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
     for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
-    let mut uidfs: Vec<(usize, f64)> = prof.uidf.iter().map(|(&d, &v)| (d, v)).collect();
-    // idf desc + desempate estável por dim asc (mesma razão do modo base: top_uidf reproduzível).
-    uidfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-    let top: Vec<(usize, f64)> = uidfs.into_iter().take(top_n).collect();
-    let top_uidf: Vec<Value> = top.iter().map(|&(d, v)| {
-        json!({"dim": d, "syllable": udim2syl.get(&d).copied().unwrap_or("?"), "uidf": v})
+
+    // df (nº de chunks que contêm a dim) e freq (contagem total) por dim GLOBAL — o insumo
+    // que faltava pro ranking idf×freq (#46). Uma passada por todos os chunks, remapeando
+    // dim local → global. O `uidf` sozinho só conhece raridade (empata todo hapax no idf
+    // máximo); com df/freq o RootIndex separa "sílaba que CARACTERIZA o corpus" de "outlier
+    // de OCR visto 1×". Barato: mesma varredura que o base_vectors já fazia, feita uma vez.
+    let mut udf: HashMap<usize, u64> = HashMap::new();
+    let mut ufreq: HashMap<usize, u64> = HashMap::new();
+    for (name, base) in inner.iter() {
+        let m = prof.remap.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+        for ch in &base.chunks {
+            for &(ld, cnt) in &ch.vec {
+                let ld = ld as usize;
+                if ld < m.len() {
+                    let gd = m[ld];
+                    *udf.entry(gd).or_insert(0) += 1;
+                    *ufreq.entry(gd).or_insert(0) += cnt as u64;
+                }
+            }
+        }
+    }
+
+    // ranking do top: `rank=uidf` (default, retrocompatível) ou `rank=idffreq` (uidf × freq,
+    // #46). `min_freq` opcional corta hapax de baixa contagem ANTES do take. O nome da chave
+    // de saída segue `top_uidf` (consumidores existentes — aba #30) — é aditivo: cada entrada
+    // ganha `df` e `freq`, e a ordem pode ser reordenada por idf×freq quando pedido.
+    let rank = query_param(query, "rank").unwrap_or_else(|| "uidf".to_string());
+    let min_freq: u64 = query_param(query, "min_freq").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut scored: Vec<(usize, f64)> = prof.uidf.iter()
+        .filter(|(d, _)| ufreq.get(d).copied().unwrap_or(0) >= min_freq)
+        .map(|(&d, &v)| {
+            let s = if rank == "idffreq" { v * ufreq.get(&d).copied().unwrap_or(0) as f64 } else { v };
+            (d, s)
+        }).collect();
+    // score desc + desempate estável por dim asc (top reproduzível: uidf vem de HashMap, cuja
+    // ordem de iteração não é determinística, e muitos raros empatam no score).
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    let top: Vec<(usize, f64)> = scored.into_iter().take(top_n).collect();
+    let top_uidf: Vec<Value> = top.iter().map(|&(d, _)| {
+        json!({"dim": d, "syllable": udim2syl.get(&d).copied().unwrap_or("?"),
+               "uidf": prof.uidf.get(&d).copied().unwrap_or(0.0),
+               "df": udf.get(&d).copied().unwrap_or(0),
+               "freq": ufreq.get(&d).copied().unwrap_or(0)})
     }).collect();
     let total_chunks: usize = inner.values().map(|b| b.n_chunks).sum();
     let mut resp = json!({
@@ -2193,6 +2230,7 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
         "collection": coll,
         "bases": inner.len(), "chunks": total_chunks,
         "unified_vocab_size": prof.uvocab.len(),
+        "rank": rank, "min_freq": min_freq,
         "top_uidf": top_uidf,
     });
     // dims-por-base (heatmap/dendrograma): só quando pedido (&vectors=1). Pra cada base, o
