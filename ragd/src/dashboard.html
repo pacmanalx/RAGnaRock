@@ -968,8 +968,10 @@ const NV_CHARTS=[
    desc:'Intensidade de cada sílaba saliente por base (tf-idf normalizado por base). Mostra qual léxico acende em qual obra. (dims-por-base)'},
   {k:'dend',ic:'⑃',name:'Dendrograma de bases',perColl:true,ready:true,
    desc:'Parentesco lexical: agrupa as bases por cosseno no subespaço das sílabas salientes (UPGMA). As obras-irmãs caem no mesmo galho. (dims-por-base)'},
+  {k:'cache',ic:'🔁',name:'CacheDigest',perColl:false,ready:true,
+   desc:'Digest do cache de expansão de query (query→variantes), GLOBAL. O 3º pilar do nível 0 — o que a expansão por IA já aprendeu. (CacheDigest, #48)'},
 ];
-let _nidk=[], _nvActive='cloud', _nvLevel=0;
+let _nidk=[], _nvActive='cloud', _nvLevel=0, _nvcache=null;
 // O que CADA nível ≥1 oferecerá (esqueleto rodando; funcionalidades nas issues #22→#24).
 const NV_LVL_FEATURES={
   1:['Resumo destilado por coleção (sobrevive à deleção da coleção)','Insights de conteúdo — colecionáveis soltos (personagens, locais, eventos)','Cartões de conhecimento consultáveis'],
@@ -989,17 +991,25 @@ async function loadNidViz(){
   $('#nv-tabs').style.display=isL0?'flex':'none';
   $('#nv-pick').style.display=isL0?'':'none';
   if(!isL0){
+    // Nível 1 (consciente) JÁ IMPLEMENTADO (#22): renderiza o Summary destilado por coleção.
+    if(_nvLevel===1){
+      let s=null; try{s=await jget('/api/nidhogg/summary')}catch(e){}
+      $('#nv-future').innerHTML=renderSummaries(s);
+      return;
+    }
+    // Níveis 2/3: ainda esqueleto — placeholder que puxa a implementação.
     const feats=NV_LVL_FEATURES[_nvLevel]||[];
     $('#nv-future').innerHTML=`<h2 style="color:var(--warn)">🚧 Nível ${lv.n} · ${esc(lv.name)} — ainda não implementado</h2>
       <p class="muted" style="margin:0 0 12px">${esc(lv.desc)}</p>
       <p class="muted" style="margin:0 0 6px">Quando ligado, este nível vai oferecer:</p>
       <div class="dlist" style="min-height:0;max-height:none">${feats.map(f=>`<div class="dcard" style="cursor:default"><span>• ${esc(f)}</span></div>`).join('')}</div>
-      <p class="muted" style="margin-top:14px;font-size:11px">🧠 Consome IA (tokens) a cada ciclo. O esqueleto do worm já roda; as funcionalidades entram nas issues #22→#24. A tela já existe pra puxar a implementação. 🪨</p>`;
+      <p class="muted" style="margin-top:14px;font-size:11px">🧠 Consome IA (tokens) a cada ciclo. O esqueleto do worm já roda; as funcionalidades entram nas issues #23→#24. A tela já existe pra puxar a implementação. 🪨</p>`;
     return;
   }
   // Nível 0: busca o conhecimento UMA vez e alimenta o painel destilado + a galeria.
   let d=null; try{d=await jget('/api/nidhogg/knowledge')}catch(e){}
   loadNidKnowledge(d);
+  try{_nvcache=await jget('/api/nidhogg/cachedigest')}catch(e){_nvcache=null;}   // 3º pilar (global)
   _nidk=((d&&d.collections)||[]).filter(c=>c.knowledge&&c.knowledge.length).map(c=>{
     const dict=(c.knowledge||[]).find(k=>k.type==='CorpusDict');
     const root=(c.knowledge||[]).find(k=>k.type==='RootIndex');
@@ -1023,12 +1033,49 @@ function renderNidViz(){
   $('#nv-desc').textContent=ch.desc;
   $('#nv-pick').style.display=ch.perColl?'':'none';
   const st=$('#nv-stage');
+  if(ch.k==='cache'){ mountStage(vizCache()); return; }   // GLOBAL — independe de _nidk
   if(!_nidk.length){st.innerHTML='<span class="muted">nada destilado ainda — ligue uma coleção no Nidhogg e aguarde a cadência.</span>';return;}
   if(!ch.ready){st.innerHTML=vizLocked(ch);return;}
   const coll=$('#nv-coll').value||_nidk[0].collection;
   const html = ch.k==='cloud'?vizCloud(coll) : ch.k==='sun'?vizSunburst() : ch.k==='tree'?vizTreemap(coll)
              : ch.k==='scat'?vizScatter() : ch.k==='heat'?vizHeatmap(coll) : ch.k==='dend'?vizDendro(coll) : vizLocked(ch);
   mountStage(html);
+}
+// [#48] CacheDigest — tabela query→variantes do cache de expansão (global, engine-wide).
+function vizCache(){
+  const d=_nvcache; if(!d||!d.content) return '<span class="muted">CacheDigest ainda não gerado — force um ciclo do Nidhogg.</span>';
+  const c=d.content, es=c.entries||[];
+  if(!es.length) return `<div class="dcard" style="cursor:default"><span class="muted">Cache de expansão VAZIO — nenhuma query furou os dicionários ainda. O digest enche conforme o <code>/search_expand</code> aciona o LLM em query rara.</span></div>`;
+  const rows=es.map(e=>`<tr>
+      <td style="padding:5px 10px;font-weight:bold;color:#58a6ff;vertical-align:top;white-space:nowrap;border-bottom:1px solid #21262d">${esc(e.query)}</td>
+      <td style="padding:5px 10px;color:#c9d1d9;border-bottom:1px solid #21262d">${(e.variants||[]).map(v=>esc(v)).join('  ·  ')}</td></tr>`).join('');
+  return `<div style="width:100%">
+    <p class="muted" style="margin:0 0 8px">${c.n_queries} query(s) · ${c.n_variants_total} variantes · média ${(+c.avg_variants).toFixed(1)}/query · <b>GLOBAL</b> (o cache é engine-wide, não por-coleção)</p>
+    <div style="overflow:auto;max-height:60vh"><table style="width:100%;border-collapse:collapse;font-size:13px;font:13px var(--mono,monospace)">
+      <tr><th style="text-align:left;padding:5px 10px;border-bottom:1px solid #30363d;color:#7d8590">query</th><th style="text-align:left;padding:5px 10px;border-bottom:1px solid #30363d;color:#7d8590">variantes (via IA / dicionário)</th></tr>
+      ${rows}</table></div>
+    <p class="muted" style="font-size:11px;margin-top:8px">${esc(c.note||'')}</p></div>`;
+}
+// [#22] Summary do nível 1 — cards por coleção com abstract/themes/entities/key_points.
+function renderSummaries(s){
+  const arr=(s&&s.summaries)||[];
+  const chip=x=>`<span style="display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:11px;padding:1px 9px;margin:2px 3px 2px 0;font-size:12px;color:#c9d1d9">${esc(x)}</span>`;
+  if(!arr.length) return `<h2 style="color:var(--warn)">🧠 Nível 1 · consciente</h2>
+    <p class="muted">Nenhum Summary destilado ainda — habilite uma coleção e force um ciclo (ou aguarde a cadência). Consome IA (o LLM da frota).</p>`;
+  return `<h2 style="color:var(--accent,#58a6ff)">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
+    <p class="muted" style="margin:0 0 12px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede.</p>`+
+    arr.map(it=>{
+      const s=it.summary||{}, c=s.content||{}, p=s.provenance||{};
+      const head=`<div><b style="font-size:15px;color:#e6edf3">${esc(it.collection)}</b> <span class="muted" style="font-size:11px">· via ${esc(p.via||'?')} · ${p.sampled_docs||0} docs amostrados · ${esc(s.updated||'')}</span></div>`;
+      if(c.raw) return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:6px;cursor:default">${head}<pre style="white-space:pre-wrap;margin:0;font-size:12px;color:#c9d1d9">${esc(c.raw)}</pre></div>`;
+      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">
+        ${head}
+        <p style="margin:0;line-height:1.5">${esc(c.abstract||'')}</p>
+        ${(c.themes||[]).length?`<div><span class="muted" style="font-size:12px">Temas:</span> ${(c.themes||[]).map(chip).join('')}</div>`:''}
+        ${(c.entities||[]).length?`<div><span class="muted" style="font-size:12px">Entidades:</span> ${(c.entities||[]).map(chip).join('')}</div>`:''}
+        ${(c.key_points||[]).length?`<div><span class="muted" style="font-size:12px">Pontos-chave:</span><ul style="margin:4px 0 0;padding-left:20px">${(c.key_points||[]).map(k=>`<li style="margin:2px 0">${esc(k)}</li>`).join('')}</ul></div>`:''}
+      </div>`;
+    }).join('');
 }
 // helpers de cor/geometria
 function nvLerp(a,b,t){t=Math.max(0,Math.min(1,t));
