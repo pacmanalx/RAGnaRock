@@ -377,24 +377,27 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
     let source_hash = collection_source_hash(&bases);
     let total_chunks: u64 = bases.iter().map(|b| b["n_chunks"].as_u64().unwrap_or(0)).sum();
 
-    // 2) /profile?collection — vocabulário unificado + sílabas salientes (top_uidf).
-    let prof: Value = serde_json::from_str(&http_get_t(&format!("{api}/profile?collection={coll}&top=40&vectors=1"), 30)?).ok()?;
+    // 2) /profile?collection — vocabulário unificado + sílabas salientes (top por idf×freq).
+    // rank=idffreq (#46): o /profile rankeia as dims por uidf×freq e expõe df/freq por dim.
+    // Sem isso o top saía como caça-ao-hapax (só sílabas df=1, uidf máximo empatado).
+    let prof: Value = serde_json::from_str(&http_get_t(&format!("{api}/profile?collection={coll}&top=40&vectors=1&rank=idffreq"), 30)?).ok()?;
     let salient = prof["top_uidf"].as_array().cloned().unwrap_or_default();
     let unified_vocab = prof["unified_vocab_size"].as_u64().unwrap_or(0);
     // dims-por-base (heatmap/dendrograma): vetor tf-idf de cada base nas dims salientes,
-    // alinhado 1:1 com `salient` (top_uidf). Vem do /profile&vectors=1.
+    // alinhado 1:1 com `salient`. Com rank=idffreq as dims salientes deixam de ser hapax
+    // (peso ~0 por base) e o base_vectors ganha sinal real (#47). Vem do /profile&vectors=1.
     let base_vectors = prof["base_vectors"].as_array().cloned().unwrap_or_default();
 
-    // Pilar 1 — RootIndex: as sílabas/dims mais salientes (rankeadas por uidf). É a
-    // IDENTIDADE LÉXICA da coleção: o que a distingue das outras.
+    // Pilar 1 — RootIndex: as sílabas/dims mais salientes (rankeadas por idf×freq). É a
+    // IDENTIDADE LÉXICA da coleção: o que a distingue das outras — distintivo E recorrente.
     let root_index = json!({
         "type": "RootIndex", "level": 0,
         "content": {
             "bases_count": bases.len(),
             "total_chunks": total_chunks,
             "unified_vocab_size": unified_vocab,
-            "salient_roots": salient,   // [{dim, syllable, uidf}], ordenado por uidf desc
-            "note": "agrupamento por raiz (stem) e ranking idf×freq são [FUTURO]: o /profile expõe uidf, não df/freq por dim"
+            "salient_roots": salient,   // [{dim, syllable, uidf, df, freq}], ordenado por idf×freq desc
+            "note": "ranking idf×freq ATIVO (#46): privilegia sílaba distintiva E recorrente, não o hapax de OCR. Agrupamento por raiz (stem) segue [FUTURO]."
         }
     });
 
@@ -409,8 +412,8 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
         "content": {
             "unified_vocab_size": unified_vocab,
             "bases": per_base,
-            "base_vectors": base_vectors,   // [{name,corpus,n_chunks,vec[]}] alinhado às dims salientes (heatmap/dendrograma)
-            "note": "base_vectors = tf-idf por base nas dims salientes (alinhado ao salient_roots). vocab completo por base e oov ainda [FUTURO]"
+            "base_vectors": base_vectors,   // [{name,corpus,n_chunks,vec[]}] alinhado 1:1 às dims salientes (heatmap/dendrograma)
+            "note": "base_vectors = tf-idf por base nas dims salientes, alinhado 1:1 ao salient_roots (#47 ok pós-#46: com idf×freq as dims salientes são recorrentes, não hapax, então o vec tem sinal). vocab completo por base e oov ainda [FUTURO]"
         }
     });
 
