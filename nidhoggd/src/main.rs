@@ -350,6 +350,35 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         (Method::Get, "/api/nidhogg/cachedigest") => { let s = st.lock().unwrap(); (200, read_cachedigest(&s.dir).to_string()) }
         // [#22] Summary — nível 1 (consciente), o resumo destilado por IA.
         (Method::Get, "/api/nidhogg/summary") => { let s = st.lock().unwrap(); (200, summary_query(&s, query).to_string()) }
+        // [prompts] biblioteca de prompts nomeados — o que/como cada nível/coleção extrai.
+        (Method::Get, "/api/nidhogg/prompts") => { let s = st.lock().unwrap(); (200, read_prompts(&s.dir).to_string()) }
+        (Method::Post, "/api/nidhogg/prompts/template") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let name = match v["name"].as_str() { Some(n) if !n.trim().is_empty() => n.trim().to_string(), _ => return (400, json!({"error":"falta 'name'"}).to_string()) };
+            let system = v["system"].as_str().unwrap_or("").to_string();
+            if system.trim().is_empty() { return (400, json!({"error":"falta 'system'"}).to_string()); }
+            if system.chars().count() > PROMPT_MAX_CHARS { return (400, json!({"error":format!("system excede {PROMPT_MAX_CHARS} caracteres")}).to_string()); }
+            let desc = v["description"].as_str().unwrap_or("").to_string();
+            let dir = { st.lock().unwrap().dir.clone() };
+            let mut lib = read_prompts(&dir);
+            lib["templates"][name.as_str()] = json!({"description": desc, "system": system, "updated": now_stamp()});
+            write_prompts(&dir, &lib);
+            nlog(&format!("prompt template {name:?} salvo ({} chars)", system.chars().count()));
+            (200, json!({"ok":true,"template":name}).to_string())
+        }
+        (Method::Post, "/api/nidhogg/prompts/assign") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let template = match v["template"].as_str() { Some(t) if !t.is_empty() => t.to_string(), _ => return (400, json!({"error":"falta 'template'"}).to_string()) };
+            let dir = { st.lock().unwrap().dir.clone() };
+            let mut lib = read_prompts(&dir);
+            if !lib["templates"][template.as_str()].is_object() { return (400, json!({"error":format!("template {template:?} não existe")}).to_string()); }
+            if let Some(coll) = v["collection"].as_str() { lib["collections"][coll] = json!(template); }
+            else if let Some(lv) = v["level"].as_u64() { let ls = lv.to_string(); lib["level_default"][ls.as_str()] = json!(template); }
+            else { return (400, json!({"error":"informe 'collection' ou 'level'"}).to_string()); }
+            write_prompts(&dir, &lib);
+            nlog(&format!("prompt assign: template={template}"));
+            (200, json!({"ok":true}).to_string())
+        }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
@@ -526,6 +555,49 @@ fn mine_cachedigest(api: &str) -> Option<Value> {
 // ───────────────────────────── nível 1 (consciente) — Summary por coleção (#22) ─────────────────────────────
 const SUMMARY_CHAR_BUDGET: usize = 40_000;   // ~11k tokens PT; cabe no ctx 16384/slot com folga p/ prompt+saída
 const EXCERPT_CHARS: usize = 1500;           // recorte por documento amostrado
+const PROMPT_MAX_CHARS: usize = 6000;        // teto do system prompt de um template (cabe no ctx com folga)
+/// Prompt embutido (fallback quando prompts.json some/corrompe, e seed do template "padrão").
+/// O daemon NUNCA fica sem prompt. As chaves aqui são as DEFAULT; um template pode definir outras.
+const BUILTIN_SUMMARY_PROMPT: &str = "Você é um analista que resume coleções de documentos em português. Seja FIEL ao material amostrado; não invente fatos. Responda APENAS com um objeto JSON com as chaves: \"abstract\" (2 a 4 frases resumindo a coleção), \"themes\" (array de 3 a 6 temas), \"entities\" (array de nomes próprios, organizações e produtos citados) e \"key_points\" (array de 3 a 6 pontos concretos).";
+
+// ───────────────────────────── biblioteca de prompts nomeados (por nível/coleção) ─────────────────────────────
+fn prompts_path(dir: &str) -> std::path::PathBuf { Path::new(dir).join("prompts.json") }
+/// Lê a biblioteca. Ausente/corrompida → seed com o template "padrão" = BUILTIN (nunca sem prompt).
+/// Formato: {templates:{name:{description,system,updated}}, level_default:{"1":name}, collections:{coll:name}}
+fn read_prompts(dir: &str) -> Value {
+    let seed = || json!({
+        "templates": { "padrão": {
+            "description": "Resumo geral: abstract, themes, entities, key_points.",
+            "system": BUILTIN_SUMMARY_PROMPT, "updated": "" } },
+        "level_default": { "1": "padrão" },
+        "collections": {}
+    });
+    match std::fs::read_to_string(prompts_path(dir)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(v) if v["templates"].is_object() => v,
+        _ => seed(),
+    }
+}
+fn write_prompts(dir: &str, v: &Value) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(s) = serde_json::to_string_pretty(v) {
+        let final_path = prompts_path(dir);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let tmp = final_path.with_extension(format!("json.{}.{}.tmp", std::process::id(), nanos));
+        if std::fs::write(&tmp, &s).is_ok() { let _ = std::fs::rename(&tmp, &final_path); }
+    }
+}
+/// Resolve o template pra (nível, coleção): override da coleção → default do nível → BUILTIN.
+/// Devolve (nome, system, resolved_from) — resolved_from vai na proveniência (debug do 3-camadas).
+fn resolve_template(lib: &Value, level: u8, coll: &str) -> (String, String, String) {
+    let sys_of = |name: &str| lib["templates"][name]["system"].as_str().map(String::from);
+    if let Some(name) = lib["collections"][coll].as_str() {
+        if let Some(sys) = sys_of(name) { return (name.to_string(), sys, "collection".into()); }
+    }
+    if let Some(name) = lib["level_default"][level.to_string()].as_str() {
+        if let Some(sys) = sys_of(name) { return (name.to_string(), sys, "level_default".into()); }
+    }
+    ("padrão".into(), BUILTIN_SUMMARY_PROMPT.to_string(), "builtin".into())
+}
 
 /// Extrai um objeto JSON de um texto (tolera fences/prosa em volta). Análogo ao parse_str_array
 /// do ragd, mas pra objeto — o Summary é `{abstract, themes, entities, key_points}`.
@@ -562,16 +634,15 @@ fn sample_chunks(api: &str, coll: &str, bases: &[Value], budget: usize) -> (Stri
 /// estruturado. ⚠️ é o 1º ponto em que CONTEÚDO do corpus sai da caixa (vai pro llm_url) —
 /// por isso o llm_url deve ser a IA da frota. Retorna None só se não houve amostra ou o LLM
 /// não respondeu (não sobrescreve o Summary anterior). Parse tolerante: sem JSON → content.raw.
-fn mine_summary(api: &str, llm_url: &str, coll: &str, src: &str) -> Option<Value> {
+fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, src: &str) -> Option<Value> {
     let bases_resp: Value = serde_json::from_str(&http_get_t(&format!("{api}/bases?collection={coll}"), 30)?).ok()?;
     let bases = bases_resp["bases"].as_array()?.clone();
     let (excerpts, used, scanned) = sample_chunks(api, coll, &bases, SUMMARY_CHAR_BUDGET);
     if used == 0 { nlog(&format!("summary {coll}: 0 chunks amostrados")); return None; }
-    let sys = "Você é um analista que resume coleções de documentos em português. Seja FIEL ao \
-        material amostrado; não invente fatos. Responda APENAS com um objeto JSON com as chaves: \
-        \"abstract\" (2 a 4 frases resumindo a coleção), \"themes\" (array de 3 a 6 temas), \
-        \"entities\" (array de nomes próprios, organizações e produtos citados) e \"key_points\" \
-        (array de 3 a 6 pontos concretos).";
+    // resolve o template (coleção → nível → builtin); o system prompt define O QUE extrair
+    // (inclusive as CHAVES do JSON — a UI renderiza genérico). phash entra no gate de invalidação.
+    let (tname, sys, resolved_from) = resolve_template(lib, level, coll);
+    let phash = hash_hex(&sys);
     let user = format!("COLEÇÃO: {coll} — {used} documento(s) amostrado(s).\n\nEXCERTOS:\n{excerpts}");
     let body = json!({"messages":[{"role":"system","content":sys},{"role":"user","content":user}],
                       "temperature":0.2}).to_string();
@@ -581,8 +652,9 @@ fn mine_summary(api: &str, llm_url: &str, coll: &str, src: &str) -> Option<Value
     let content_val = extract_json_object(&content)
         .unwrap_or_else(|| json!({"raw": content, "note": "LLM não devolveu JSON válido; texto cru preservado"}));
     Some(json!({
-        "type": "Summary", "level": 1, "updated": now_stamp(), "source_hash": src,
-        "provenance": {"via": "level1/llm", "sampled_docs": used, "scanned_bases": scanned,
+        "type": "Summary", "level": 1, "updated": now_stamp(), "source_hash": src, "prompt_hash": phash,
+        "provenance": {"via": "level1/llm", "template": tname, "resolved_from": resolved_from,
+                       "prompt_hash": phash, "sampled_docs": used, "scanned_bases": scanned,
                        "char_budget": SUMMARY_CHAR_BUDGET, "at": now_stamp()},
         "content": content_val
     }))
@@ -593,6 +665,7 @@ fn mine_summary(api: &str, llm_url: &str, coll: &str, src: &str) -> Option<Value
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     let (api, dir, level, llm_url) = { let s = state.lock().unwrap();
         (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone()) };
+    let lib = read_prompts(&dir);   // biblioteca de prompts (uma leitura por ciclo)
     let colls: Vec<String> = http_get_t(&format!("{api}/collections"), 10)
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v["collections"].as_array().map(|a| a.iter()
@@ -608,7 +681,14 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                 // deste source_hash). Assim, subir 0→1 numa coleção já minerada gera o Summary
                 // mesmo sem mudança de corpus (o furo que o run_cycle antigo tinha).
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
-                let summ_same = k["summary"]["source_hash"].as_str() == Some(src.as_str());
+                // summ_same = corpo (source_hash) E prompt resolvido (prompt_hash) inalterados.
+                // Editar/reatribuir um template muda o prompt_hash → invalida o Summary mesmo
+                // sem o corpus mudar (o caminho de invalidação que a cadência exercita).
+                let summ_same = if level >= 1 {
+                    let (_, exp_sys, _) = resolve_template(&lib, level, coll);
+                    k["summary"]["source_hash"].as_str() == Some(src.as_str())
+                        && k["summary"]["prompt_hash"].as_str() == Some(hash_hex(&exp_sys).as_str())
+                } else { true };
                 if !force && l0_same && (level < 1 || summ_same) {
                     skipped.push(coll.clone());
                     continue;
@@ -626,7 +706,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                 // nível 1 (consciente): gera o Summary com IA se level>=1 e (forçado ou stale).
                 // Falha do LLM não derruba o ciclo — mantém o Summary anterior.
                 if level >= 1 && (force || !summ_same) {
-                    match mine_summary(&api, &llm_url, coll, &src) {
+                    match mine_summary(&api, &llm_url, &lib, level, coll, &src) {
                         Some(s) => { k["summary"] = s; summarized.push(coll.clone()); }
                         None => nlog(&format!("summary {coll}: LLM não respondeu · mantém anterior")),
                     }
