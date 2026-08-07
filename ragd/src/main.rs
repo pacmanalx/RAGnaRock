@@ -1718,6 +1718,7 @@ fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, Strin
         }
         (Method::Get, "/collections") => list_collections(&state.bases),
         (Method::Get, "/profile") => profile(query, &state.bases),                  // [#1]
+        (Method::Get, "/expansions") => (200, expansions_json(state)),              // [#48] cache p/ CacheDigest
         (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
@@ -2151,6 +2152,19 @@ fn base_meta(coll: &str, name: &str, bases: &Bases) -> (u16, String) {
 /// GET /profile?collection=&base=&top=N — perfil léxico inspecionável. [#1]
 /// Dois modos: com `base` → idf POR-BASE; sem `base` → idf UNIFICADO da coleção (constrói o
 /// perfil on-the-fly — operação read-only, sem cachear no State).
+/// GET /expansions — dump read-only do cache de expansão de query (query normalizada ->
+/// variantes de sinônimo). É o insumo do CacheDigest (Nidhogg nível 0, #48) — o nidhoggd
+/// não pode ler o disco da coleção, então consome o cache por aqui. Ordenado por chave =
+/// saída determinística (o cache é um HashMap, cuja ordem de iteração não é estável).
+fn expansions_json(st: &State) -> String {
+    let map = st.expansions.read();
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut obj = serde_json::Map::new();
+    for k in keys { obj.insert(k.clone(), json!(map.get(k).unwrap())); }
+    json!({"count": map.len(), "expansions": Value::Object(obj)}).to_string()
+}
+
 fn profile(query: &str, bases: &Bases) -> (u16, String) {
     let coll = match query_param(query, "collection") {
         Some(c) => c, None => return (400, json!({"error": "falta 'collection'"}).to_string()),

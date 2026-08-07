@@ -307,6 +307,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // por query: ?collection=X (uma só; senão todas) &type=RootIndex|CorpusDict &level=0.
         // SÓ leitura — o ragd nunca consome isto; é a janela pro que o worm colheu.
         (Method::Get, "/api/nidhogg/knowledge") => { let s = st.lock().unwrap(); (200, knowledge_query(&s, query).to_string()) }
+        // [#48] CacheDigest — pilar GLOBAL do nível 0 (digest do cache de expansão do ragd).
+        (Method::Get, "/api/nidhogg/cachedigest") => { let s = st.lock().unwrap(); (200, read_cachedigest(&s.dir).to_string()) }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
@@ -428,6 +430,58 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
     Some((source_hash, vec![root_index, corpus_dict], bases.len(), total_chunks))
 }
 
+// ───────────────────────────── CacheDigest (#48) — pilar GLOBAL do nível 0 ─────────────────────────────
+fn cachedigest_path(dir: &str) -> std::path::PathBuf { Path::new(dir).join("_cachedigest.json") }
+/// Escreve o digest global do cache de expansão. Nome `_cachedigest.json` (NÃO `.knowledge.json`)
+/// de propósito: `known_count`/`collections_known` só contam `*.knowledge.json`, então o digest
+/// global não vira coleção-fantasma. Escrita atômica (tmp + rename), como o write_knowledge.
+fn write_cachedigest(dir: &str, v: &Value) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(s) = serde_json::to_string_pretty(v) {
+        let final_path = cachedigest_path(dir);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos()).unwrap_or(0);
+        let tmp_path = final_path.with_extension(format!("json.{}.{}.tmp", std::process::id(), nanos));
+        if std::fs::write(&tmp_path, &s).is_ok() { let _ = std::fs::rename(&tmp_path, &final_path); }
+    }
+}
+fn read_cachedigest(dir: &str) -> Value {
+    std::fs::read_to_string(cachedigest_path(dir)).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({"type":"CacheDigest","level":0,"scope":"global","updated":"",
+            "content":{"n_queries":0,"n_variants_total":0,"avg_variants":0.0,"entries":[],
+            "note":"ainda não digerido (rode um ciclo)"}}))
+}
+
+/// CacheDigest — o 3º pilar do nível 0 (#48), GLOBAL (não por-coleção): consolida o cache de
+/// expansão de query do ragd (`query → variantes`), lido via `GET /expansions` (o invariante
+/// proíbe o nidhoggd ler disco da coleção). Cache VAZIO é estado válido → digest com zeros +
+/// nota, NUNCA falha por isso. Retorna None só se o ragd não respondeu (não sobrescreve).
+/// Clustering de equivalência por "mesmos chunks" é [FUTURO]: o cache não guarda chunk_ids.
+fn mine_cachedigest(api: &str) -> Option<Value> {
+    let resp: Value = serde_json::from_str(&http_get_t(&format!("{api}/expansions"), 10)?).ok()?;
+    let mut entries: Vec<Value> = vec![];
+    let mut total_variants = 0u64;
+    if let Some(map) = resp["expansions"].as_object() {
+        for (q, v) in map {
+            let variants = v.as_array().cloned().unwrap_or_default();
+            total_variants += variants.len() as u64;
+            entries.push(json!({"query": q, "variants": variants, "n_variants": variants.len()}));
+        }
+    }
+    let n = entries.len() as u64;
+    Some(json!({
+        "type": "CacheDigest", "level": 0, "scope": "global", "updated": now_stamp(),
+        "content": {
+            "n_queries": n,
+            "n_variants_total": total_variants,
+            "avg_variants": if n == 0 { 0.0 } else { total_variants as f64 / n as f64 },
+            "entries": entries,
+            "note": "consolida o cache de expansão do ragd (query→variantes), GLOBAL (não por-coleção — o cache é engine-wide). Clustering de equivalência por 'mesmos chunks' é [FUTURO]: o cache não registra chunk_ids; precisaria o search_expand gravar os hits por variante."
+        }
+    }))
+}
+
 /// Roda UM ciclo. `force=true` (/run manual) re-minera sempre; `force=false` (cadência do
 /// worker) pula coleção sem mudança (source_hash igual). NÃO segura o lock durante HTTP/IO.
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
@@ -462,13 +516,21 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
             None => failed.push(coll.clone()),
         }
     }
+    // CacheDigest (#48): 3º pilar do nível 0, GLOBAL — UMA vez por ciclo, FORA do loop de
+    // coleções (senão reescreveria N×). Cache vazio é válido; só não grava se o ragd caiu.
+    let cache_queries = match mine_cachedigest(&api) {
+        Some(cd) => { write_cachedigest(&dir, &cd); cd["content"]["n_queries"].as_u64().unwrap_or(0) }
+        None => u64::MAX,   // sentinela: ragd não respondeu /expansions
+    };
     if let Ok(mut s) = state.lock() {
         s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {}{}",
             now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(),
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
-           "mined": mined, "skipped": skipped, "failed": failed, "at": now_stamp()})
+           "mined": mined, "skipped": skipped, "failed": failed,
+           "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
+           "at": now_stamp()})
 }
 
 // ───────────────────────────── worker ─────────────────────────────
