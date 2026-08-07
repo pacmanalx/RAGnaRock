@@ -2188,8 +2188,12 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
     // de OCR visto 1×". Barato: mesma varredura que o base_vectors já fazia, feita uma vez.
     let mut udf: HashMap<usize, u64> = HashMap::new();
     let mut ufreq: HashMap<usize, u64> = HashMap::new();
+    // base_dims: conjunto de dims GLOBAIS que cada base toca — alimenta o coverage/OOV e o
+    // particionamento shared/unique do CorpusDict (escopo não concluído da #20).
+    let mut base_dims: HashMap<String, std::collections::HashSet<usize>> = HashMap::new();
     for (name, base) in inner.iter() {
         let m = prof.remap.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+        let bd = base_dims.entry((*name).clone()).or_default();
         for ch in &base.chunks {
             for &(ld, cnt) in &ch.vec {
                 let ld = ld as usize;
@@ -2197,10 +2201,20 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
                     let gd = m[ld];
                     *udf.entry(gd).or_insert(0) += 1;
                     *ufreq.entry(gd).or_insert(0) += cnt as u64;
+                    bd.insert(gd);
                 }
             }
         }
     }
+    // bdf = base document frequency: em quantas bases DISTINTAS a dim aparece. bdf==1 → a
+    // sílaba é EXCLUSIVA daquela base (o "OOV" das outras); bdf>1 → é backbone compartilhado.
+    let mut bdf: HashMap<usize, u32> = HashMap::new();
+    for dims in base_dims.values() {
+        for &d in dims { *bdf.entry(d).or_insert(0) += 1; }
+    }
+    let uvocab_n = prof.uvocab.len();
+    let shared_vocab = bdf.values().filter(|&&c| c > 1).count();
+    let unique_vocab = bdf.values().filter(|&&c| c == 1).count();
 
     // ranking do top: `rank=uidf` (default, retrocompatível) ou `rank=idffreq` (uidf × freq,
     // #46). `min_freq` opcional corta hapax de baixa contagem ANTES do take. O nome da chave
@@ -2229,7 +2243,9 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
         "scope": "collection",
         "collection": coll,
         "bases": inner.len(), "chunks": total_chunks,
-        "unified_vocab_size": prof.uvocab.len(),
+        "unified_vocab_size": uvocab_n,
+        "shared_vocab": shared_vocab,   // dims usadas por >1 base (backbone comum)
+        "unique_vocab": unique_vocab,   // dims usadas por exatamente 1 base (assinatura exclusiva)
         "rank": rank, "min_freq": min_freq,
         "top_uidf": top_uidf,
     });
@@ -2253,7 +2269,17 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
             let vec: Vec<f64> = salient_dims.iter()
                 .map(|d| gtf.get(d).copied().unwrap_or(0.0) * prof.uidf.get(d).copied().unwrap_or(0.0))
                 .collect();
-            json!({"name": name, "corpus": base.corpus, "n_chunks": base.n_chunks, "vec": vec})
+            // coverage/OOV por base (#20, escopo restante): dims_used = largura léxica da base
+            // no espaço da coleção; coverage = fração do vocab unificado; unique_dims = sílabas
+            // exclusivas desta base (bdf==1), o "OOV" relativo às demais; shared = o resto.
+            let bd = base_dims.get(*name);
+            let dims_used = bd.map(|s| s.len()).unwrap_or(0);
+            let unique_dims = bd.map(|s| s.iter().filter(|d| bdf.get(d).copied().unwrap_or(0) == 1).count()).unwrap_or(0);
+            let shared_dims = dims_used - unique_dims;
+            let coverage = if uvocab_n == 0 { 0.0 } else { dims_used as f64 / uvocab_n as f64 };
+            json!({"name": name, "corpus": base.corpus, "n_chunks": base.n_chunks,
+                   "dims_used": dims_used, "coverage": coverage,
+                   "unique_dims": unique_dims, "shared_dims": shared_dims, "vec": vec})
         }).collect();
         resp["base_vectors"] = json!(base_vectors);
     }

@@ -383,6 +383,10 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
     let prof: Value = serde_json::from_str(&http_get_t(&format!("{api}/profile?collection={coll}&top=40&vectors=1&rank=idffreq"), 30)?).ok()?;
     let salient = prof["top_uidf"].as_array().cloned().unwrap_or_default();
     let unified_vocab = prof["unified_vocab_size"].as_u64().unwrap_or(0);
+    // shared/unique do vocab unificado (#20 restante): dims em >1 base (backbone) vs em 1 só
+    // (assinatura exclusiva). Vem do /profile; o coverage/OOV por base vem dentro do base_vectors.
+    let shared_vocab = prof["shared_vocab"].as_u64().unwrap_or(0);
+    let unique_vocab = prof["unique_vocab"].as_u64().unwrap_or(0);
     // dims-por-base (heatmap/dendrograma): vetor tf-idf de cada base nas dims salientes,
     // alinhado 1:1 com `salient`. Com rank=idffreq as dims salientes deixam de ser hapax
     // (peso ~0 por base) e o base_vectors ganha sinal real (#47). Vem do /profile&vectors=1.
@@ -411,9 +415,11 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
         "type": "CorpusDict", "level": 0,
         "content": {
             "unified_vocab_size": unified_vocab,
+            "shared_vocab": shared_vocab,   // dims em >1 base (backbone comum da coleção)
+            "unique_vocab": unique_vocab,   // dims em 1 base só (assinatura exclusiva somada)
             "bases": per_base,
-            "base_vectors": base_vectors,   // [{name,corpus,n_chunks,vec[]}] alinhado 1:1 às dims salientes (heatmap/dendrograma)
-            "note": "base_vectors = tf-idf por base nas dims salientes, alinhado 1:1 ao salient_roots (#47 ok pós-#46: com idf×freq as dims salientes são recorrentes, não hapax, então o vec tem sinal). vocab completo por base e oov ainda [FUTURO]"
+            "base_vectors": base_vectors,   // [{name,corpus,n_chunks,dims_used,coverage,unique_dims,shared_dims,vec[]}]
+            "note": "base_vectors = tf-idf por base nas dims salientes (alinhado 1:1 ao salient_roots, #47 ok pós-#46). Cada base traz coverage/OOV: dims_used, coverage (fração do vocab unificado), unique_dims (sílabas exclusivas = OOV das outras) e shared_dims. Agrupamento por raiz/stem segue [FUTURO]."
         }
     });
 
