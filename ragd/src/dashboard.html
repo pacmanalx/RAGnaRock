@@ -971,7 +971,7 @@ const NV_CHARTS=[
   {k:'cache',ic:'🔁',name:'CacheDigest',perColl:false,ready:true,
    desc:'Digest do cache de expansão de query (query→variantes), GLOBAL. O 3º pilar do nível 0 — o que a expansão por IA já aprendeu. (CacheDigest, #48)'},
 ];
-let _nidk=[], _nvActive='cloud', _nvLevel=0, _nvcache=null;
+let _nidk=[], _nvActive='cloud', _nvLevel=0, _nvcache=null, _nvprompts=null, _nvpEdit=null;
 // O que CADA nível ≥1 oferecerá (esqueleto rodando; funcionalidades nas issues #22→#24).
 const NV_LVL_FEATURES={
   1:['Resumo destilado por coleção (sobrevive à deleção da coleção)','Insights de conteúdo — colecionáveis soltos (personagens, locais, eventos)','Cartões de conhecimento consultáveis'],
@@ -993,6 +993,7 @@ async function loadNidViz(){
   if(!isL0){
     // Nível 1 (consciente) JÁ IMPLEMENTADO (#22): renderiza o Summary destilado por coleção.
     if(_nvLevel===1){
+      try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){_nvprompts=null;}
       let s=null; try{s=await jget('/api/nidhogg/summary')}catch(e){}
       $('#nv-future').innerHTML=renderSummaries(s);
       return;
@@ -1057,26 +1058,82 @@ function vizCache(){
     <p class="muted" style="font-size:11px;margin-top:8px">${esc(c.note||'')}</p></div>`;
 }
 // [#22] Summary do nível 1 — cards por coleção com abstract/themes/entities/key_points.
+function nvChip(x){return `<span style="display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:11px;padding:1px 9px;margin:2px 3px 2px 0;font-size:12px;color:#c9d1d9">${esc(x)}</span>`;}
+// Render GENÉRICO do content: o template define as próprias chaves, então não assumimos schema.
+// string→parágrafo · array de escalares→chips · array de objetos/objeto→JSON · (raw é especial).
+function renderContentGeneric(c){
+  const lbl=k=>`<b style="font-size:12px;color:#7d8590;text-transform:capitalize">${esc(String(k).replace(/_/g,' '))}</b>`;
+  return Object.entries(c||{}).map(([k,v])=>{
+    if(k==='raw') return `<pre style="white-space:pre-wrap;margin:0;font-size:12px;color:#c9d1d9">${esc(String(v))}</pre>`;
+    if(typeof v==='string') return `<div>${lbl(k)}<p style="margin:2px 0 0;line-height:1.5">${esc(v)}</p></div>`;
+    if(Array.isArray(v)){
+      if(v.every(x=>x===null||typeof x!=='object')) return `<div>${lbl(k)}<div style="margin-top:3px">${v.map(x=>nvChip(String(x))).join('')}</div></div>`;
+      return `<div>${lbl(k)}<pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11px;color:#c9d1d9">${esc(JSON.stringify(v,null,2))}</pre></div>`;
+    }
+    if(typeof v==='object'&&v!==null) return `<div>${lbl(k)}<pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11px;color:#c9d1d9">${esc(JSON.stringify(v,null,2))}</pre></div>`;
+    return `<div>${lbl(k)} ${esc(String(v))}</div>`;
+  }).join('');
+}
 function renderSummaries(s){
   const arr=(s&&s.summaries)||[];
-  const chip=x=>`<span style="display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:11px;padding:1px 9px;margin:2px 3px 2px 0;font-size:12px;color:#c9d1d9">${esc(x)}</span>`;
-  if(!arr.length) return `<h2 style="color:var(--warn)">🧠 Nível 1 · consciente</h2>
-    <p class="muted">Nenhum Summary destilado ainda — habilite uma coleção e force um ciclo (ou aguarde a cadência). Consome IA (o LLM da frota).</p>`;
-  return `<h2 style="color:var(--accent,#58a6ff)">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
-    <p class="muted" style="margin:0 0 12px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede.</p>`+
-    arr.map(it=>{
-      const s=it.summary||{}, c=s.content||{}, p=s.provenance||{};
-      const head=`<div><b style="font-size:15px;color:#e6edf3">${esc(it.collection)}</b> <span class="muted" style="font-size:11px">· via ${esc(p.via||'?')} · ${p.sampled_docs||0} docs amostrados · ${esc(s.updated||'')}</span></div>`;
-      if(c.raw) return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:6px;cursor:default">${head}<pre style="white-space:pre-wrap;margin:0;font-size:12px;color:#c9d1d9">${esc(c.raw)}</pre></div>`;
-      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">
-        ${head}
-        <p style="margin:0;line-height:1.5">${esc(c.abstract||'')}</p>
-        ${(c.themes||[]).length?`<div><span class="muted" style="font-size:12px">Temas:</span> ${(c.themes||[]).map(chip).join('')}</div>`:''}
-        ${(c.entities||[]).length?`<div><span class="muted" style="font-size:12px">Entidades:</span> ${(c.entities||[]).map(chip).join('')}</div>`:''}
-        ${(c.key_points||[]).length?`<div><span class="muted" style="font-size:12px">Pontos-chave:</span><ul style="margin:4px 0 0;padding-left:20px">${(c.key_points||[]).map(k=>`<li style="margin:2px 0">${esc(k)}</li>`).join('')}</ul></div>`:''}
-      </div>`;
+  const cards=!arr.length ? `<p class="muted">Nenhum Summary destilado ainda — habilite uma coleção e force um ciclo (ou aguarde a cadência). Consome IA (o LLM da frota).</p>`
+    : arr.map(it=>{
+      const su=it.summary||{}, c=su.content||{}, p=su.provenance||{};
+      const head=`<div><b style="font-size:15px;color:#e6edf3">${esc(it.collection)}</b> <span class="muted" style="font-size:11px">· template <b>${esc(p.template||'padrão')}</b> (${esc(p.resolved_from||'?')}) · ${p.sampled_docs||0} docs · ${esc(su.updated||'')}</span></div>`;
+      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${renderContentGeneric(c)}</div>`;
     }).join('');
+  return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
+    <p class="muted" style="margin:0 0 12px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
+    ${renderPromptsPanel()}
+    ${cards}`;
 }
+// [prompts] painel de biblioteca de prompts — CRUD de templates + atribuição por nível/coleção.
+function renderPromptsPanel(){
+  const L=_nvprompts||{templates:{},level_default:{},collections:{}};
+  const T=L.templates||{}, tnames=Object.keys(T);
+  const colls=(_nidk||[]).map(c=>c.collection);
+  const inp='padding:5px;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:5px';
+  const tlist=tnames.map(n=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #21262d">
+      <div><b style="color:#c9d1d9">${esc(n)}</b> <span class="muted" style="font-size:11px">${esc((T[n]||{}).description||'')}</span></div>
+      <button class="go ghost" style="padding:2px 9px" onclick="nvpEditT('${esc(n)}')">editar</button></div>`).join('');
+  const ed=_nvpEdit, cur=(ed&&T[ed])||{};
+  const editor = ed===null ? '' : `<div style="border:1px solid #30363d;border-radius:8px;padding:10px;margin-top:8px;background:#010409">
+      <div style="display:flex;gap:8px;margin-bottom:6px">
+        <input id="nvp-name" placeholder="nome" value="${esc(ed)}" ${ed?'readonly':''} style="flex:0 0 190px;${inp}">
+        <input id="nvp-desc" placeholder="descrição" value="${esc(cur.description||'')}" style="flex:1;${inp}">
+      </div>
+      <textarea id="nvp-sys" placeholder="system prompt — instrua O QUE extrair e as CHAVES do JSON (ex.: partes, valores, riscos)" style="width:100%;height:130px;${inp};font:12px var(--mono,monospace)">${esc(cur.system||'')}</textarea>
+      <div style="margin-top:6px;display:flex;gap:8px;align-items:center"><button class="go" onclick="nvpSaveT()">salvar</button><button class="go ghost" onclick="_nvpEdit=null;renderNidViz2()">cancelar</button> <span id="nvp-msg" class="muted" style="font-size:11px"></span></div>
+    </div>`;
+  const optsColl=cn=>`<option value="">(usa default do nível)</option>`+tnames.map(n=>`<option value="${esc(n)}" ${(L.collections||{})[cn]===n?'selected':''}>${esc(n)}</option>`).join('');
+  const assign=`<div style="margin-top:10px"><span class="muted" style="font-size:12px">Aplicar template por:</span>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span style="width:130px;color:#7d8590;font-size:12px">nível 1 (default)</span>
+        <select onchange="nvpAssign('level',1,this.value)" style="${inp}">${tnames.map(n=>`<option value="${esc(n)}" ${(L.level_default||{})['1']===n?'selected':''}>${esc(n)}</option>`).join('')}</select></div>
+      ${colls.map(cn=>`<div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span style="width:130px;color:#7d8590;font-size:12px">coleção ${esc(cn)}</span>
+        <select onchange="nvpAssign('collection','${esc(cn)}',this.value)" style="${inp}">${optsColl(cn)}</select></div>`).join('')}
+    </div>`;
+  return `<details style="border:1px solid #30363d;border-radius:8px;padding:8px 12px;margin:0 0 14px;background:#0d1117">
+    <summary style="cursor:pointer;color:#58a6ff;font-weight:bold">⚙ Prompts — o que/como cada nível·coleção extrai (${tnames.length} template${tnames.length!==1?'s':''})</summary>
+    <div style="margin-top:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center"><span class="muted" style="font-size:12px">Templates</span><button class="go ghost" style="padding:2px 9px" onclick="nvpNew()">+ novo</button></div>
+      ${tlist||'<span class="muted">(nenhum)</span>'}${editor}${assign}
+      <p class="muted" style="font-size:11px;margin:10px 0 0">Editar/reatribuir invalida o Summary da coleção afetada — regenera no próximo ciclo (IA da frota). Teto do system: 6000 chars.</p>
+    </div></details>`;
+}
+function nvpNew(){ _nvpEdit=''; renderNidViz2(); }
+function nvpEditT(n){ _nvpEdit=n; renderNidViz2(); }
+async function nvpSaveT(){
+  const name=($('#nvp-name').value||'').trim(), description=$('#nvp-desc').value||'', system=$('#nvp-sys').value||'';
+  if(!name||!system.trim()){ $('#nvp-msg').textContent='nome e system são obrigatórios'; return; }
+  try{ await jpost('/api/nidhogg/prompts/template',{name,description,system}); }catch(e){ $('#nvp-msg').textContent='erro: '+e.message; return; }
+  _nvpEdit=null; try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} renderNidViz2();
+}
+async function nvpAssign(scope,key,template){
+  if(scope==='collection'&&!template) return;   // '' = manter default (sem endpoint de unassign por ora)
+  try{ await jpost('/api/nidhogg/prompts/assign', scope==='level'?{level:key,template}:{collection:key,template}); }catch(e){ return; }
+  try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} renderNidViz2();
+}
+async function renderNidViz2(){ let s=null; try{s=await jget('/api/nidhogg/summary')}catch(e){} $('#nv-future').innerHTML=renderSummaries(s); }
 // helpers de cor/geometria
 function nvLerp(a,b,t){t=Math.max(0,Math.min(1,t));
   const P=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16));
