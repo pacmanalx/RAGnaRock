@@ -53,12 +53,17 @@ struct Config {
     cadence: u64,        // segundos entre ciclos
     cfg_path: String,
     cors_origin: String, // CORS: vazio = sem header (same-origin safe); senão ecoa o valor
+    llm_url: String,     // endpoint OpenAI-compat da IA (nível >=1). ⚠️ APONTAR PRA IA DA FROTA:
+                         // o nível 1 manda CONTEÚDO do corpus (ex. `real`, sensível) pro LLM —
+                         // nuvem = conteúdo SAI da frota. Default = llama-server local (Aron).
+                         // Independente do provider do ragd de propósito.
 }
 impl Default for Config {
     fn default() -> Self {
         Config { port: DEFAULT_PORT, ragd_api: DEFAULT_RAGD_API.to_string(), on: false, level: 0,
                  dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string(),
-                 cors_origin: String::new() }
+                 cors_origin: String::new(),
+                 llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string() }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -77,6 +82,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "dir"      => cfg.dir = v.to_string(),
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
+            "llm_url"  => cfg.llm_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
         }
     }
@@ -102,6 +108,7 @@ struct State {
     dir: String,
     cadence: u64,
     ragd_api: String,
+    llm_url: String,       // IA da frota p/ nível >=1 (ver comentário na Config)
     cfg_path: String,
     started: Instant,
     last_cycle: String,
@@ -142,6 +149,22 @@ fn http_get_t(url: &str, secs: u32) -> Option<String> {
         let mut cmd = std::process::Command::new(tool);
         if tool == "curl" { cmd.args(["-s", "-m", &secs.to_string(), url]); }
         else { cmd.args(["-q", "-O", "-", "--tries=1", &format!("--timeout={secs}"), url]); }
+        if let Ok(out) = cmd.output() {
+            if out.status.success() && !out.stdout.is_empty() { return Some(String::from_utf8_lossy(&out.stdout).to_string()); }
+        }
+    }
+    None
+}
+/// POST JSON (curl/wget). Usado pro /chunk do ragd e pra IA do nível >=1.
+fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
+    for tool in ["curl", "wget"] {
+        let mut cmd = std::process::Command::new(tool);
+        if tool == "curl" {
+            cmd.args(["-s", "-m", &secs.to_string(), "-H", "Content-Type: application/json", "-d", body, url]);
+        } else {
+            cmd.args(["-q", "-O", "-", "--tries=1", &format!("--timeout={secs}"),
+                      "--header=Content-Type: application/json", &format!("--post-data={body}"), url]);
+        }
         if let Ok(out) = cmd.output() {
             if out.status.success() && !out.stdout.is_empty() { return Some(String::from_utf8_lossy(&out.stdout).to_string()); }
         }
@@ -251,6 +274,22 @@ fn knowledge_query(st: &State, query: &str) -> Value {
     json!({"collections": collections})
 }
 
+/// [#22] Leitura do Summary (nível 1). O Summary mora em `k["summary"]` (fora do `knowledge[]`
+/// dos pilares do nível 0), então tem janela própria. ?collection=X → uma; sem → todas que têm.
+fn summary_query(st: &State, query: &str) -> Value {
+    if let Some(coll) = query_param(query, "collection") {
+        let k = read_knowledge(&st.dir, &coll);
+        return json!({"collection": coll, "summary": k.get("summary").cloned().unwrap_or(Value::Null)});
+    }
+    let summaries: Vec<Value> = list_knowledge(&st.dir).into_iter().filter_map(|k| {
+        match k.get("summary") {
+            Some(s) if !s.is_null() => Some(json!({"collection": k["collection"], "summary": s})),
+            _ => None,
+        }
+    }).collect();
+    json!({"summaries": summaries})
+}
+
 // ───────────────────────────── API ─────────────────────────────
 fn status_json(st: &State) -> Value {
     json!({
@@ -309,6 +348,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         (Method::Get, "/api/nidhogg/knowledge") => { let s = st.lock().unwrap(); (200, knowledge_query(&s, query).to_string()) }
         // [#48] CacheDigest — pilar GLOBAL do nível 0 (digest do cache de expansão do ragd).
         (Method::Get, "/api/nidhogg/cachedigest") => { let s = st.lock().unwrap(); (200, read_cachedigest(&s.dir).to_string()) }
+        // [#22] Summary — nível 1 (consciente), o resumo destilado por IA.
+        (Method::Get, "/api/nidhogg/summary") => { let s = st.lock().unwrap(); (200, summary_query(&s, query).to_string()) }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
@@ -482,26 +523,98 @@ fn mine_cachedigest(api: &str) -> Option<Value> {
     }))
 }
 
+// ───────────────────────────── nível 1 (consciente) — Summary por coleção (#22) ─────────────────────────────
+const SUMMARY_CHAR_BUDGET: usize = 40_000;   // ~11k tokens PT; cabe no ctx 16384/slot com folga p/ prompt+saída
+const EXCERPT_CHARS: usize = 1500;           // recorte por documento amostrado
+
+/// Extrai um objeto JSON de um texto (tolera fences/prosa em volta). Análogo ao parse_str_array
+/// do ragd, mas pra objeto — o Summary é `{abstract, themes, entities, key_points}`.
+fn extract_json_object(s: &str) -> Option<Value> {
+    let a = s.find('{')?; let b = s.rfind('}')?;
+    if a >= b { return None; }
+    match serde_json::from_str::<Value>(&s[a..=b]) { Ok(v) if v.is_object() => Some(v), _ => None }
+}
+
+/// Amostra conteúdo da coleção via /chunk (NUNCA disco), orçado por CARACTERES (não contagem):
+/// 1º chunk de cada base, em ordem, recortado, até estourar o teto. Devolve (excertos, usados, escaneadas).
+fn sample_chunks(api: &str, coll: &str, bases: &[Value], budget: usize) -> (String, usize, usize) {
+    let mut out = String::new();
+    let (mut used, mut scanned) = (0usize, 0usize);
+    for b in bases {
+        if out.len() >= budget || scanned >= 60 { break; }   // teto de fetches p/ coleção gigante
+        scanned += 1;
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let req = json!({"collection": coll, "base": name, "id": 0}).to_string();
+        let text = http_post_t(&format!("{api}/chunk"), &req, 20)
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v["chunks"][0]["text"].as_str().map(String::from));
+        if let Some(t) = text {
+            let excerpt = format!("### {name}\n{}\n\n", t.chars().take(EXCERPT_CHARS).collect::<String>());
+            if out.len() + excerpt.len() > budget { break; }
+            out.push_str(&excerpt);
+            used += 1;
+        }
+    }
+    (out, used, scanned)
+}
+
+/// Nível 1 — Summary de UMA coleção. Amostra conteúdo (via /chunk) e pede ao LLM um resumo
+/// estruturado. ⚠️ é o 1º ponto em que CONTEÚDO do corpus sai da caixa (vai pro llm_url) —
+/// por isso o llm_url deve ser a IA da frota. Retorna None só se não houve amostra ou o LLM
+/// não respondeu (não sobrescreve o Summary anterior). Parse tolerante: sem JSON → content.raw.
+fn mine_summary(api: &str, llm_url: &str, coll: &str, src: &str) -> Option<Value> {
+    let bases_resp: Value = serde_json::from_str(&http_get_t(&format!("{api}/bases?collection={coll}"), 30)?).ok()?;
+    let bases = bases_resp["bases"].as_array()?.clone();
+    let (excerpts, used, scanned) = sample_chunks(api, coll, &bases, SUMMARY_CHAR_BUDGET);
+    if used == 0 { nlog(&format!("summary {coll}: 0 chunks amostrados")); return None; }
+    let sys = "Você é um analista que resume coleções de documentos em português. Seja FIEL ao \
+        material amostrado; não invente fatos. Responda APENAS com um objeto JSON com as chaves: \
+        \"abstract\" (2 a 4 frases resumindo a coleção), \"themes\" (array de 3 a 6 temas), \
+        \"entities\" (array de nomes próprios, organizações e produtos citados) e \"key_points\" \
+        (array de 3 a 6 pontos concretos).";
+    let user = format!("COLEÇÃO: {coll} — {used} documento(s) amostrado(s).\n\nEXCERTOS:\n{excerpts}");
+    let body = json!({"messages":[{"role":"system","content":sys},{"role":"user","content":user}],
+                      "temperature":0.2}).to_string();
+    let resp = http_post_t(llm_url, &body, 180)?;
+    let content = serde_json::from_str::<Value>(&resp).ok()
+        .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(String::from))?;
+    let content_val = extract_json_object(&content)
+        .unwrap_or_else(|| json!({"raw": content, "note": "LLM não devolveu JSON válido; texto cru preservado"}));
+    Some(json!({
+        "type": "Summary", "level": 1, "updated": now_stamp(), "source_hash": src,
+        "provenance": {"via": "level1/llm", "sampled_docs": used, "scanned_bases": scanned,
+                       "char_budget": SUMMARY_CHAR_BUDGET, "at": now_stamp()},
+        "content": content_val
+    }))
+}
+
 /// Roda UM ciclo. `force=true` (/run manual) re-minera sempre; `force=false` (cadência do
 /// worker) pula coleção sem mudança (source_hash igual). NÃO segura o lock durante HTTP/IO.
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
-    let (api, dir, level) = { let s = state.lock().unwrap(); (s.ragd_api.clone(), s.dir.clone(), s.level) };
+    let (api, dir, level, llm_url) = { let s = state.lock().unwrap();
+        (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone()) };
     let colls: Vec<String> = http_get_t(&format!("{api}/collections"), 10)
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v["collections"].as_array().map(|a| a.iter()
             .filter_map(|c| c["collection"].as_str().map(String::from)).collect()))
         .unwrap_or_default();
-    let (mut mined, mut skipped, mut failed) = (vec![], vec![], vec![]);
+    let (mut mined, mut skipped, mut failed, mut summarized) = (vec![], vec![], vec![], vec![]);
     for coll in &colls {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
         match mine_level0(&api, coll) {
             Some((src, pillars, n_bases, total_chunks)) => {
-                if !force && k["source_hash"].as_str() == Some(src.as_str()) {
-                    skipped.push(coll.clone());   // sem mudança e não forçado → não remastiga
+                // Gating: pula só se o nível 0 não mudou E (não é nível >=1 OU o Summary já é
+                // deste source_hash). Assim, subir 0→1 numa coleção já minerada gera o Summary
+                // mesmo sem mudança de corpus (o furo que o run_cycle antigo tinha).
+                let l0_same = k["source_hash"].as_str() == Some(src.as_str());
+                let summ_same = k["summary"]["source_hash"].as_str() == Some(src.as_str());
+                if !force && l0_same && (level < 1 || summ_same) {
+                    skipped.push(coll.clone());
                     continue;
                 }
-                k["level"] = json!(0);
+                // nível 0 (sempre que não pulou): re-grava os pilares (mesmo dado se l0_same).
+                k["level"] = json!(if level >= 1 { 1 } else { 0 });
                 k["source_hash"] = json!(src);
                 k["updated"] = json!(now_stamp());
                 k["knowledge"] = json!(pillars);
@@ -510,7 +623,15 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     "at": now_stamp(), "via": "level0/no-ai",
                     "inputs": {"bases": n_bases, "total_chunks": total_chunks, "source_hash": src},
                 });
-                write_knowledge(&dir, coll, &k);
+                // nível 1 (consciente): gera o Summary com IA se level>=1 e (forçado ou stale).
+                // Falha do LLM não derruba o ciclo — mantém o Summary anterior.
+                if level >= 1 && (force || !summ_same) {
+                    match mine_summary(&api, &llm_url, coll, &src) {
+                        Some(s) => { k["summary"] = s; summarized.push(coll.clone()); }
+                        None => nlog(&format!("summary {coll}: LLM não respondeu · mantém anterior")),
+                    }
+                }
+                write_knowledge(&dir, coll, &k);   // grava os 2 artefatos ATÔMICO (1 escrita)
                 mined.push(coll.clone());
             }
             None => failed.push(coll.clone()),
@@ -523,12 +644,12 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         None => u64::MAX,   // sentinela: ragd não respondeu /expansions
     };
     if let Ok(mut s) = state.lock() {
-        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {}{}",
-            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(),
+        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {}{}",
+            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(),
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
-           "mined": mined, "skipped": skipped, "failed": failed,
+           "mined": mined, "skipped": skipped, "failed": failed, "summarized": summarized,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
 }
@@ -595,7 +716,7 @@ fn main() {
     let _ = std::fs::create_dir_all(&cfg.dir);
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
-        ragd_api: cfg.ragd_api.clone(), cfg_path: cfg.cfg_path.clone(),
+        ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(), cfg_path: cfg.cfg_path.clone(),
         started: Instant::now(), last_cycle: String::new(),
         ragd_online: false, ragd_health: Value::Null,
     }));
