@@ -1197,6 +1197,44 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
         }
         slog(&format!("   ├─ 🔎 literal {needles_lit:?} · 0 hit(s) · segue cascata"));
     }
+    // ── TWO-PHASE: expande SÓ quando o léxico puro é fraco ──────────────────────────────
+    // Roda a busca ORIGINAL primeiro. Se o recall já é forte (≥ min(k,3) hits com cobertura
+    // TOTAL da query), devolve na hora — SEM tocar dict/cache/IA. A query fácil fica
+    // instantânea e a expansão (incl. o LLM, o caro) só dispara quando a busca pura NÃO
+    // acha — que é o único momento em que ela se paga. Desliga com {"two_phase": false}.
+    if v["two_phase"].as_bool().unwrap_or(true) {
+        let k = v["k"].as_u64().unwrap_or(8) as usize;
+        let base = v["base"].as_str().unwrap_or("*").to_string();
+        let phon = v["phonetic"].as_bool().unwrap_or(false);
+        let coll = v["collection"].as_str().map(|s| s.to_string());
+        let mut qb = Map::new();
+        if let Some(c) = &coll { qb.insert("collection".into(), json!(c)); }
+        qb.insert("base".into(), json!(base));
+        qb.insert("query".into(), json!(query));
+        qb.insert("k".into(), json!(k));
+        qb.insert("phonetic".into(), json!(phon));
+        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &st.collection_profiles);
+        if code == 200 {
+            let rv: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+            if let Some(hits) = rv["hits"].as_array() {
+                let cov = |h: &Value| h["coverage"].as_f64().or_else(|| h["matchpoint"].as_f64()).unwrap_or(0.0);
+                // FORTE = o TOP hit cobre a query inteira (todos os termos presentes) e há
+                // mais de um resultado. Em query multi-termo raramente MUITOS chunks têm TODAS
+                // as palavras, mas se o #1 tem, o léxico puro já achou o alvo — expandir é supérfluo.
+                let top_cov = hits.first().map(cov).unwrap_or(0.0);
+                let full = hits.iter().filter(|h| cov(h) >= 0.999).count();
+                if top_cov >= 0.999 && hits.len() >= k.min(2) {
+                    slog(&format!("   └─ two-phase: original FORTE (top cobertura {top_cov:.2}, {full} full de {} hit(s)) · SEM expansão · fase 1", hits.len()));
+                    return (200, json!({
+                        "query": query, "source": "phase1", "recall": "strong",
+                        "expansions": [], "hits": hits
+                    }).to_string());
+                }
+                slog(&format!("   ├─ two-phase: original FRACA (top cobertura {top_cov:.2}, {} hit(s)) · segue p/ expansão", hits.len()));
+            }
+        }
+    }
+
     // Cascata de expansão (do mais barato pro mais caro):
     //   1) DICIONÁRIOS por-palavra ATIVOS (instantâneo, zero custo) — se houver, encerra aqui.
     //   2) CACHE por-query (cache/expansions.json) — hit instantâneo.
