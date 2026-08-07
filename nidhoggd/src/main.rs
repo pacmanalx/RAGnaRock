@@ -644,8 +644,12 @@ fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, sr
     let (tname, sys, resolved_from) = resolve_template(lib, level, coll);
     let phash = hash_hex(&sys);
     let user = format!("COLEÇÃO: {coll} — {used} documento(s) amostrado(s).\n\nEXCERTOS:\n{excerpts}");
+    // max_tokens CAPADO: sem teto, um prompt "liste tudo" faz o modelo despejar geração
+    // longuíssima que estoura o timeout do http_post_t (→ None → não atualiza) e ainda gera
+    // JSON gigante/truncado. 1500 tokens bounda o Summary (é resumo, não dump) e mantém o
+    // ciclo rápido. Prompt que peça listagem exaustiva deve pedir "os principais / até N".
     let body = json!({"messages":[{"role":"system","content":sys},{"role":"user","content":user}],
-                      "temperature":0.2}).to_string();
+                      "temperature":0.2, "max_tokens":1500}).to_string();
     let resp = http_post_t(llm_url, &body, 180)?;
     let content = serde_json::from_str::<Value>(&resp).ok()
         .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(String::from))?;
