@@ -67,7 +67,8 @@ struct State {
     config_path: String,        // cfg de onde lemos / onde persistimos mudanças do painel
     anthropic_key: String,      // chave p/ acoplar Claude (vazio = não cadastrada)
     openai_key: String,         // chave p/ acoplar OpenAI/Codex
-    active_provider: String,    // "none" | "anthropic" | "openai" — SÓ UM ativo por vez
+    active_provider: String,    // "none" | "anthropic" | "openai" | "local" — SÓ UM ativo por vez
+    local_url: String,          // endpoint OpenAI-compat do modelo local (llama-server) — provider "local"
     cache_dir: String,          // pasta do cache por-QUERY (sinônimos consultados antes da IA)
     expansions: RwLock<HashMap<String, Vec<String>>>, // [#6] interior mut RW: search_expand cacheia sob outer-read; N readers
     thesaurus_dir: String,      // pasta dos dicionários por-PALAVRA (subdir/CODE com inuse.flag)
@@ -96,6 +97,7 @@ struct Config {
     anthropic_key: String,
     openai_key: String,
     active_provider: String,
+    local_url: String,
     cache_dir: String,
     thesaurus_dir: String,
     nidhogg_url: String,
@@ -118,6 +120,7 @@ impl Default for Config {
             anthropic_key: String::new(),
             openai_key: String::new(),
             active_provider: "none".to_string(),
+            local_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
             cache_dir: "cache".to_string(),
             thesaurus_dir: DEFAULT_THESAURUS_DIR.to_string(),
             nidhogg_url: "http://127.0.0.1:11497".to_string(),
@@ -160,6 +163,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "anthropic_key" => cfg.anthropic_key = v.to_string(),
             "openai_key"  => cfg.openai_key = v.to_string(),
             "active_provider" => cfg.active_provider = v.to_string(),
+            "local_url"   => cfg.local_url = v.to_string(),
             "cache_dir"   => cfg.cache_dir = v.to_string(),
             "thesaurus_dir" => cfg.thesaurus_dir = v.to_string(),
             "nidhogg_url" => cfg.nidhogg_url = v.to_string(),
@@ -625,6 +629,7 @@ fn main() {
         anthropic_key: cfg.anthropic_key.clone(),
         openai_key: cfg.openai_key.clone(),
         active_provider: cfg.active_provider.clone(),
+        local_url: cfg.local_url.clone(),
         cache_dir: cfg.cache_dir.clone(),
         expansions: RwLock::new({
             let t = load_expansions(&cfg.cache_dir);
@@ -906,7 +911,7 @@ fn parse_str_array(s: &str) -> Vec<String> {
 
 /// Chama o LLM ativo (via wget POST) pra expandir a query em sinônimos/reformulações.
 /// O LLM toca SÓ a query (uma frase) — o corpus nunca passa por aqui.
-fn llm_expand(provider: &str, key: &str, query: &str) -> Result<Vec<String>, String> {
+fn llm_expand(provider: &str, key: &str, local_url: &str, query: &str) -> Result<Vec<String>, String> {
     let prompt = format!(
         "Você é um expansor de consulta para um motor de busca LÉXICO (casamento de palavras) de \
          código-fonte e documentos em português. Dada a CONSULTA, gere de 4 a 6 reformulações curtas: \
@@ -920,6 +925,12 @@ fn llm_expand(provider: &str, key: &str, query: &str) -> Result<Vec<String>, Str
         "anthropic" => ("https://api.anthropic.com/v1/messages", "claude-3-5-haiku-20241022",
             vec![format!("x-api-key: {key}"), "anthropic-version: 2023-06-01".into()],
             json!({"model": "claude-3-5-haiku-20241022", "max_tokens": 300,
+                   "messages": [{"role": "user", "content": prompt}]}).to_string()),
+        // modelo LOCAL (llama-server na Aron, OpenAI-compat): sem chave, endpoint do cfg.
+        // Mesmo formato de request/response do openai — o parsing reaproveita choices[0].message.content.
+        "local" => (local_url, "local",
+            vec![],
+            json!({"model": "local", "temperature": 0.3, "stream": false,
                    "messages": [{"role": "user", "content": prompt}]}).to_string()),
         _ => return Err("provider inválido".into()),
     };
@@ -938,7 +949,7 @@ fn llm_expand(provider: &str, key: &str, query: &str) -> Result<Vec<String>, Str
     let resp = String::from_utf8_lossy(&out.stdout);
     let rv: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
     let content = match provider {
-        "openai" => rv["choices"][0]["message"]["content"].as_str(),
+        "openai" | "local" => rv["choices"][0]["message"]["content"].as_str(),
         "anthropic" => rv["content"][0]["text"].as_str(),
         _ => None,
     }.unwrap_or("");
@@ -1206,7 +1217,8 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     } else {
         let provider = st.active_provider.clone();
         let key = match provider.as_str() { "anthropic" => st.anthropic_key.clone(), "openai" => st.openai_key.clone(), _ => String::new() };
-        if provider == "none" || key.is_empty() {
+        // "local" não precisa de chave (llama-server sem auth) — só exige o endpoint no cfg.
+        if provider == "none" || (provider != "local" && key.is_empty()) {
             // [Issue #38] Quarto estágio: literal_fallback. Se a query tem tokens
             // alfanuméricos com dígito (ticket OE-6016, norma RFC1918, preço 1500),
             // o motor silábico é cego mas o grep literal acha. Só dispara aqui,
@@ -1235,7 +1247,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
             return (400, json!({"error": "nenhum dicionário ativo, sem cache e sem provider de IA — ative um dicionário na aba Dicionários ou um provider na aba Config (ou semeie cache/expansions.json)"}).to_string());
         }
         slog(&format!("   ├─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 aciona IA ({provider})"));
-        match llm_expand(&provider, &key, query) {
+        match llm_expand(&provider, &key, &st.local_url, query) {
             Ok(e) => {
                 let mut m = st.expansions.write();
                 m.insert(nkey.clone(), e.clone());
