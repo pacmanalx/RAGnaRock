@@ -1084,9 +1084,31 @@ function renderSummaries(s){
       return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${trunc}${renderContentGeneric(c)}</div>`;
     }).join('');
   return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
-    <p class="muted" style="margin:0 0 12px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
+    <p class="muted" style="margin:0 0 10px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
+    <div style="display:flex;gap:10px;align-items:center;margin:0 0 12px">
+      <button class="ghost" id="nv-regen-btn" onclick="nvRegenNow()">⟳ regenerar agora</button>
+      <span id="nv-regen-msg" style="color:var(--dim);font-size:12px"></span></div>
     ${renderPromptsPanel()}
     ${cards}`;
+}
+// [ciclo async] dispara /run (retorna na hora) e faz poll de cycle_running até terminar, então
+// recarrega a view. O servidor não trava — o botão não congela a tela.
+async function nvRegenNow(){
+  const btn=$('#nv-regen-btn'), msg=$('#nv-regen-msg');
+  try{ const r=await jpost('/api/nidhogg/run',{}); if(r&&r.started===false){ if(msg)msg.textContent='já há um ciclo em andamento…'; } }
+  catch(e){ if(msg)msg.textContent='erro: '+e.message; return; }
+  if(btn) btn.disabled=true;
+  nvPollCycle();
+}
+async function nvPollCycle(){
+  let running=true;
+  while(running){
+    await new Promise(r=>setTimeout(r,3000));
+    let d=null; try{d=await jget('/api/nidhogg')}catch(e){}
+    running = !!(d&&d.cycle_running);
+    const msg=$('#nv-regen-msg'); if(msg) msg.textContent = running ? '⏳ regenerando… (IA da frota, ~1min/coleção)' : '✓ pronto';
+  }
+  loadNidViz();   // recarrega Summaries + prompts com o resultado fresco
 }
 // [prompts] painel de biblioteca de prompts — CRUD de templates + atribuição por nível/coleção.
 function renderPromptsPanel(){
