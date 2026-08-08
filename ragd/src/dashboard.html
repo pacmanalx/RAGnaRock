@@ -1080,7 +1080,8 @@ function renderSummaries(s){
     : arr.map(it=>{
       const su=it.summary||{}, c=su.content||{}, p=su.provenance||{};
       const head=`<div><b style="font-size:15px;color:#e6edf3">${esc(it.collection)}</b> <span class="muted" style="font-size:11px">· template <b>${esc(p.template||'padrão')}</b> (${esc(p.resolved_from||'?')}) · ${p.sampled_docs||0} docs · ${esc(su.updated||'')}</span></div>`;
-      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${renderContentGeneric(c)}</div>`;
+      const trunc = su.truncated ? `<div style="border:1px solid var(--warn);border-radius:6px;padding:7px 11px;color:var(--warn);font-size:12px;background:rgba(210,153,34,.09)">⚠ Resultado <b>CORTADO</b> no teto de ${(p.max_tokens||'?')} tokens (finish_reason=length). Aumente o <b>max tokens</b> deste template no painel ⚙ Prompts, ou peça algo mais conciso.</div>` : '';
+      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${trunc}${renderContentGeneric(c)}</div>`;
     }).join('');
   return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
     <p class="muted" style="margin:0 0 12px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
@@ -1101,8 +1102,9 @@ function renderPromptsPanel(){
     ? `<div style="color:var(--dim);border:1px dashed var(--line);border-radius:6px;padding:28px 16px;text-align:center">Selecione um template à esquerda pra editar,<br>ou clique <b style="color:var(--acc)">+ novo</b> pra criar.</div>`
     : `<div style="display:flex;flex-direction:column;gap:8px">
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <input id="nvp-name" placeholder="nome do template" value="${esc(ed)}" ${ed?'readonly':''} style="flex:0 0 180px">
-          <input id="nvp-desc" placeholder="descrição curta" value="${esc(cur.description||'')}" style="flex:1 1 180px">
+          <input id="nvp-name" placeholder="nome do template" value="${esc(ed)}" ${ed?'readonly':''} style="flex:0 0 160px">
+          <input id="nvp-desc" placeholder="descrição curta" value="${esc(cur.description||'')}" style="flex:1 1 150px">
+          <input id="nvp-mt" type="number" min="64" max="4000" placeholder="max tokens" value="${cur.max_tokens!=null?cur.max_tokens:''}" title="teto de geração (default 1500, máx 4000). Suba se o resultado cortar." style="flex:0 0 110px">
         </div>
         <textarea id="nvp-sys" rows="7" placeholder="system prompt — instrua O QUE extrair e as CHAVES do JSON (ex.: sumario, partes, valores, riscos)">${esc(cur.system||'')}</textarea>
         <div style="display:flex;gap:8px;align-items:center">
@@ -1137,7 +1139,8 @@ function nvpEditT(n){ _nvpEdit=n; renderNidViz2(); }
 async function nvpSaveT(){
   const name=($('#nvp-name').value||'').trim(), description=$('#nvp-desc').value||'', system=$('#nvp-sys').value||'';
   if(!name||!system.trim()){ $('#nvp-msg').textContent='nome e system são obrigatórios'; return; }
-  try{ await jpost('/api/nidhogg/prompts/template',{name,description,system}); }catch(e){ $('#nvp-msg').textContent='erro: '+e.message; return; }
+  const body={name,description,system}; const mt=($('#nvp-mt').value||'').trim(); if(mt) body.max_tokens=+mt;
+  try{ await jpost('/api/nidhogg/prompts/template',body); }catch(e){ $('#nvp-msg').textContent='erro: '+e.message; return; }
   _nvpEdit=null; try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} renderNidViz2();
 }
 async function nvpAssign(scope,key,template){

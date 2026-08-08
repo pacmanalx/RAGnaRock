@@ -361,9 +361,13 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let desc = v["description"].as_str().unwrap_or("").to_string();
             let dir = { st.lock().unwrap().dir.clone() };
             let mut lib = read_prompts(&dir);
-            lib["templates"][name.as_str()] = json!({"description": desc, "system": system, "updated": now_stamp()});
+            let mut tobj = json!({"description": desc, "system": system, "updated": now_stamp()});
+            // #3 max_tokens opcional por template (clampado ao teto); ausente = default global.
+            if let Some(mt) = v["max_tokens"].as_u64() { tobj["max_tokens"] = json!(mt.clamp(64, SUMMARY_MAX_TOKENS_CEIL)); }
+            lib["templates"][name.as_str()] = tobj;
             write_prompts(&dir, &lib);
-            nlog(&format!("prompt template {name:?} salvo ({} chars)", system.chars().count()));
+            nlog(&format!("prompt template {name:?} salvo ({} chars, max_tokens={})", system.chars().count(),
+                          v["max_tokens"].as_u64().map(|m| m.to_string()).unwrap_or_else(|| "default".into())));
             (200, json!({"ok":true,"template":name}).to_string())
         }
         (Method::Post, "/api/nidhogg/prompts/assign") => {
@@ -556,6 +560,8 @@ fn mine_cachedigest(api: &str) -> Option<Value> {
 const SUMMARY_CHAR_BUDGET: usize = 40_000;   // ~11k tokens PT; cabe no ctx 16384/slot com folga p/ prompt+saída
 const EXCERPT_CHARS: usize = 1500;           // recorte por documento amostrado
 const PROMPT_MAX_CHARS: usize = 6000;        // teto do system prompt de um template (cabe no ctx com folga)
+const SUMMARY_MAX_TOKENS: u64 = 1500;        // teto DEFAULT de geração do Summary (é resumo, não dump)
+const SUMMARY_MAX_TOKENS_CEIL: u64 = 4000;   // teto MÁXIMO configurável por template (trava runaway mesmo custom)
 /// Prompt embutido (fallback quando prompts.json some/corrompe, e seed do template "padrão").
 /// O daemon NUNCA fica sem prompt. As chaves aqui são as DEFAULT; um template pode definir outras.
 const BUILTIN_SUMMARY_PROMPT: &str = "Você é um analista que resume coleções de documentos em português. Seja FIEL ao material amostrado; não invente fatos. Responda APENAS com um objeto JSON com as chaves: \"abstract\" (2 a 4 frases resumindo a coleção), \"themes\" (array de 3 a 6 temas), \"entities\" (array de nomes próprios, organizações e produtos citados) e \"key_points\" (array de 3 a 6 pontos concretos).";
@@ -588,15 +594,21 @@ fn write_prompts(dir: &str, v: &Value) {
 }
 /// Resolve o template pra (nível, coleção): override da coleção → default do nível → BUILTIN.
 /// Devolve (nome, system, resolved_from) — resolved_from vai na proveniência (debug do 3-camadas).
-fn resolve_template(lib: &Value, level: u8, coll: &str) -> (String, String, String) {
-    let sys_of = |name: &str| lib["templates"][name]["system"].as_str().map(String::from);
+fn resolve_template(lib: &Value, level: u8, coll: &str) -> (String, String, String, u64) {
+    // devolve (nome, system, resolved_from, max_tokens). max_tokens vem do template (#3),
+    // com default e teto — clampado pra nunca virar runaway mesmo se o cadastro exagerar.
+    let get = |name: &str| {
+        let t = &lib["templates"][name];
+        t["system"].as_str().map(|s| (s.to_string(),
+            t["max_tokens"].as_u64().unwrap_or(SUMMARY_MAX_TOKENS).clamp(64, SUMMARY_MAX_TOKENS_CEIL)))
+    };
     if let Some(name) = lib["collections"][coll].as_str() {
-        if let Some(sys) = sys_of(name) { return (name.to_string(), sys, "collection".into()); }
+        if let Some((sys, mt)) = get(name) { return (name.to_string(), sys, "collection".into(), mt); }
     }
     if let Some(name) = lib["level_default"][level.to_string()].as_str() {
-        if let Some(sys) = sys_of(name) { return (name.to_string(), sys, "level_default".into()); }
+        if let Some((sys, mt)) = get(name) { return (name.to_string(), sys, "level_default".into(), mt); }
     }
-    ("padrão".into(), BUILTIN_SUMMARY_PROMPT.to_string(), "builtin".into())
+    ("padrão".into(), BUILTIN_SUMMARY_PROMPT.to_string(), "builtin".into(), SUMMARY_MAX_TOKENS)
 }
 
 /// Extrai um objeto JSON de um texto (tolera fences/prosa em volta). Análogo ao parse_str_array
@@ -641,24 +653,33 @@ fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, sr
     if used == 0 { nlog(&format!("summary {coll}: 0 chunks amostrados")); return None; }
     // resolve o template (coleção → nível → builtin); o system prompt define O QUE extrair
     // (inclusive as CHAVES do JSON — a UI renderiza genérico). phash entra no gate de invalidação.
-    let (tname, sys, resolved_from) = resolve_template(lib, level, coll);
-    let phash = hash_hex(&sys);
+    let (tname, sys, resolved_from, max_tokens) = resolve_template(lib, level, coll);
+    // prompt_hash cobre system E max_tokens: mudar o teto altera a SAÍDA (trunca/solta), então
+    // tem que invalidar o Summary igual mudar o texto. Sem isso, subir o teto não regeneraria.
+    let phash = hash_hex(&format!("{sys}|mt={max_tokens}"));
     let user = format!("COLEÇÃO: {coll} — {used} documento(s) amostrado(s).\n\nEXCERTOS:\n{excerpts}");
-    // max_tokens CAPADO: sem teto, um prompt "liste tudo" faz o modelo despejar geração
-    // longuíssima que estoura o timeout do http_post_t (→ None → não atualiza) e ainda gera
-    // JSON gigante/truncado. 1500 tokens bounda o Summary (é resumo, não dump) e mantém o
-    // ciclo rápido. Prompt que peça listagem exaustiva deve pedir "os principais / até N".
+    // #3 max_tokens vem do template (default 1500, teto SUMMARY_MAX_TOKENS_CEIL). Sem teto, um
+    // prompt "liste tudo" gera geração longuíssima que estoura o timeout (→ None → não atualiza)
+    // e trunca o JSON. O timeout escala com o teto (~12 tok/s conservador + folga de prompt-eval).
     let body = json!({"messages":[{"role":"system","content":sys},{"role":"user","content":user}],
-                      "temperature":0.2, "max_tokens":1500}).to_string();
-    let resp = http_post_t(llm_url, &body, 180)?;
-    let content = serde_json::from_str::<Value>(&resp).ok()
-        .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(String::from))?;
-    let content_val = extract_json_object(&content)
-        .unwrap_or_else(|| json!({"raw": content, "note": "LLM não devolveu JSON válido; texto cru preservado"}));
+                      "temperature":0.2, "max_tokens":max_tokens}).to_string();
+    let to = ((max_tokens / 12) + 120).min(500) as u32;
+    let resp = http_post_t(llm_url, &body, to)?;
+    let rv: Value = serde_json::from_str(&resp).ok()?;
+    let content = rv["choices"][0]["message"]["content"].as_str().map(String::from)?;
+    // #2 detecção de truncamento: finish_reason == "length" = bateu no teto de tokens (cortado).
+    let finish = rv["choices"][0]["finish_reason"].as_str().unwrap_or("").to_string();
+    let truncated = finish == "length";
+    let completion_tokens = rv["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let content_val = extract_json_object(&content).unwrap_or_else(|| json!({"raw": content,
+        "note": if truncated { "cortado no teto de tokens antes de fechar o JSON — aumente o max_tokens do template ou peça algo mais conciso" }
+                else { "LLM não devolveu JSON válido; texto cru preservado" }}));
     Some(json!({
         "type": "Summary", "level": 1, "updated": now_stamp(), "source_hash": src, "prompt_hash": phash,
+        "truncated": truncated,
         "provenance": {"via": "level1/llm", "template": tname, "resolved_from": resolved_from,
-                       "prompt_hash": phash, "sampled_docs": used, "scanned_bases": scanned,
+                       "prompt_hash": phash, "max_tokens": max_tokens, "completion_tokens": completion_tokens,
+                       "finish_reason": finish, "sampled_docs": used, "scanned_bases": scanned,
                        "char_budget": SUMMARY_CHAR_BUDGET, "at": now_stamp()},
         "content": content_val
     }))
@@ -689,9 +710,10 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                 // Editar/reatribuir um template muda o prompt_hash → invalida o Summary mesmo
                 // sem o corpus mudar (o caminho de invalidação que a cadência exercita).
                 let summ_same = if level >= 1 {
-                    let (_, exp_sys, _) = resolve_template(&lib, level, coll);
+                    let (_, exp_sys, _, exp_mt) = resolve_template(&lib, level, coll);
+                    let exp_ph = hash_hex(&format!("{exp_sys}|mt={exp_mt}"));
                     k["summary"]["source_hash"].as_str() == Some(src.as_str())
-                        && k["summary"]["prompt_hash"].as_str() == Some(hash_hex(&exp_sys).as_str())
+                        && k["summary"]["prompt_hash"].as_str() == Some(exp_ph.as_str())
                 } else { true };
                 if !force && l0_same && (level < 1 || summ_same) {
                     skipped.push(coll.clone());
