@@ -136,7 +136,7 @@ fn now_stamp() -> String {
     let (y, mo, d) = civil_from_days(days);
     format!("{y:04}-{mo:02}-{d:02} {:02}:{:02}:{:02}", tod / 3600, (tod % 3600) / 60, tod % 60)
 }
-fn nlog(line: &str) { println!("[{}] [nidhogg] {line}", now_stamp()); }
+fn nlog(line: &str) { use std::io::Write; println!("[{}] [nidhogg] {line}", now_stamp()); std::io::stdout().flush().ok(); }
 
 // ───────────────────────────── HTTP client (via wget, no espírito do ragd) ─────────────────────────────
 fn http_get(url: &str) -> Option<String> { http_get_t(url, 3) }
@@ -570,7 +570,7 @@ fn mine_cachedigest(api: &str) -> Option<Value> {
 }
 
 // ───────────────────────────── nível 1 (consciente) — Summary por coleção (#22) ─────────────────────────────
-const SUMMARY_CHAR_BUDGET: usize = 40_000;   // ~11k tokens PT; cabe no ctx 16384/slot com folga p/ prompt+saída
+const SUMMARY_CHAR_BUDGET: usize = 20_000;   // ~7k tokens PT; cabe FOLGADO no ctx 16384/slot c/ saída até 4k (40k estourava e devolvia None mudo)
 const EXCERPT_CHARS: usize = 1500;           // recorte por documento amostrado
 const PROMPT_MAX_CHARS: usize = 6000;        // teto do system prompt de um template (cabe no ctx com folga)
 const SUMMARY_MAX_TOKENS: u64 = 1500;        // teto DEFAULT de geração do Summary (é resumo, não dump)
@@ -634,67 +634,139 @@ fn extract_json_object(s: &str) -> Option<Value> {
 
 /// Amostra conteúdo da coleção via /chunk (NUNCA disco), orçado por CARACTERES (não contagem):
 /// 1º chunk de cada base, em ordem, recortado, até estourar o teto. Devolve (excertos, usados, escaneadas).
-fn sample_chunks(api: &str, coll: &str, bases: &[Value], budget: usize) -> (String, usize, usize) {
-    let mut out = String::new();
-    let (mut used, mut scanned) = (0usize, 0usize);
-    for b in bases {
-        if out.len() >= budget || scanned >= 60 { break; }   // teto de fetches p/ coleção gigante
-        scanned += 1;
-        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
-        let req = json!({"collection": coll, "base": name, "id": 0}).to_string();
-        let text = http_post_t(&format!("{api}/chunk"), &req, 20)
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v["chunks"][0]["text"].as_str().map(String::from));
-        if let Some(t) = text {
-            let excerpt = format!("### {name}\n{}\n\n", t.chars().take(EXCERPT_CHARS).collect::<String>());
-            if out.len() + excerpt.len() > budget { break; }
-            out.push_str(&excerpt);
-            used += 1;
+
+// ───────────────────────────── merge genérico do acumulado (incremental) ─────────────────────────────
+/// Chave estável de um objeto pra dedup no merge: cnpj → id/codigo → nome → serialização inteira.
+fn obj_key(v: &Value) -> String {
+    for k in ["cnpj", "CNPJ", "id", "codigo", "nome", "name", "titulo"] {
+        if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+            if !s.trim().is_empty() { return format!("{k}={}", s.trim().to_lowercase()); }
         }
     }
-    (out, used, scanned)
+    v.to_string()
+}
+/// Funde um valor no acumulado. ARRAY acumula (objetos dedup por obj_key; escalares por união);
+/// qualquer outro tipo (string/número/objeto) SUBSTITUI — a última versão vence. Contrato: arrays
+/// acumulam, o resto substitui. Determinístico e inspecionável.
+fn merge_value(av: &mut Value, nv: &Value) {
+    if let (Value::Array(a), Value::Array(n)) = (&mut *av, nv) {
+        for item in n {
+            let dup = if item.is_object() { let key = obj_key(item); a.iter().any(|x| obj_key(x) == key) }
+                      else { a.iter().any(|x| x == item) };
+            if !dup { a.push(item.clone()); }
+        }
+    } else { *av = nv.clone(); }
+}
+/// Funde o content de um batch no acumulado (o template define as chaves — genérico sobre o shape).
+fn merge_content(acc: &mut Value, new: &Value) {
+    if !acc.is_object() { *acc = new.clone(); return; }
+    if let Some(nobj) = new.as_object() {
+        for (k, nv) in nobj {
+            match acc.get_mut(k.as_str()) {
+                Some(av) => merge_value(av, nv),
+                None => { acc[k.as_str()] = nv.clone(); }
+            }
+        }
+    }
+}
+/// Soma dos tamanhos de array no content (pro invariante "arrays não encolhem" no log).
+fn array_len_sum(c: &Value) -> usize {
+    c.as_object().map(|o| o.values().filter_map(|v| v.as_array().map(|a| a.len())).sum()).unwrap_or(0)
 }
 
 /// Nível 1 — Summary de UMA coleção. Amostra conteúdo (via /chunk) e pede ao LLM um resumo
 /// estruturado. ⚠️ é o 1º ponto em que CONTEÚDO do corpus sai da caixa (vai pro llm_url) —
 /// por isso o llm_url deve ser a IA da frota. Retorna None só se não houve amostra ou o LLM
 /// não respondeu (não sobrescreve o Summary anterior). Parse tolerante: sem JSON → content.raw.
-fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, src: &str) -> Option<Value> {
+fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, src: &str, prev: &Value) -> Option<Value> {
+    let (tname, sys, resolved_from, max_tokens) = resolve_template(lib, level, coll);
+    let phash = hash_hex(&format!("{sys}|mt={max_tokens}"));
+    // RESET quando prompt/teto mudam: o acumulado foi extraído sob OUTRA instrução → não mistura.
+    let reset = prev["prompt_hash"].as_str() != Some(phash.as_str());
+    let mut acc = if reset { json!({}) } else { prev["content"].clone() };
+    if !acc.is_object() { acc = json!({}); }
+    let mut processed: serde_json::Map<String, Value> =
+        if reset { serde_json::Map::new() } else { prev["processed"].as_object().cloned().unwrap_or_default() };
+
+    // FILA de não-processadas: base ausente do checkpoint OU com state_hash diferente (#21 diff).
+    // Agregadoras (índice/cadastro/00_/relacoes) primeiro — trazem a lista completa e convergem rápido.
     let bases_resp: Value = serde_json::from_str(&http_get_t(&format!("{api}/bases?collection={coll}"), 30)?).ok()?;
     let bases = bases_resp["bases"].as_array()?.clone();
-    let (excerpts, used, scanned) = sample_chunks(api, coll, &bases, SUMMARY_CHAR_BUDGET);
-    if used == 0 { nlog(&format!("summary {coll}: 0 chunks amostrados")); return None; }
-    // resolve o template (coleção → nível → builtin); o system prompt define O QUE extrair
-    // (inclusive as CHAVES do JSON — a UI renderiza genérico). phash entra no gate de invalidação.
-    let (tname, sys, resolved_from, max_tokens) = resolve_template(lib, level, coll);
-    // prompt_hash cobre system E max_tokens: mudar o teto altera a SAÍDA (trunca/solta), então
-    // tem que invalidar o Summary igual mudar o texto. Sem isso, subir o teto não regeneraria.
-    let phash = hash_hex(&format!("{sys}|mt={max_tokens}"));
-    let user = format!("COLEÇÃO: {coll} — {used} documento(s) amostrado(s).\n\nEXCERTOS:\n{excerpts}");
-    // #3 max_tokens vem do template (default 1500, teto SUMMARY_MAX_TOKENS_CEIL). Sem teto, um
-    // prompt "liste tudo" gera geração longuíssima que estoura o timeout (→ None → não atualiza)
-    // e trunca o JSON. O timeout escala com o teto (~12 tok/s conservador + folga de prompt-eval).
+    let total = bases.len();
+    let is_agg = |name: &str| { let n = name.to_lowercase();
+        n.contains("indice") || n.contains("índice") || n.contains("cadastro") || n.contains("resumo")
+        || n.contains("relaco") || n.starts_with("00_") };
+    let mut queue: Vec<&Value> = bases.iter().filter(|b| {
+        let name = b["name"].as_str().unwrap_or("");
+        processed.get(name).and_then(|v| v.as_str()) != Some(base_state_hash(b).as_str())
+    }).collect();
+    queue.sort_by_key(|b| !is_agg(b["name"].as_str().unwrap_or("")));
+    if queue.is_empty() { return None; }   // CONVERGIU: tudo processado com o hash atual, mantém.
+
+    // BATCH: bases da fila até o orçamento. Extrai SÓ o batch (o acumulado NÃO vai ao LLM — nada de
+    // resumo-de-resumo; o merge é programático). Marca as bases fetchadas como processadas.
+    // Base agregadora (índice/cadastro/resumo/relações) NUNCA divide batch com filler: diluída entre
+    // dezenas de excerpts, o 7B pega as primeiras linhas e para (medido 7/15 fornecedores). Sozinha → 15/15.
+    // Como a fila vem ordenada com agregadoras à frente, isolá-las 1-a-1 gasta poucos ciclos focados.
+    let head_is_agg = queue.first().map(|b| is_agg(b["name"].as_str().unwrap_or(""))).unwrap_or(false);
+    let batch_cap = if head_is_agg { 1 } else { 60 };
+    let mut excerpts = String::new();
+    let mut batch: Vec<(String, String)> = vec![];
+    for b in &queue {
+        if excerpts.len() >= SUMMARY_CHAR_BUDGET || batch.len() >= batch_cap { break; }
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let req = json!({"collection": coll, "base": name, "id": 0}).to_string();
+        if let Some(text) = http_post_t(&format!("{api}/chunk"), &req, 20)
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v["chunks"][0]["text"].as_str().map(String::from)) {
+            let ex = format!("### {name}\n{}\n\n", text.chars().take(EXCERPT_CHARS).collect::<String>());
+            if excerpts.len() + ex.len() > SUMMARY_CHAR_BUDGET { break; }
+            excerpts.push_str(&ex);
+            batch.push((name.to_string(), base_state_hash(b)));
+        }
+    }
+    if batch.is_empty() { return None; }
+
+    let user = format!("COLEÇÃO: {coll} — lote de {} documento(s).\n\nEXCERTOS:\n{excerpts}", batch.len());
     let body = json!({"messages":[{"role":"system","content":sys},{"role":"user","content":user}],
                       "temperature":0.2, "max_tokens":max_tokens}).to_string();
     let to = ((max_tokens / 12) + 120).min(500) as u32;
-    let resp = http_post_t(llm_url, &body, to)?;
-    let rv: Value = serde_json::from_str(&resp).ok()?;
-    let content = rv["choices"][0]["message"]["content"].as_str().map(String::from)?;
-    // #2 detecção de truncamento: finish_reason == "length" = bateu no teto de tokens (cortado).
+    let resp = match http_post_t(llm_url, &body, to) {
+        Some(r) => r,
+        None => { nlog(&format!("summary {coll}: LLM sem resposta (timeout {to}s · lote {} bases · ~{}KB) — mantém acumulado, retenta no próximo ciclo", batch.len(), excerpts.len()/1024)); return None; }
+    };
+    let rv: Value = match serde_json::from_str(&resp) {
+        Ok(v) => v,
+        Err(_) => { nlog(&format!("summary {coll}: resposta LLM não-JSON ({} bytes) — mantém acumulado", resp.len())); return None; }
+    };
+    let content = match rv["choices"][0]["message"]["content"].as_str() {
+        Some(c) => c.to_string(),
+        None => { nlog(&format!("summary {coll}: LLM sem content (err={}) — mantém acumulado", rv["error"].to_string().chars().take(160).collect::<String>())); return None; }
+    };
     let finish = rv["choices"][0]["finish_reason"].as_str().unwrap_or("").to_string();
     let truncated = finish == "length";
-    let completion_tokens = rv["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    let content_val = extract_json_object(&content).unwrap_or_else(|| json!({"raw": content,
-        "note": if truncated { "cortado no teto de tokens antes de fechar o JSON — aumente o max_tokens do template ou peça algo mais conciso" }
-                else { "LLM não devolveu JSON válido; texto cru preservado" }}));
+    let batch_content = extract_json_object(&content).unwrap_or_else(|| json!({"raw": content,
+        "note": if truncated { "lote cortado no teto de tokens — aumente o max_tokens do template" }
+                else { "LLM não devolveu JSON válido neste lote; texto cru preservado" }}));
+
+    // MERGE do batch no acumulado + marca processadas. Invariante: arrays NÃO encolhem (só push/dedup).
+    let before = array_len_sum(&acc);
+    merge_content(&mut acc, &batch_content);
+    let after = array_len_sum(&acc);
+    for (name, sh) in &batch { processed.insert(name.clone(), json!(sh)); }
+    let done = processed.len();
+    let cobertura_completa = done >= total;  // TODAS as bases vistas 1×, NÃO garantia de extração completa
+    nlog(&format!("summary {coll}: lote {} · acumulado {}/{} bases · arrays {}→{} · {}",
+        batch.len(), done, total, before, after, if cobertura_completa { "COBERTURA COMPLETA (todas vistas 1×) ✓" } else { "varrendo" }));
+
     Some(json!({
         "type": "Summary", "level": 1, "updated": now_stamp(), "source_hash": src, "prompt_hash": phash,
-        "truncated": truncated,
-        "provenance": {"via": "level1/llm", "template": tname, "resolved_from": resolved_from,
-                       "prompt_hash": phash, "max_tokens": max_tokens, "completion_tokens": completion_tokens,
-                       "finish_reason": finish, "sampled_docs": used, "scanned_bases": scanned,
-                       "char_budget": SUMMARY_CHAR_BUDGET, "at": now_stamp()},
-        "content": content_val
+        "truncated": truncated, "cobertura_completa": cobertura_completa, "processed": Value::Object(processed),
+        "provenance": {"via": "level1/llm/incremental", "template": tname, "resolved_from": resolved_from,
+                       "prompt_hash": phash, "max_tokens": max_tokens,
+                       "processadas": done, "total_bases": total, "cobertura_completa": cobertura_completa,
+                       "batch_size": batch.len(), "at": now_stamp()},
+        "content": acc
     }))
 }
 
@@ -723,43 +795,34 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
         match mine_level0(&api, coll) {
             Some((src, pillars, n_bases, total_chunks)) => {
-                // Gating: pula só se o nível 0 não mudou E (não é nível >=1 OU o Summary já é
-                // deste source_hash). Assim, subir 0→1 numa coleção já minerada gera o Summary
-                // mesmo sem mudança de corpus (o furo que o run_cycle antigo tinha).
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
-                // summ_same = corpo (source_hash) E prompt resolvido (prompt_hash) inalterados.
-                // Editar/reatribuir um template muda o prompt_hash → invalida o Summary mesmo
-                // sem o corpus mudar (o caminho de invalidação que a cadência exercita).
-                let summ_same = if level >= 1 {
-                    let (_, exp_sys, _, exp_mt) = resolve_template(&lib, level, coll);
-                    let exp_ph = hash_hex(&format!("{exp_sys}|mt={exp_mt}"));
-                    k["summary"]["source_hash"].as_str() == Some(src.as_str())
-                        && k["summary"]["prompt_hash"].as_str() == Some(exp_ph.as_str())
-                } else { true };
-                if !force && l0_same && (level < 1 || summ_same) {
-                    skipped.push(coll.clone());
-                    continue;
-                }
-                // nível 0 (sempre que não pulou): re-grava os pilares (mesmo dado se l0_same).
-                k["level"] = json!(if level >= 1 { 1 } else { 0 });
-                k["source_hash"] = json!(src);
-                k["updated"] = json!(now_stamp());
-                k["knowledge"] = json!(pillars);
-                k["provenance"] = json!({
-                    "digestion_id": format!("l0-{}", &src[..src.len().min(8)]),
-                    "at": now_stamp(), "via": "level0/no-ai",
-                    "inputs": {"bases": n_bases, "total_chunks": total_chunks, "source_hash": src},
-                });
-                // nível 1 (consciente): gera o Summary com IA se level>=1 e (forçado ou stale).
-                // Falha do LLM não derruba o ciclo — mantém o Summary anterior.
-                if level >= 1 && (force || !summ_same) {
-                    match mine_summary(&api, &llm_url, &lib, level, coll, &src) {
-                        Some(s) => { k["summary"] = s; summarized.push(coll.clone()); }
-                        None => nlog(&format!("summary {coll}: LLM não respondeu · mantém anterior")),
+                // nível 1 INCREMENTAL: processa UM batch da fila de não-processadas por ciclo,
+                // acumulando. Some = progrediu (mais bases/entidades); None = convergiu (nada a
+                // fazer) OU o LLM falhou. mine_summary lê/atualiza o acumulado em k["summary"],
+                // reseta se o prompt mudou, e converge em N ciclos até cobrir TODAS as bases.
+                let mut summ_updated = false;
+                if level >= 1 {
+                    if let Some(s) = mine_summary(&api, &llm_url, &lib, level, coll, &src, &k["summary"]) {
+                        k["summary"] = s; summ_updated = true;
                     }
                 }
-                write_knowledge(&dir, coll, &k);   // grava os 2 artefatos ATÔMICO (1 escrita)
-                mined.push(coll.clone());
+                // grava se o nível 0 mudou/forçado OU o Summary progrediu (senão nada a persistir).
+                if force || !l0_same || summ_updated {
+                    k["level"] = json!(if level >= 1 { 1 } else { 0 });
+                    k["source_hash"] = json!(src);
+                    k["updated"] = json!(now_stamp());
+                    k["knowledge"] = json!(pillars);
+                    k["provenance"] = json!({
+                        "digestion_id": format!("l0-{}", &src[..src.len().min(8)]),
+                        "at": now_stamp(), "via": "level0/no-ai",
+                        "inputs": {"bases": n_bases, "total_chunks": total_chunks, "source_hash": src},
+                    });
+                    write_knowledge(&dir, coll, &k);   // nível 0 + Summary numa escrita atômica
+                    if !l0_same || force { mined.push(coll.clone()); }
+                    if summ_updated { summarized.push(coll.clone()); }
+                } else {
+                    skipped.push(coll.clone());
+                }
             }
             None => failed.push(coll.clone()),
         }
