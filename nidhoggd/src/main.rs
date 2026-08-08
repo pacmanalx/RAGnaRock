@@ -114,6 +114,7 @@ struct State {
     last_cycle: String,
     ragd_online: bool,     // cache do keepalive (atualizado por thread leve) — status NUNCA faz curl ao vivo
     ragd_health: Value,    // último /health do ragd
+    cycle_running: bool,   // um ciclo em andamento? (worker OU /run async). Impede concorrência.
 }
 
 // ───────────────────────────── timestamp (civil, sem dependência) ─────────────────────────────
@@ -301,6 +302,7 @@ fn status_json(st: &State) -> Value {
         "cadence_secs": st.cadence,
         "dir": st.dir,
         "collections_known": known_count(&st.dir),
+        "cycle_running": st.cycle_running,   // um ciclo (worker ou /run async) em andamento
         "last_cycle": st.last_cycle,
         "ragd_api": st.ragd_api,
         "ragd_online": st.ragd_online,   // cache do keepalive (instantâneo)
@@ -408,7 +410,18 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         }
         // dispara um ciclo AGORA, FORÇADO (re-minera o nível 0 ignorando o source_hash).
         // É o "atualiza já" — e o caminho de refresh quando os dados não mudaram.
-        (Method::Post, "/api/nidhogg/run") => { nlog("run manual — forçando ciclo nível 0"); (200, run_cycle(st, true).to_string()) }
+        // ASSÍNCRONO: spawna o ciclo numa thread e retorna NA HORA — o servidor single-thread
+        // não trava mais durante a geração. cycle_running impede disparo concorrente.
+        (Method::Post, "/api/nidhogg/run") => {
+            if try_start_cycle(st) {
+                let st2 = st.clone();
+                std::thread::spawn(move || { run_cycle(&st2, true); end_cycle(&st2); });
+                nlog("run manual — ciclo FORÇADO iniciado (async)");
+                (202, json!({"ok":true,"started":true,"note":"ciclo em andamento — acompanhe cycle_running no status"}).to_string())
+            } else {
+                (200, json!({"ok":true,"started":false,"reason":"já há um ciclo em andamento"}).to_string())
+            }
+        }
         _ => (404, json!({"error":"rota não encontrada","path":path}).to_string()),
     }
 }
@@ -685,6 +698,14 @@ fn mine_summary(api: &str, llm_url: &str, lib: &Value, level: u8, coll: &str, sr
     }))
 }
 
+/// Cadeado de ciclo: impede que worker e /run rodem ao mesmo tempo (ou dois /run). Devolve
+/// true se ESTE chamador pegou o cadeado; false se já havia um ciclo. Pareado com end_cycle.
+fn try_start_cycle(st: &Arc<Mutex<State>>) -> bool {
+    let mut s = st.lock().unwrap();
+    if s.cycle_running { false } else { s.cycle_running = true; true }
+}
+fn end_cycle(st: &Arc<Mutex<State>>) { if let Ok(mut s) = st.lock() { s.cycle_running = false; } }
+
 /// Roda UM ciclo. `force=true` (/run manual) re-minera sempre; `force=false` (cadência do
 /// worker) pula coleção sem mudança (source_hash igual). NÃO segura o lock durante HTTP/IO.
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
@@ -770,8 +791,9 @@ fn worker(state: Arc<Mutex<State>>) {
         let (on, online) = { let s = state.lock().unwrap(); (s.on, s.ragd_online) };
         if !on { continue; }
         if !online { nlog("ciclo pulado: ragd OFFLINE"); continue; }
-        // TODO(IA nível >=1): por coleção HABILITADA, gerar Summary/Tree/Doc e persistir c/ proveniência.
+        if !try_start_cycle(&state) { nlog("ciclo da cadência pulado: já há um ciclo (ex. /run) em andamento"); continue; }
         let r = run_cycle(&state, false);   // cadência NÃO força: respeita o source_hash
+        end_cycle(&state);
         nlog(&format!("ciclo nível 0 — minou={} pulou={} falhou={}",
             r["mined"].as_array().map(|a| a.len()).unwrap_or(0),
             r["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
@@ -824,7 +846,7 @@ fn main() {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(), cfg_path: cfg.cfg_path.clone(),
         started: Instant::now(), last_cycle: String::new(),
-        ragd_online: false, ragd_health: Value::Null,
+        ragd_online: false, ragd_health: Value::Null, cycle_running: false,
     }));
 
     println!("🐉 Níðhöggr {VERSION} — camada de inteligência (daemon de módulos)");
