@@ -994,8 +994,7 @@ async function loadNidViz(){
     // Nível 1 (consciente) JÁ IMPLEMENTADO (#22): renderiza o Summary destilado por coleção.
     if(_nvLevel===1){
       try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){_nvprompts=null;}
-      let s=null; try{s=await jget('/api/nidhogg/summary')}catch(e){}
-      $('#nv-future').innerHTML=renderSummaries(s);
+      await renderNidViz2();   // classes + vocabulário (doctypes) + prompts + summaries
       return;
     }
     // Níveis 2/3: ainda esqueleto — placeholder que puxa a implementação.
@@ -1074,7 +1073,7 @@ function renderContentGeneric(c){
     return `<div>${lbl(k)} ${esc(String(v))}</div>`;
   }).join('');
 }
-function renderSummaries(s){
+function renderSummaries(s, withPrompts=true){
   const arr=(s&&s.summaries)||[];
   const cards=!arr.length ? `<p class="muted">Nenhum Summary destilado ainda — habilite uma coleção e force um ciclo (ou aguarde a cadência). Consome IA (o LLM da frota).</p>`
     : arr.map(it=>{
@@ -1090,12 +1089,9 @@ function renderSummaries(s){
       const trunc = su.truncated ? `<div style="border:1px solid var(--warn);border-radius:6px;padding:7px 11px;color:var(--warn);font-size:12px;background:rgba(210,153,34,.09)">⚠ Resultado <b>CORTADO</b> no teto de ${(p.max_tokens||'?')} tokens (finish_reason=length). Aumente o <b>max tokens</b> deste template no painel ⚙ Prompts, ou peça algo mais conciso.</div>` : '';
       return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${trunc}${renderContentGeneric(c)}</div>`;
     }).join('');
-  return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Nível 1 · consciente — Summary destilado por coleção</h2>
+  return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Summary destilado por coleção</h2>
     <p class="muted" style="margin:0 0 10px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
-    <div style="display:flex;gap:10px;align-items:center;margin:0 0 12px">
-      <button class="ghost" id="nv-regen-btn" onclick="nvRegenNow()">⟳ regenerar agora</button>
-      <span id="nv-regen-msg" style="color:var(--dim);font-size:12px"></span></div>
-    ${renderPromptsPanel()}
+    ${withPrompts ? renderPromptsPanel() : ''}
     ${cards}`;
 }
 // [ciclo async] dispara /run (retorna na hora) e faz poll de cycle_running até terminar, então
@@ -1138,7 +1134,7 @@ function renderPromptsPanel(){
         <textarea id="nvp-sys" rows="7" placeholder="system prompt — instrua O QUE extrair e as CHAVES do JSON (ex.: sumario, partes, valores, riscos)">${esc(cur.system||'')}</textarea>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="go" onclick="nvpSaveT()">salvar</button>
-          <button class="ghost" onclick="_nvpEdit=null;renderNidViz2()">cancelar</button>
+          <button class="ghost" onclick="_nvpEdit=null;paintNv1()">cancelar</button>
           <span id="nvp-msg" style="color:var(--dim);font-size:11px"></span></div>
       </div>`;
   // ATRIBUIÇÕES — grid alinhado rótulo|select.
@@ -1163,27 +1159,46 @@ function renderPromptsPanel(){
     <p style="color:var(--dim);font-size:11px;margin:14px 0 0;line-height:1.4">Editar ou reatribuir invalida o Summary da coleção afetada — regenera no próximo ciclo (IA da frota, local). Teto do system: 6000 caracteres.</p>
   </details>`;
 }
-function nvpNew(){ _nvpEdit=''; renderNidViz2(); }
-function nvpEditT(n){ _nvpEdit=n; renderNidViz2(); }
+function nvpNew(){ _nvpEdit=''; paintNv1(); }
+function nvpEditT(n){ _nvpEdit=n; paintNv1(); }
 async function nvpSaveT(){
   const name=($('#nvp-name').value||'').trim(), description=$('#nvp-desc').value||'', system=$('#nvp-sys').value||'';
   if(!name||!system.trim()){ $('#nvp-msg').textContent='nome e system são obrigatórios'; return; }
   const body={name,description,system}; const mt=($('#nvp-mt').value||'').trim(); if(mt) body.max_tokens=+mt;
   try{ await jpost('/api/nidhogg/prompts/template',body); }catch(e){ $('#nvp-msg').textContent='erro: '+e.message; return; }
-  _nvpEdit=null; try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} renderNidViz2();
+  _nvpEdit=null; try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} paintNv1();
 }
 async function nvpAssign(scope,key,template){
   if(scope==='collection'&&!template) return;   // '' = manter default (sem endpoint de unassign por ora)
   try{ await jpost('/api/nidhogg/prompts/assign', scope==='level'?{level:key,template}:{collection:key,template}); }catch(e){ return; }
-  try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} renderNidViz2();
+  try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} paintNv1();
 }
+let _nv1Tab='classes', _nv1data=null;
 async function renderNidViz2(){
   let s=null,cl=null,dt=null;
   try{s=await jget('/api/nidhogg/summary')}catch(e){}
   try{cl=await jget('/api/nidhogg/classes')}catch(e){}
   try{dt=await jget('/api/nidhogg/doctypes')}catch(e){}
-  $('#nv-future').innerHTML = renderClasses(cl) + renderDoctypes(dt) + renderSummaries(s);
+  _nv1data={s,cl,dt};
+  paintNv1();
 }
+// abas do nível 1: Classificação | Vocabulário | Prompts | Summary (uma seção por vez).
+// Dados ficam em cache (_nv1data) — trocar de aba não re-busca. Regenerar fica fixo na barra.
+function paintNv1(){
+  const d=_nv1data||{}, tabs=[['classes','🏷 Classificação'],['vocab','🧬 Vocabulário'],['prompts','⚙ Prompts'],['summary','🧠 Summary']];
+  const bar=`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px">
+      ${tabs.map(([k,l])=>`<button class="go ${k===_nv1Tab?'':'ghost'}" style="padding:5px 13px" onclick="setNv1Tab('${k}')">${l}</button>`).join('')}
+      <span style="flex:1 1 auto"></span>
+      <button class="ghost" id="nv-regen-btn" onclick="nvRegenNow()">⟳ regenerar agora</button>
+      <span id="nv-regen-msg" style="color:var(--dim);font-size:12px"></span></div>`;
+  let body='';
+  if(_nv1Tab==='classes') body=renderClasses(d.cl)||'<div class="panel"><p class="muted">Sem classificação ainda — force um ciclo (⟳).</p></div>';
+  else if(_nv1Tab==='vocab') body=renderDoctypes(d.dt)||'<div class="panel"><p class="muted">Vocabulário indisponível.</p></div>';
+  else if(_nv1Tab==='prompts') body=renderPromptsPanel();
+  else body=renderSummaries(d.s,false);
+  $('#nv-future').innerHTML = bar + body;
+}
+function setNv1Tab(k){ _nv1Tab=k; paintNv1(); }
 // [Fase 1] distribuição {natureza,tipo} do banco auxiliar — barras por natureza e por tipo.
 function renderClasses(c){
   if(!c||c.error) return '';
@@ -1205,7 +1220,7 @@ function renderClasses(c){
 function renderDoctypes(dt){
   if(!dt||dt.error) return '';
   const nat=(dt.naturezas||[]).join(', '), tip=(dt.tipos||[]).join(', ');
-  return `<details class="prompts-panel" style="border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:0 0 18px;background:var(--panel)">
+  return `<details class="prompts-panel" open style="border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:0 0 18px;background:var(--panel)">
     <summary style="cursor:pointer;color:var(--acc);font-weight:bold;letter-spacing:.3px">🧬 Naturezas & Tipos — o vocabulário do classificador · ${(dt.tipos||[]).length} tipos</summary>
     <p style="color:var(--dim);font-size:11px;margin:10px 0 8px;line-height:1.4">Esta lista alimenta o <b>enum</b> do constrained decoding — o classificador só pode escolher destes valores. Editar e salvar <b>invalida os checkpoints</b> e reclassifica as bases no próximo ciclo. Separe por vírgula.</p>
     <div style="display:flex;flex-direction:column;gap:8px">
