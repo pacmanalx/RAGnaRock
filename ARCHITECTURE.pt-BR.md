@@ -345,6 +345,15 @@ Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo,
 | 2 | **estrutural** | sim | **Árvore de conhecimento / mapa mental** da obra (`KnowledgeTree`) | [FUTURO] |
 | 3 | **propositivo** | sim | **Documento vivo incremental** (`LivingDocument`, cresce no tempo) + `Gap`/`Suggestion` | [FUTURO] |
 
+> 🏗️ **ESCALA (Hinode, milhões de docs) — decisão 09/ago/2026.** A tabela acima descreve o
+> desenho original. Para a escala real, os níveis 0 e 1 são **redefinidos**: o L0 vira o
+> **motor determinístico** que aplica templates aprendidos (zero-IA no caso comum) e o L1 vira
+> o **LLM que cria/mantém os templates** sob gatilho (não processa cada doc). A chave é o
+> **átomo de análise** (analisar o balanço, não a nota-a-nota) + um motor auto-adaptativo
+> medido pelo **NQI** (Normalization Quality Index). Design completo em
+> [`docs/2026-08-09_nidhogg-arquitetura-escala.md`](docs/2026-08-09_nidhogg-arquitetura-escala.md).
+> O `Summary` "1 LLM pesado por doc" descrito abaixo é **stopgap** (commit `d00a009`).
+
 **Nível 0 (sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
 health-check** ("minha coleção está íntegra e navegável?"), **não "conhecimento"** — não vender como tal.
 Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e custa zero IA.
