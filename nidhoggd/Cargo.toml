@@ -8,6 +8,7 @@ description = "Níðhöggr — camada de inteligência do RAGnaRock. Worm autôn
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [[bin]]
 name = "nidhoggd"

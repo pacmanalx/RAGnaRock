@@ -16,6 +16,8 @@ use std::hash::{Hash, Hasher};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Response, Server};
 
+mod db;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PORT: u16 = 11497;
 const DEFAULT_RAGD_API: &str = "http://127.0.0.1:11499";
@@ -86,7 +88,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             other => eprintln!("config: chave desconhecida {other:?}"),
         }
     }
-    println!("config: carregada de {path:?}");
+    eprintln!("config: carregada de {path:?}");
 }
 /// Atualiza (ou anexa) `chave = valor` no cfg, preservando o resto.
 fn set_cfg_key(path: &str, key: &str, val: &str) {
@@ -388,6 +390,39 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             nlog(&format!("prompt assign: template={template}"));
             (200, json!({"ok":true}).to_string())
         }
+        // [Fase 1] classes {natureza,tipo} do banco auxiliar — distribuição por coleção (ou todas).
+        (Method::Get, "/api/nidhogg/classes") => {
+            let dir = { st.lock().unwrap().dir.clone() };
+            let coll = query_param(query, "collection");
+            match db::open(&dir).and_then(|c| db::classes_summary(&c, coll.as_deref())) {
+                Ok(v) => (200, v.to_string()),
+                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
+            }
+        }
+        // [Fase 1] doctypes — a lista EDITÁVEL de naturezas/tipos que alimenta o enum do classificador.
+        (Method::Get, "/api/nidhogg/doctypes") => {
+            let dir = { st.lock().unwrap().dir.clone() };
+            match db::open(&dir).and_then(|c| db::doctypes(&c)) {
+                Ok((nat, tip)) => (200, json!({"naturezas": nat, "tipos": tip}).to_string()),
+                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
+            }
+        }
+        (Method::Post, "/api/nidhogg/doctypes") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let to_vec = |k: &str| -> Vec<String> {
+                v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+            };
+            let naturezas = to_vec("naturezas");
+            let tipos = to_vec("tipos");
+            if naturezas.is_empty() || tipos.is_empty() { return (400, json!({"error":"naturezas e tipos não podem ser vazios"}).to_string()); }
+            let dir = { st.lock().unwrap().dir.clone() };
+            match db::open(&dir).and_then(|c| db::write_doctypes(&c, &naturezas, &tipos)) {
+                Ok(_) => { nlog(&format!("doctypes atualizados: {} naturezas, {} tipos — checkpoints invalidados", naturezas.len(), tipos.len()));
+                           (200, json!({"ok":true,"naturezas":naturezas.len(),"tipos":tipos.len()}).to_string()) }
+                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
+            }
+        }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
@@ -583,15 +618,37 @@ const SUMMARY_MAX_TOKENS_CEIL: u64 = 4000;   // teto MÁXIMO configurável por t
 /// O daemon NUNCA fica sem prompt. As chaves aqui são as DEFAULT; um template pode definir outras.
 const BUILTIN_SUMMARY_PROMPT: &str = "Você é um analista que resume coleções de documentos em português. Seja FIEL ao material amostrado; não invente fatos. Responda APENAS com um objeto JSON com as chaves: \"abstract\" (2 a 4 frases resumindo a coleção), \"themes\" (array de 3 a 6 temas), \"entities\" (array de nomes próprios, organizações e produtos citados) e \"key_points\" (array de 3 a 6 pontos concretos).";
 
+// ───────────────────────────── nível 1 (consciente) — Classificação {natureza,tipo} (Fase 1) ─────────────────────────────
+// ADITIVA ao normalizador Summary (coexistem em level>=1): descobre a CLASSE de cada base por
+// LLM leve com constrained decoding, persistindo no banco auxiliar (db.rs). É a fundação do
+// motor auto-adaptativo — registry determinístico + NQI sobem em cima disto. Endpoint/modelo
+// do LLM vem do `nidhogg.cfg` (llm_url); a lista de tipos e o prompt são editáveis no ValHalla.
+const CLASSIFY_MAX_CHARS: usize = 1000;   // primeiros N chars do chunk 0 (bate com a calibração 89,5%)
+const CLASSIFY_TIMEOUT_S: u32 = 40;       // curto e FIXO (é ~40 tokens; nada do teto 500s do Summary)
+const CLASSIFY_MAX_FAILS: usize = 2;      // 2 falhas de LLM consecutivas abortam o lote do ciclo
+const CLASSIFY_PER_CYCLE: usize = 40;     // batch por ciclo — classificação é leve (~3s/base), bem além do Summary (4)
+/// System prompt calibrado (89,5% no Qwen2.5-7B). Os TIPOS não entram aqui — vêm do `enum` do
+/// schema (montado da lista editável de doctypes), então editar a lista muda só o enum.
+/// Os EXEMPLOS-âncora entre parênteses e a cláusula "NÃO um documento individual" são o que
+/// impede o colapso de comprovante/OC individual em `cadastro` — sem eles a acurácia despenca
+/// (medido: 68,8% → 100% de paridade com o baseline). Bate 100% com o baseline nas bases de
+/// negócio; a versão acentuada só diverge em narrativos ambíguos do `real` (às vezes melhor).
+const BUILTIN_CLASSIFY_PROMPT: &str = "Você classifica um documento em NATUREZA e TIPO.\nNATUREZA: tabular=dados em linhas/colunas, registros, valores (cadastros, notas, comprovantes, balanços, folhas, ordens). narrativo=texto corrido em prosa (livros, artigos, contratos, atas, cartas, currículos). codigo=código-fonte, config, log.\nSe for uma LISTA/TABELA com várias linhas de registros, o TIPO é cadastro ou relatorio, NÃO um documento individual.\nEscolha o TIPO mais específico da lista permitida.";
+
 // ───────────────────────────── biblioteca de prompts nomeados (por nível/coleção) ─────────────────────────────
 fn prompts_path(dir: &str) -> std::path::PathBuf { Path::new(dir).join("prompts.json") }
 /// Lê a biblioteca. Ausente/corrompida → seed com o template "padrão" = BUILTIN (nunca sem prompt).
 /// Formato: {templates:{name:{description,system,updated}}, level_default:{"1":name}, collections:{coll:name}}
 fn read_prompts(dir: &str) -> Value {
     let seed = || json!({
-        "templates": { "padrão": {
-            "description": "Resumo geral: abstract, themes, entities, key_points.",
-            "system": BUILTIN_SUMMARY_PROMPT, "updated": "" } },
+        "templates": {
+            "padrão": {
+                "description": "Resumo geral: abstract, themes, entities, key_points.",
+                "system": BUILTIN_SUMMARY_PROMPT, "updated": "" },
+            "classificador": {
+                "description": "Classifica {natureza, tipo} na entrada (Fase 1). Os tipos vêm da lista editável de doctypes.",
+                "system": BUILTIN_CLASSIFY_PROMPT, "updated": "" }
+        },
         "level_default": { "1": "padrão" },
         "collections": {}
     });
@@ -1072,6 +1129,184 @@ fn end_cycle(st: &Arc<Mutex<State>>) { if let Ok(mut s) = st.lock() { s.cycle_ru
 
 /// Roda UM ciclo. `force=true` (/run manual) re-minera sempre; `force=false` (cadência do
 /// worker) pula coleção sem mudança (source_hash igual). NÃO segura o lock durante HTTP/IO.
+/// System do classificador: template "classificador" da biblioteca (editável no ValHalla) ou o
+/// BUILTIN. Devolve (system, resolved_from).
+fn classify_system(lib: &Value) -> (String, String) {
+    match lib["templates"]["classificador"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => (s.to_string(), "template".into()),
+        _ => (BUILTIN_CLASSIFY_PROMPT.to_string(), "builtin".into()),
+    }
+}
+
+/// Garante que o template "classificador" existe na biblioteca (pra aparecer no editor do
+/// ValHalla). Idempotente: só grava se faltava.
+fn ensure_classifier_template(dir: &str) {
+    let mut lib = read_prompts(dir);
+    if !lib["templates"]["classificador"].is_object() {
+        lib["templates"]["classificador"] = json!({
+            "description": "Classifica {natureza, tipo} na entrada (Fase 1). Os tipos vêm da lista editável de doctypes.",
+            "system": BUILTIN_CLASSIFY_PROMPT, "updated": now_stamp() });
+        write_prompts(dir, &lib);
+    }
+}
+
+/// Texto do chunk 0 de uma base (primeiros CLASSIFY_MAX_CHARS chars). Leve — não puxa a base
+/// inteira como o normalizador. None se a base não tem texto.
+fn fetch_chunk0(api: &str, coll: &str, name: &str) -> Option<String> {
+    let req = json!({"collection": coll, "base": name, "id": 0}).to_string();
+    let v: Value = serde_json::from_str(&http_post_t(&format!("{api}/chunk"), &req, 20)?).ok()?;
+    let t = v["chunks"][0]["text"].as_str()?;
+    if t.trim().is_empty() { return None; }
+    Some(t.chars().take(CLASSIFY_MAX_CHARS).collect())
+}
+
+/// Uma classificação por LLM com CONSTRAINED DECODING (json_schema/enum). temperature 0.
+/// Err carrega o motivo. Devolve (natureza, tipo).
+fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
+    -> Result<(String, String), String>
+{
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "natureza": {"type": "string", "enum": naturezas},
+            "tipo": {"type": "string", "enum": tipos}
+        },
+        "required": ["natureza", "tipo"]
+    });
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!("DOCUMENTO:\n{text}")}
+        ],
+        "temperature": 0, "max_tokens": 40,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let resp = http_post_t(llm_url, &body, CLASSIFY_TIMEOUT_S)
+        .ok_or(format!("sem resposta (timeout {CLASSIFY_TIMEOUT_S}s)"))?;
+    let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
+    let content = rv["choices"][0]["message"]["content"].as_str()
+        .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(120).collect::<String>()))?;
+    let obj = extract_json_object(content).ok_or_else(|| "não devolveu JSON válido".to_string())?;
+    let nat = obj["natureza"].as_str().unwrap_or("").to_string();
+    let tip = obj["tipo"].as_str().unwrap_or("").to_string();
+    if nat.is_empty() || tip.is_empty() { return Err(format!("classe incompleta: {obj}")); }
+    Ok((nat, tip))
+}
+
+/// Classifica UMA base: chunk 0 + LLM constrangido. Err("sem-texto") se a base não tem texto.
+fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
+                 naturezas: &[String], tipos: &[String]) -> Result<(String, String), String> {
+    let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
+    llm_classify(llm_url, sys, &text, naturezas, tipos)
+}
+
+/// Ciclo de classificação de UMA coleção (Fase 1). Reconcilia /bases do ragd com o banco:
+/// classifica só as bases NOVAS/mudadas (state_hash) ou afetadas por edição de doctypes (dt_hash).
+/// BASES_PER_CYCLE por ciclo; aborta o lote em 2 falhas de LLM seguidas. O corpus fica no ragd —
+/// só a classe é persistida. Devolve um resumo (pro log/status).
+fn mine_classes(api: &str, llm_url: &str, dir: &str, lib: &Value, coll: &str, force: bool) -> Value {
+    let conn = match db::open(dir) {
+        Ok(c) => c,
+        Err(e) => return json!({"ok": false, "error": format!("db: {e}")}),
+    };
+    let (naturezas, tipos) = match db::doctypes(&conn) {
+        Ok(t) => t, Err(e) => return json!({"ok": false, "error": format!("doctypes: {e}")}),
+    };
+    if naturezas.is_empty() || tipos.is_empty() {
+        return json!({"ok": false, "error": "doctypes vazios"});
+    }
+    let (sys, _from) = classify_system(lib);
+    // checkpoint da CONFIG de classificação = doctypes + prompt do classificador. Editar a lista
+    // OU o prompt invalida e reclassifica; state_hash cobre mudança do corpus. `force` re-minera
+    // L0/Summary, mas a classificação SEGUE o checkpoint — o botão "regenerar" não refaz centenas
+    // de bases já provadas à toa; as que falharam não têm registro e reentram sozinhas.
+    let _ = force;
+    let cfg_hash = hash_hex(&format!("{}|{}", db::doctypes_hash(&conn).unwrap_or_default(), sys));
+
+    let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        Some(v) => v["bases"].as_array().cloned().unwrap_or_default(),
+        None => return json!({"ok": false, "error": "ragd /bases sem resposta"}),
+    };
+    let existing: Vec<String> = bases.iter().filter_map(|b| b["name"].as_str().map(String::from)).collect();
+    let _ = db::prune_missing(&conn, coll, &existing);
+
+    // fila determinística das que precisam
+    let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
+        let name = b["name"].as_str().unwrap_or("");
+        !name.is_empty() && db::needs_class(&conn, coll, name, &base_state_hash(b), &cfg_hash).unwrap_or(true)
+    }).collect();
+    queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+
+    let pending_before = queue.len();
+    let (mut classified, mut no_text, mut fails_total) = (0usize, 0usize, 0usize);
+    let mut consecutive_fails = 0usize;
+    let at = now_stamp();
+    for b in queue.iter().take(CLASSIFY_PER_CYCLE) {
+        let name = b["name"].as_str().unwrap_or("");
+        let sh = base_state_hash(b);
+        let has_text = b["has_text"].as_bool().unwrap_or(true);
+        if !has_text {
+            let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, "?", "sem-texto", 0.0, &at);
+            no_text += 1;
+            continue;
+        }
+        match classify_base(api, llm_url, &sys, coll, name, &naturezas, &tipos) {
+            Ok((nat, tip)) => {
+                let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, &nat, &tip, 1.0, &at);
+                classified += 1;
+                consecutive_fails = 0;
+            }
+            Err(e) if e == "sem-texto" => {
+                let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, "?", "sem-texto", 0.0, &at);
+                no_text += 1;
+                consecutive_fails = 0;
+            }
+            Err(e) => {
+                nlog(&format!("classify {coll}/{name} falhou: {e}"));
+                fails_total += 1;
+                consecutive_fails += 1;
+                if consecutive_fails >= CLASSIFY_MAX_FAILS {
+                    nlog(&format!("classify: {CLASSIFY_MAX_FAILS} falhas seguidas em {coll} — aborta lote"));
+                    break;
+                }
+            }
+        }
+    }
+    let pending = pending_before.saturating_sub(classified + no_text);
+    json!({"ok": true, "collection": coll, "classified": classified,
+           "no_text": no_text, "fails": fails_total, "pending": pending})
+}
+
+/// Modo CLI de teste (portão de paridade): classifica uma LISTA de bases e imprime JSONL em
+/// stdout, sem daemon e sem Summary. Reusa exatamente as funções da Fase 1 — é o que confere o
+/// port Rust contra o baseline Python. Aceita `[["coll","base"],...]` ou `[{"coll","base"},...]`.
+fn classify_list_cli(cfg: &Config, path: &str) {
+    let conn = db::open(&cfg.dir).expect("abrir banco");
+    let (naturezas, tipos) = db::doctypes(&conn).expect("doctypes");
+    let lib = read_prompts(&cfg.dir);
+    let (sys, from) = classify_system(&lib);
+    let arr: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("ler lista")).expect("json");
+    let items = arr.as_array().cloned().unwrap_or_default();
+    eprintln!("classify-list: {} itens · prompt={from} · {} naturezas · {} tipos · llm={}",
+              items.len(), naturezas.len(), tipos.len(), cfg.llm_url);
+    for item in items {
+        let (coll, base) = if let Some(pair) = item.as_array() {
+            (pair.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
+             pair.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string())
+        } else {
+            (item["coll"].as_str().unwrap_or("").to_string(),
+             item["base"].as_str().unwrap_or("").to_string())
+        };
+        let (nat, tip) = match classify_base(&cfg.ragd_api, &cfg.llm_url, &sys, &coll, &base, &naturezas, &tipos) {
+            Ok(x) => x,
+            Err(e) => ("?".to_string(), format!("ERR:{e}")),
+        };
+        println!("{}", json!({"coll": coll, "base": base, "natureza": nat, "tipo": tip}));
+    }
+}
+
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     let (api, dir, level, llm_url) = { let s = state.lock().unwrap();
         (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone()) };
@@ -1082,6 +1317,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
             .filter_map(|c| c["collection"].as_str().map(String::from)).collect()))
         .unwrap_or_default();
     let (mut mined, mut skipped, mut failed, mut summarized) = (vec![], vec![], vec![], vec![]);
+    let mut classified: Vec<String> = vec![];
     for coll in &colls {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
@@ -1094,6 +1330,12 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                 // reseta se o prompt mudou, e converge em N ciclos até cobrir TODAS as bases.
                 let mut summ_updated = false;
                 if level >= 1 {
+                    // Fase 1: classifica {natureza,tipo} das bases novas/mudadas no banco auxiliar.
+                    // ADITIVO ao Summary — roda ANTES, pra o registry futuro poder chavear por classe.
+                    let cl = mine_classes(&api, &llm_url, &dir, &lib, coll, force);
+                    if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
+                        classified.push(coll.clone());
+                    }
                     if let Some(s) = mine_summary(&api, &llm_url, &lib, level, coll, &src, &k["summary"], force) {
                         k["summary"] = s; summ_updated = true;
                     }
@@ -1130,12 +1372,13 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         None => u64::MAX,   // sentinela: ragd não respondeu /expansions
     };
     if let Ok(mut s) = state.lock() {
-        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {}{}",
-            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(),
+        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {}{}",
+            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(), classified.len(),
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
            "mined": mined, "skipped": skipped, "failed": failed, "summarized": summarized,
+           "classified": classified,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
 }
@@ -1200,7 +1443,20 @@ fn main() {
         }
     }
 
+    // modo teste (portão de paridade): classifica uma lista de bases e imprime JSONL, sem daemon.
+    if let Some(pos) = args.iter().position(|a| a == "--classify-list") {
+        let path = args.get(pos + 1).cloned().unwrap_or_default();
+        classify_list_cli(&cfg, &path);
+        return;
+    }
+
     let _ = std::fs::create_dir_all(&cfg.dir);
+    // banco auxiliar do Nidhogg (SQLite): cria/migra + seed dos doctypes na primeira subida.
+    match db::open(&cfg.dir) {
+        Ok(_) => println!("   🗄  banco auxiliar em {:?}", db::db_path(&cfg.dir)),
+        Err(e) => eprintln!("   ⚠ banco auxiliar falhou ({e}) — classificação indisponível"),
+    }
+    ensure_classifier_template(&cfg.dir);   // garante o template editável no ValHalla
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(), cfg_path: cfg.cfg_path.clone(),
