@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Response, Server};
 
 mod db;
+mod chdb;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PORT: u16 = 11497;
@@ -59,13 +60,17 @@ struct Config {
                          // o nível 1 manda CONTEÚDO do corpus (ex. `real`, sensível) pro LLM —
                          // nuvem = conteúdo SAI da frota. Default = llama-server local (Aron).
                          // Independente do provider do ragd de propósito.
+    store: String,       // backend do acumulado/classes: "clickhouse" (default) | "sqlite" (rollback)
+    ch_url: String,      // endpoint HTTP do ClickHouse (default http://127.0.0.1:8123)
 }
 impl Default for Config {
     fn default() -> Self {
         Config { port: DEFAULT_PORT, ragd_api: DEFAULT_RAGD_API.to_string(), on: false, level: 0,
                  dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string(),
                  cors_origin: String::new(),
-                 llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string() }
+                 llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+                 store: "clickhouse".to_string(),
+                 ch_url: "http://127.0.0.1:8123".to_string() }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -85,6 +90,8 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
             "llm_url"  => cfg.llm_url = v.to_string(),
+            "store"    => cfg.store = v.to_string(),
+            "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
         }
     }
@@ -111,6 +118,8 @@ struct State {
     cadence: u64,
     ragd_api: String,
     llm_url: String,       // IA da frota p/ nível >=1 (ver comentário na Config)
+    store: String,         // backend do acumulado: "clickhouse" | "sqlite"
+    ch_url: String,        // endpoint HTTP do ClickHouse
     cfg_path: String,
     started: Instant,
     last_cycle: String,
@@ -392,20 +401,18 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         }
         // [Fase 1] classes {natureza,tipo} do banco auxiliar — distribuição por coleção (ou todas).
         (Method::Get, "/api/nidhogg/classes") => {
-            let dir = { st.lock().unwrap().dir.clone() };
+            let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
             let coll = query_param(query, "collection");
-            match db::open(&dir).and_then(|c| db::classes_summary(&c, coll.as_deref())) {
+            match store_classes_summary(&store, &dir, &ch_url, coll.as_deref()) {
                 Ok(v) => (200, v.to_string()),
-                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
         // [Fase 1] doctypes — a lista EDITÁVEL de naturezas/tipos que alimenta o enum do classificador.
         (Method::Get, "/api/nidhogg/doctypes") => {
-            let dir = { st.lock().unwrap().dir.clone() };
-            match db::open(&dir).and_then(|c| db::doctypes(&c)) {
-                Ok((nat, tip)) => (200, json!({"naturezas": nat, "tipos": tip}).to_string()),
-                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
-            }
+            let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
+            let (nat, tip) = store_doctypes(&store, &dir, &ch_url);
+            (200, json!({"naturezas": nat, "tipos": tip}).to_string())
         }
         (Method::Post, "/api/nidhogg/doctypes") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
@@ -416,11 +423,11 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let naturezas = to_vec("naturezas");
             let tipos = to_vec("tipos");
             if naturezas.is_empty() || tipos.is_empty() { return (400, json!({"error":"naturezas e tipos não podem ser vazios"}).to_string()); }
-            let dir = { st.lock().unwrap().dir.clone() };
-            match db::open(&dir).and_then(|c| db::write_doctypes(&c, &naturezas, &tipos)) {
-                Ok(_) => { nlog(&format!("doctypes atualizados: {} naturezas, {} tipos — checkpoints invalidados", naturezas.len(), tipos.len()));
+            let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
+            match store_write_doctypes(&store, &dir, &ch_url, &naturezas, &tipos) {
+                Ok(_) => { nlog(&format!("doctypes atualizados: {} naturezas, {} tipos — reclassifica no próximo ciclo", naturezas.len(), tipos.len()));
                            (200, json!({"ok":true,"naturezas":naturezas.len(),"tipos":tipos.len()}).to_string()) }
-                Err(e) => (500, json!({"error": format!("db: {e}")}).to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
         (Method::Post, "/api/nidhogg") => {
@@ -1200,28 +1207,71 @@ fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
     llm_classify(llm_url, sys, &text, naturezas, tipos)
 }
 
-/// Ciclo de classificação de UMA coleção (Fase 1). Reconcilia /bases do ragd com o banco:
-/// classifica só as bases NOVAS/mudadas (state_hash) ou afetadas por edição de doctypes (dt_hash).
-/// BASES_PER_CYCLE por ciclo; aborta o lote em 2 falhas de LLM seguidas. O corpus fica no ragd —
-/// só a classe é persistida. Devolve um resumo (pro log/status).
-fn mine_classes(api: &str, llm_url: &str, dir: &str, lib: &Value, coll: &str, force: bool) -> Value {
-    let conn = match db::open(dir) {
-        Ok(c) => c,
-        Err(e) => return json!({"ok": false, "error": format!("db: {e}")}),
-    };
-    let (naturezas, tipos) = match db::doctypes(&conn) {
-        Ok(t) => t, Err(e) => return json!({"ok": false, "error": format!("doctypes: {e}")}),
-    };
+// ── dispatch do STORE do acumulado: ClickHouse (default) ou SQLite (rollback via cfg store=sqlite) ──
+// ClickHouse é o caminho ativo (decidido 09/ago). O SQLite fica como rede de segurança — trocar é
+// uma linha no nidhogg.cfg (store=sqlite), sem reverter binário.
+fn store_ensure(store: &str, dir: &str, ch_url: &str) {
+    if store == "clickhouse" {
+        match chdb::ensure_schema(ch_url) {
+            Ok(_) => println!("   🗄  store = ClickHouse ({ch_url}) — db nidhogg pronto"),
+            Err(e) => eprintln!("   ⚠ ClickHouse ensure falhou: {e} — classificação indisponível"),
+        }
+    } else {
+        match db::open(dir) {
+            Ok(_) => println!("   🗄  store = SQLite ({:?})", db::db_path(dir)),
+            Err(e) => eprintln!("   ⚠ SQLite falhou: {e}"),
+        }
+    }
+}
+fn store_doctypes(store: &str, dir: &str, ch_url: &str) -> (Vec<String>, Vec<String>) {
+    if store == "clickhouse" { chdb::doctypes(ch_url).unwrap_or_default() }
+    else { db::open(dir).and_then(|c| db::doctypes(&c)).unwrap_or_default() }
+}
+/// Hash da CONFIG de vocabulário — determinístico das listas (bate nos dois backends).
+fn store_doctypes_hash(store: &str, dir: &str, ch_url: &str) -> String {
+    let (nat, tip) = store_doctypes(store, dir, ch_url);
+    hash_hex(&format!("nat:{}|tip:{}", nat.join(","), tip.join(",")))
+}
+fn store_needs_class(store: &str, dir: &str, ch_url: &str, coll: &str, name: &str, sh: &str, cfg: &str) -> bool {
+    if store == "clickhouse" { chdb::needs_class(ch_url, coll, name, sh, cfg).unwrap_or(true) }
+    else { db::open(dir).and_then(|c| db::needs_class(&c, coll, name, sh, cfg)).unwrap_or(true) }
+}
+fn store_insert_classes(store: &str, dir: &str, ch_url: &str, rows: &[chdb::ClassRow]) -> Result<(), String> {
+    if rows.is_empty() { return Ok(()); }
+    if store == "clickhouse" { chdb::insert_classes(ch_url, rows) }
+    else {
+        let conn = db::open(dir).map_err(|e| e.to_string())?;
+        for r in rows {
+            db::upsert_class(&conn, &r.collection, &r.name, &r.state_hash, &r.cfg_hash,
+                             &r.natureza, &r.tipo, r.confianca, &r.classified_at).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+fn store_write_doctypes(store: &str, dir: &str, ch_url: &str, nat: &[String], tip: &[String]) -> Result<(), String> {
+    if store == "clickhouse" { chdb::write_doctypes(ch_url, nat, tip) }
+    else { let conn = db::open(dir).map_err(|e| e.to_string())?; db::write_doctypes(&conn, nat, tip).map_err(|e| e.to_string()) }
+}
+fn store_classes_summary(store: &str, dir: &str, ch_url: &str, coll: Option<&str>) -> Result<Value, String> {
+    if store == "clickhouse" { chdb::classes_summary(ch_url, coll) }
+    else { let conn = db::open(dir).map_err(|e| e.to_string())?; db::classes_summary(&conn, coll).map_err(|e| e.to_string()) }
+}
+
+/// Ciclo de classificação de UMA coleção (Fase 1). Reconcilia /bases do ragd com o STORE:
+/// classifica só as bases NOVAS/mudadas (state_hash) ou afetadas por edição de vocabulário/prompt
+/// (cfg_hash). CLASSIFY_PER_CYCLE por ciclo; aborta em 2 falhas de LLM seguidas. As classes vão num
+/// ÚNICO INSERT em lote no fim (ClickHouse detesta inserts unitários). O corpus fica no ragd.
+fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, lib: &Value, coll: &str, force: bool) -> Value {
+    let (naturezas, tipos) = store_doctypes(store, dir, ch_url);
     if naturezas.is_empty() || tipos.is_empty() {
         return json!({"ok": false, "error": "doctypes vazios"});
     }
     let (sys, _from) = classify_system(lib);
-    // checkpoint da CONFIG de classificação = doctypes + prompt do classificador. Editar a lista
-    // OU o prompt invalida e reclassifica; state_hash cobre mudança do corpus. `force` re-minera
-    // L0/Summary, mas a classificação SEGUE o checkpoint — o botão "regenerar" não refaz centenas
-    // de bases já provadas à toa; as que falharam não têm registro e reentram sozinhas.
+    // checkpoint = doctypes + prompt. Editar a lista OU o prompt reclassifica; state_hash cobre o
+    // corpus. `force` re-minera L0/Summary, mas a classificação SEGUE o checkpoint (não refaz as
+    // provadas). Prune de fantasmas PULADO de propósito (mutation é caro no CH; ghosts são inócuos).
     let _ = force;
-    let cfg_hash = hash_hex(&format!("{}|{}", db::doctypes_hash(&conn).unwrap_or_default(), sys));
+    let cfg_hash = hash_hex(&format!("{}|{}", store_doctypes_hash(store, dir, ch_url), sys));
 
     let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1229,13 +1279,9 @@ fn mine_classes(api: &str, llm_url: &str, dir: &str, lib: &Value, coll: &str, fo
         Some(v) => v["bases"].as_array().cloned().unwrap_or_default(),
         None => return json!({"ok": false, "error": "ragd /bases sem resposta"}),
     };
-    let existing: Vec<String> = bases.iter().filter_map(|b| b["name"].as_str().map(String::from)).collect();
-    let _ = db::prune_missing(&conn, coll, &existing);
-
-    // fila determinística das que precisam
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
         let name = b["name"].as_str().unwrap_or("");
-        !name.is_empty() && db::needs_class(&conn, coll, name, &base_state_hash(b), &cfg_hash).unwrap_or(true)
+        !name.is_empty() && store_needs_class(store, dir, ch_url, coll, name, &base_state_hash(b), &cfg_hash)
     }).collect();
     queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 
@@ -1243,36 +1289,35 @@ fn mine_classes(api: &str, llm_url: &str, dir: &str, lib: &Value, coll: &str, fo
     let (mut classified, mut no_text, mut fails_total) = (0usize, 0usize, 0usize);
     let mut consecutive_fails = 0usize;
     let at = now_stamp();
+    let mut rows: Vec<chdb::ClassRow> = vec![];   // acumula o lote (1 INSERT no fim)
     for b in queue.iter().take(CLASSIFY_PER_CYCLE) {
         let name = b["name"].as_str().unwrap_or("");
         let sh = base_state_hash(b);
         let has_text = b["has_text"].as_bool().unwrap_or(true);
+        let mkrow = |nat: &str, tip: &str, conf: f64| chdb::ClassRow {
+            collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
+            cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
+            confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
+        };
         if !has_text {
-            let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, "?", "sem-texto", 0.0, &at);
-            no_text += 1;
-            continue;
+            rows.push(mkrow("?", "sem-texto", 0.0)); no_text += 1; continue;
         }
         match classify_base(api, llm_url, &sys, coll, name, &naturezas, &tipos) {
-            Ok((nat, tip)) => {
-                let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, &nat, &tip, 1.0, &at);
-                classified += 1;
-                consecutive_fails = 0;
-            }
-            Err(e) if e == "sem-texto" => {
-                let _ = db::upsert_class(&conn, coll, name, &sh, &cfg_hash, "?", "sem-texto", 0.0, &at);
-                no_text += 1;
-                consecutive_fails = 0;
-            }
+            Ok((nat, tip)) => { rows.push(mkrow(&nat, &tip, 1.0)); classified += 1; consecutive_fails = 0; }
+            Err(e) if e == "sem-texto" => { rows.push(mkrow("?", "sem-texto", 0.0)); no_text += 1; consecutive_fails = 0; }
             Err(e) => {
                 nlog(&format!("classify {coll}/{name} falhou: {e}"));
-                fails_total += 1;
-                consecutive_fails += 1;
+                fails_total += 1; consecutive_fails += 1;
                 if consecutive_fails >= CLASSIFY_MAX_FAILS {
                     nlog(&format!("classify: {CLASSIFY_MAX_FAILS} falhas seguidas em {coll} — aborta lote"));
                     break;
                 }
             }
         }
+    }
+    if let Err(e) = store_insert_classes(store, dir, ch_url, &rows) {
+        nlog(&format!("classify {coll}: gravação no store falhou: {e}"));
+        return json!({"ok": false, "collection": coll, "error": format!("store: {e}")});
     }
     let pending = pending_before.saturating_sub(classified + no_text);
     json!({"ok": true, "collection": coll, "classified": classified,
@@ -1283,8 +1328,8 @@ fn mine_classes(api: &str, llm_url: &str, dir: &str, lib: &Value, coll: &str, fo
 /// stdout, sem daemon e sem Summary. Reusa exatamente as funções da Fase 1 — é o que confere o
 /// port Rust contra o baseline Python. Aceita `[["coll","base"],...]` ou `[{"coll","base"},...]`.
 fn classify_list_cli(cfg: &Config, path: &str) {
-    let conn = db::open(&cfg.dir).expect("abrir banco");
-    let (naturezas, tipos) = db::doctypes(&conn).expect("doctypes");
+    store_ensure(&cfg.store, &cfg.dir, &cfg.ch_url);
+    let (naturezas, tipos) = store_doctypes(&cfg.store, &cfg.dir, &cfg.ch_url);
     let lib = read_prompts(&cfg.dir);
     let (sys, from) = classify_system(&lib);
     let arr: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("ler lista")).expect("json");
@@ -1308,8 +1353,8 @@ fn classify_list_cli(cfg: &Config, path: &str) {
 }
 
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
-    let (api, dir, level, llm_url) = { let s = state.lock().unwrap();
-        (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone()) };
+    let (api, dir, level, llm_url, store, ch_url) = { let s = state.lock().unwrap();
+        (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone(), s.store.clone(), s.ch_url.clone()) };
     let lib = read_prompts(&dir);   // biblioteca de prompts (uma leitura por ciclo)
     let colls: Vec<String> = http_get_t(&format!("{api}/collections"), 10)
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1332,7 +1377,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                 if level >= 1 {
                     // Fase 1: classifica {natureza,tipo} das bases novas/mudadas no banco auxiliar.
                     // ADITIVO ao Summary — roda ANTES, pra o registry futuro poder chavear por classe.
-                    let cl = mine_classes(&api, &llm_url, &dir, &lib, coll, force);
+                    let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
                     }
@@ -1451,15 +1496,13 @@ fn main() {
     }
 
     let _ = std::fs::create_dir_all(&cfg.dir);
-    // banco auxiliar do Nidhogg (SQLite): cria/migra + seed dos doctypes na primeira subida.
-    match db::open(&cfg.dir) {
-        Ok(_) => println!("   🗄  banco auxiliar em {:?}", db::db_path(&cfg.dir)),
-        Err(e) => eprintln!("   ⚠ banco auxiliar falhou ({e}) — classificação indisponível"),
-    }
+    // store do acumulado/classes: ClickHouse (default) ou SQLite (rollback via cfg store=sqlite)
+    store_ensure(&cfg.store, &cfg.dir, &cfg.ch_url);
     ensure_classifier_template(&cfg.dir);   // garante o template editável no ValHalla
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
-        ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(), cfg_path: cfg.cfg_path.clone(),
+        ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(),
+        store: cfg.store.clone(), ch_url: cfg.ch_url.clone(), cfg_path: cfg.cfg_path.clone(),
         started: Instant::now(), last_cycle: String::new(),
         ragd_online: false, ragd_health: Value::Null, cycle_running: false,
     }));
