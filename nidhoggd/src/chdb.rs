@@ -238,6 +238,7 @@ pub struct EntidadeRow {
     pub tipo: String,
     pub idx: u32,
     pub dado: String,        // registro como JSON — JÁ VALIDADO pelo chamador (serde_json)
+    pub modo: String,        // "det" (parser CSV, 100% confiável) | "llm" (janela guiada, pode ter lacuna)
     pub state_hash: String,
     pub ext_cfg_hash: String,
     pub version: u64,
@@ -247,10 +248,14 @@ pub struct EntidadeRow {
 pub fn ensure_entidade_schema(url: &str) -> Result<(), String> {
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.entidade (collection String, base String, tipo String, \
-         idx UInt32, dado String, state_hash String, ext_cfg_hash String, version UInt64, \
-         extracted_at String) ENGINE=MergeTree ORDER BY (collection, base, version, idx)", 15)?;
+         idx UInt32, dado String, modo String DEFAULT 'llm', state_hash String, ext_cfg_hash String, \
+         version UInt64, extracted_at String) ENGINE=MergeTree ORDER BY (collection, base, version, idx)", 15)?;
+    // migração idempotente: tabela antiga não tinha `modo` (extração era 100% LLM → default 'llm')
     ch_exec(url,
-        "CREATE VIEW IF NOT EXISTS nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
+        "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS modo String DEFAULT 'llm'", 15)?;
+    // OR REPLACE: a view é SELECT * e precisa reincluir a coluna nova
+    ch_exec(url,
+        "CREATE OR REPLACE VIEW nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
          WHERE (collection, base, version) IN \
          (SELECT collection, base, max(version) FROM nidhogg.entidade GROUP BY collection, base)", 15)?;
     Ok(())
@@ -276,7 +281,7 @@ pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
     for r in rows {
         let line = json!({
             "collection": r.collection, "base": r.base, "tipo": r.tipo, "idx": r.idx,
-            "dado": r.dado, "state_hash": r.state_hash, "ext_cfg_hash": r.ext_cfg_hash,
+            "dado": r.dado, "modo": r.modo, "state_hash": r.state_hash, "ext_cfg_hash": r.ext_cfg_hash,
             "version": r.version, "extracted_at": r.extracted_at,
         });
         ndjson.push_str(&line.to_string());
@@ -297,7 +302,7 @@ pub fn entities_summary(url: &str, collection: Option<&str>, base: Option<&str>)
         &format!("SELECT count() FROM nidhogg.entidade_atual{where_c} FORMAT TabSeparated"), &params, 10)?
         .trim().parse().unwrap_or(0);
     let bases_body = ch_query_param(url,
-        &format!("SELECT collection, base, tipo, count() c FROM nidhogg.entidade_atual{where_c} \
+        &format!("SELECT collection, base, tipo, any(modo) modo, count() c FROM nidhogg.entidade_atual{where_c} \
                   GROUP BY collection, base, tipo ORDER BY c DESC LIMIT 300 FORMAT JSON"), &params, 15)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json: {e}"))?;
     let por_base = bv["data"].as_array().cloned().unwrap_or_default();

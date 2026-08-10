@@ -1490,7 +1490,7 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
     // o hash da config de extração inclui a versão do ALGORITMO (v2det = despacho determinístico),
     // a JANELA e o TETO — mudá-los reprocessa as bases (senão o deploy vira no-op: as bases batem
     // o hash antigo e o ciclo pula todas).
-    let ext_cfg_hash = hash_hex(&format!("extrator|v2det|{sys}|win{}|tok{}",
+    let ext_cfg_hash = hash_hex(&format!("extrator|v3modo|{sys}|win{}|tok{}",
         EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
 
     // classes TABULARES da coleção (name -> tipo) — só elas têm registros pra extrair
@@ -1538,7 +1538,7 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
                 for rec in parse_tabular(&text, delim) {
                     ents.push(chdb::EntidadeRow {
                         collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                        idx, dado: rec.to_string(), state_hash: sh.clone(),
+                        idx, dado: rec.to_string(), modo: "det".to_string(), state_hash: sh.clone(),
                         ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
                     });
                     idx += 1;
@@ -1553,7 +1553,7 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
                                 if !rec.is_object() { continue; }   // valida: só objetos entram no dump
                                 ents.push(chdb::EntidadeRow {
                                     collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                                    idx, dado: rec.to_string(), state_hash: sh.clone(),
+                                    idx, dado: rec.to_string(), modo: "llm".to_string(), state_hash: sh.clone(),
                                     ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
                                 });
                                 idx += 1;
