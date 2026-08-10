@@ -653,6 +653,7 @@ const EXTRACT_PER_CYCLE: usize = 5;               // extração é PESADA (vári
 const EXTRACT_INPUT_CHARS_PER_WINDOW: usize = 1500; // janela por ORÇAMENTO DE CHARS (adaptativo): bases
                                                     // densas pegam menos linhas → não satura o teto de saída
 const EXTRACT_MAX_TOKENS: u64 = 1500;
+const TEMPLATE_MIN_COVERAGE: f64 = 0.7;   // Fase 3: molde só é gravado se casa ≥70% dos campos na amostra
 /// Prompt do extrator (editável no ValHalla como o classificador). `{tipo}` é substituído pela classe.
 const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os REGISTROS como um array JSON — um objeto por linha/registro, com os campos relevantes (nomes de campo claros e minúsculos). Responda APENAS com o array JSON, nada além dele.";
 /// System prompt calibrado (89,5% no Qwen2.5-7B). Os TIPOS não entram aqui — vêm do `enum` do
@@ -1351,9 +1352,12 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     let mut por_tipo: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
     for b in &bases {
         let is_csv = b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1);
+        let natureza = b["natureza"].as_str().unwrap_or("");
         let tipo = b["tipo"].as_str().unwrap_or("");
         let name = b["name"].as_str().unwrap_or("");
-        if is_csv || tipo.is_empty() || tipo == "sem-texto" || name.is_empty() { continue; }
+        // SÓ natureza=documento (átomos da ponta ESTRUTURADOS: comprovante/nota/holerite/OC). Narrativo
+        // (contrato, memorial) e código NÃO têm campos rotulados → molde regex não serve (viraria lixo).
+        if is_csv || natureza != "documento" || tipo.is_empty() || tipo == "sem-texto" || name.is_empty() { continue; }
         if templates.get(tipo).is_some() { continue; }   // já tem molde
         let e = por_tipo.entry(tipo.to_string()).or_insert((0, name.to_string()));
         e.0 += 1;
@@ -1375,6 +1379,14 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     let n_campos = regras_v.as_array().map(|a| a.len()).unwrap_or(0);
     let n_ok = rec.as_object().map(|o| o.values().filter(|v| !v.as_str().unwrap_or("").is_empty()).count()).unwrap_or(0);
     let cobertura = if n_campos > 0 { n_ok as f64 / n_campos as f64 } else { 0.0 };
+    // GATE de cobertura: só grava se o molde CASA a maioria dos campos na amostra. Cobertura baixa =
+    // documento sem estrutura extraível (o regex não ancorou) → NÃO vira molde (nem lixo no dump).
+    if cobertura < TEMPLATE_MIN_COVERAGE {
+        nlog(&format!("molde REJEITADO: tipo={tipo} cobertura={:.0}% < {:.0}% (sem estrutura extraível)",
+            cobertura * 100.0, TEMPLATE_MIN_COVERAGE * 100.0));
+        return json!({"ok": true, "collection": coll, "criados": 0, "tipo": tipo,
+                      "cobertura": cobertura, "rejeitado": "cobertura baixa"});
+    }
     let row = chdb::TemplateRow {
         tipo: tipo.clone(), schema, regras, cobertura, origem: "llm".into(),
         created_at: now_stamp(), version: chdb::now_version(),
