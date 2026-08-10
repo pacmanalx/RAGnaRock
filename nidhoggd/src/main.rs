@@ -851,21 +851,46 @@ fn grow_size(c: &Value) -> usize {
 /// Detecção estrutural de documento tabular (CSV/TSV) — determinística e sobre o CONTEÚDO,
 /// nunca sobre o nome. Devolve o nº de linhas de DADOS (sem o cabeçalho) se ≥80% das linhas
 /// repetem a contagem de delimitadores da primeira.
-fn tabular_rows(text: &str) -> Option<usize> {
+/// Assinatura tabular: devolve `(delimitador, nº de linhas de DADOS)` quando um delimitador é
+/// consistente em ≥80% das linhas não-vazias. É o RECONHECEDOR determinístico — quando casa, a
+/// base é um CSV regular e a extração dispensa o LLM (ver `parse_tabular`).
+fn tabular_spec(text: &str) -> Option<(char, usize)> {
     let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 3 { return None; }
     for delim in [',', ';', '\t'] {
         let head = lines[0].matches(delim).count();
         if head == 0 { continue; }
         let consistent = lines.iter().filter(|l| l.matches(delim).count() == head).count();
-        if consistent * 100 >= lines.len() * 80 { return Some(lines.len() - 1); }
+        if consistent * 100 >= lines.len() * 80 { return Some((delim, lines.len() - 1)); }
     }
     None
+}
+/// Extração DETERMINÍSTICA de um CSV regular: o CABEÇALHO (linha 0) nomeia os campos e cada linha
+/// de dados vira um objeto `{campo: valor}`. Os campos são LIDOS do arquivo, não inferidos — por
+/// isso não há LLM aqui, nem schema divergente entre janelas, nem linha pulada. A linha 0 é o
+/// schema, logo NUNCA vira registro. Linhas "ragged": células faltantes → `""` (pad), excedentes
+/// ignoradas (o objeto tem exatamente as chaves do cabeçalho). Não trata aspas/escape de CSV
+/// (RFC 4180) — as bases-alvo são planas; um delimitador dentro de aspas cairia no ragged handling.
+fn parse_tabular(text: &str, delim: char) -> Vec<Value> {
+    let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < 2 { return vec![]; }
+    let header: Vec<String> = lines[0].split(delim).map(|c| c.trim().to_string()).collect();
+    let mut out = Vec::with_capacity(lines.len() - 1);
+    for ln in &lines[1..] {
+        let cells: Vec<&str> = ln.split(delim).collect();
+        let mut obj = serde_json::Map::new();
+        for (i, key) in header.iter().enumerate() {
+            let val = cells.get(i).map(|c| c.trim()).unwrap_or("");   // ragged: falta vira ""
+            obj.insert(key.clone(), Value::String(val.to_string()));
+        }
+        out.push(Value::Object(obj));
+    }
+    out
 }
 /// Janelas de extração por ORÇAMENTO DE CARACTERES (adaptativo): bases densas pegam menos linhas
 /// por janela, estreitas pegam mais — dimensiona a SAÍDA do LLM pra não estourar o teto de tokens
 /// (a causa da sub-extração medida em bases com muitos registros). Ignora linhas vazias (mesma
-/// população que `tabular_rows` conta). Uma linha maior que o orçamento vira a própria janela.
+/// população que `tabular_spec` conta). Uma linha maior que o orçamento vira a própria janela.
 fn extract_windows(text: &str, budget: usize) -> Vec<String> {
     let mut wins: Vec<String> = vec![];
     let mut cur: Vec<&str> = vec![];
@@ -963,7 +988,7 @@ fn normalize_base(api: &str, llm_url: &str, coll: &str, name: &str, sys: &str,
         None => return (json!({}), json!({"h": state_hash, "ok": false, "proof": "sem-texto",
                                           "passes": 0, "itens": 0, "linhas": null, "trunc": false, "infra": true})),
     };
-    let rows = tabular_rows(&text);
+    let rows = tabular_spec(&text).map(|(_, n)| n);
     let tab_hint = rows.map(|n| format!("\nDocumento TABULAR com {n} linha(s) de dados — o resultado deve cobrir TODAS as linhas."))
                        .unwrap_or_default();
     // janelas por linha até o orçamento — a fonte nunca é truncada
@@ -1462,9 +1487,10 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
         return json!({"ok": false, "collection": coll, "error": format!("schema: {e}")});
     }
     let (sys, _from) = extract_system(lib);
-    // o hash da config de extração inclui a JANELA e o TETO — mudá-los reprocessa as bases
-    // (senão o deploy vira no-op: as bases batem o hash antigo e o ciclo pula todas).
-    let ext_cfg_hash = hash_hex(&format!("extrator|{sys}|win{}|tok{}",
+    // o hash da config de extração inclui a versão do ALGORITMO (v2det = despacho determinístico),
+    // a JANELA e o TETO — mudá-los reprocessa as bases (senão o deploy vira no-op: as bases batem
+    // o hash antigo e o ciclo pula todas).
+    let ext_cfg_hash = hash_hex(&format!("extrator|v2det|{sys}|win{}|tok{}",
         EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
 
     // classes TABULARES da coleção (name -> tipo) — só elas têm registros pra extrair
@@ -1490,43 +1516,64 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
     queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 
     let pending_before = queue.len();
-    let (mut extracted, mut incompletas, mut fails) = (0usize, 0usize, 0usize);
+    let (mut extracted, mut incompletas, mut fails, mut det_bases) = (0usize, 0usize, 0usize, 0usize);
     let at = now_stamp();
     for b in queue.iter().take(EXTRACT_PER_CYCLE) {
         let name = b["name"].as_str().unwrap_or("");
         let sh = base_state_hash(b);
         let tipo = tab_tipos.get(name).cloned().unwrap_or_else(|| "registro".into());
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        let rows_src = tabular_rows(&text);
+        let spec = tabular_spec(&text);            // Some((delim, n)) = CSV regular → extração determinística
+        let rows_src = spec.map(|(_, n)| n);
         let version = chdb::now_version();
         let mut ents: Vec<chdb::EntidadeRow> = vec![];
         let mut idx: u32 = 0;
         let mut ok = true;
-        for wtext in extract_windows(&text, EXTRACT_INPUT_CHARS_PER_WINDOW) {
-            match llm_extract_records(llm_url, &sys, &tipo, &wtext) {
-                Ok(recs) => {
-                    for rec in recs {
-                        if !rec.is_object() { continue; }   // valida: só objetos entram no dump
-                        ents.push(chdb::EntidadeRow {
-                            collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                            idx, dado: rec.to_string(), state_hash: sh.clone(),
-                            ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
-                        });
-                        idx += 1;
+        let mut det = false;
+        match spec {
+            // CSV REGULAR → determinístico: cabeçalho = schema, cada linha = registro. Zero LLM,
+            // schema único, sem linha pulada (o oposto do LLM linha-a-linha).
+            Some((delim, _)) => {
+                det = true;
+                for rec in parse_tabular(&text, delim) {
+                    ents.push(chdb::EntidadeRow {
+                        collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
+                        idx, dado: rec.to_string(), state_hash: sh.clone(),
+                        ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
+                    });
+                    idx += 1;
+                }
+            }
+            // Sem estrutura CSV (comprovantes, docs) → LLM guiado com janela adaptativa.
+            None => {
+                for wtext in extract_windows(&text, EXTRACT_INPUT_CHARS_PER_WINDOW) {
+                    match llm_extract_records(llm_url, &sys, &tipo, &wtext) {
+                        Ok(recs) => {
+                            for rec in recs {
+                                if !rec.is_object() { continue; }   // valida: só objetos entram no dump
+                                ents.push(chdb::EntidadeRow {
+                                    collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
+                                    idx, dado: rec.to_string(), state_hash: sh.clone(),
+                                    ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
+                                });
+                                idx += 1;
+                            }
+                        }
+                        Err(e) => { nlog(&format!("extract {coll}/{name}: janela falhou ({e}) — descarta base (all-or-nothing)"));
+                                    ok = false; fails += 1; break; }
                     }
                 }
-                Err(e) => { nlog(&format!("extract {coll}/{name}: janela falhou ({e}) — descarta base (all-or-nothing)"));
-                            ok = false; fails += 1; break; }
             }
         }
         if !ok { continue; }   // ALL-OR-NOTHING: nada gravado; a base volta no próximo ciclo
         match chdb::insert_entities(ch_url, &ents) {
-            Ok(_) => { extracted += 1; if let Some(r) = rows_src { if ents.len() < r { incompletas += 1; } } }
+            Ok(_) => { extracted += 1; if det { det_bases += 1; }
+                       if let Some(r) = rows_src { if !det && ents.len() < r { incompletas += 1; } } }
             Err(e) => { nlog(&format!("extract {coll}/{name}: insert falhou ({e})")); fails += 1; }
         }
     }
     let pending = pending_before.saturating_sub(extracted);
-    json!({"ok": true, "collection": coll, "extracted": extracted,
+    json!({"ok": true, "collection": coll, "extracted": extracted, "deterministicas": det_bases,
            "incompletas": incompletas, "fails": fails, "pending": pending})
 }
 
@@ -1542,6 +1589,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     let (mut mined, mut skipped, mut failed, mut summarized) = (vec![], vec![], vec![], vec![]);
     let mut classified: Vec<String> = vec![];
     let mut extracted_ents: Vec<String> = vec![];
+    let mut det_total = 0u64;   // bases extraídas DETERMINISTICAMENTE (CSV, zero LLM) no ciclo
     for coll in &colls {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
@@ -1563,6 +1611,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     // Fase 2: extrai os registros das bases tabulares (ClickHouse); só natureza=tabular.
                     let ex = mine_entities(&api, &llm_url, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
+                    det_total += ex["deterministicas"].as_u64().unwrap_or(0);
                     if let Some(s) = mine_summary(&api, &llm_url, &lib, level, coll, &src, &k["summary"], force) {
                         k["summary"] = s; summ_updated = true;
                     }
@@ -1599,8 +1648,9 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         None => u64::MAX,   // sentinela: ragd não respondeu /expansions
     };
     if let Ok(mut s) = state.lock() {
-        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {} · extraiu {}{}",
+        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {} · extraiu {}{}{}",
             now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(), classified.len(), extracted_ents.len(),
+            if det_total > 0 { format!(" · det {det_total}") } else { String::new() },
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
