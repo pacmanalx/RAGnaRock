@@ -1175,17 +1175,18 @@ async function nvpAssign(scope,key,template){
 }
 let _nv1Tab='classes', _nv1data=null;
 async function renderNidViz2(){
-  let s=null,cl=null,dt=null;
+  let s=null,cl=null,dt=null,ent=null;
   try{s=await jget('/api/nidhogg/summary')}catch(e){}
   try{cl=await jget('/api/nidhogg/classes')}catch(e){}
   try{dt=await jget('/api/nidhogg/doctypes')}catch(e){}
-  _nv1data={s,cl,dt};
+  try{ent=await jget('/api/nidhogg/entities')}catch(e){}
+  _nv1data={s,cl,dt,ent};
   paintNv1();
 }
 // abas do nível 1: Classificação | Vocabulário | Prompts | Summary (uma seção por vez).
 // Dados ficam em cache (_nv1data) — trocar de aba não re-busca. Regenerar fica fixo na barra.
 function paintNv1(){
-  const d=_nv1data||{}, tabs=[['classes','🏷 Classificação'],['vocab','🧬 Vocabulário'],['prompts','⚙ Prompts'],['summary','🧠 Summary']];
+  const d=_nv1data||{}, tabs=[['classes','🏷 Classificação'],['vocab','🧬 Vocabulário'],['entidades','📦 Entidades'],['prompts','⚙ Prompts'],['summary','🧠 Summary']];
   const bar=`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px">
       ${tabs.map(([k,l])=>`<button class="go ${k===_nv1Tab?'':'ghost'}" style="padding:5px 13px" onclick="setNv1Tab('${k}')">${l}</button>`).join('')}
       <span style="flex:1 1 auto"></span>
@@ -1194,11 +1195,44 @@ function paintNv1(){
   let body='';
   if(_nv1Tab==='classes') body=renderClasses(d.cl)||'<div class="panel"><p class="muted">Sem classificação ainda — force um ciclo (⟳).</p></div>';
   else if(_nv1Tab==='vocab') body=renderDoctypes(d.dt)||'<div class="panel"><p class="muted">Vocabulário indisponível.</p></div>';
+  else if(_nv1Tab==='entidades') body=renderEntities(d.ent);
   else if(_nv1Tab==='prompts') body=renderPromptsPanel();
   else body=renderSummaries(d.s,false);
   $('#nv-future').innerHTML = bar + body;
 }
 function setNv1Tab(k){ _nv1Tab=k; paintNv1(); }
+// [Fase 2] card das entidades extraídas (o dump denso do ClickHouse). Lista base→registros à
+// esquerda; clicar mostra os registros JSON daquela base à direita.
+let _nvEntSel=null;
+function renderEntities(ent){
+  if(!ent||ent.error) return '<div class="panel"><p class="muted">Entidades indisponíveis (extração requer ClickHouse).</p></div>';
+  const total=ent.count||0, por=ent.por_base||[];
+  if(!total) return `<div class="panel"><h2>📦 Entidades extraídas <span class="muted" style="text-transform:none">— Fase 2</span></h2>
+    <p class="muted" style="margin:0">Nenhum registro extraído ainda — as bases tabulares são extraídas ciclo a ciclo (⟳ regenerar força).</p></div>`;
+  const linhas=por.map(b=>{
+    const key=b.collection+'/'+b.base;
+    return `<div onclick="nvEntShow('${esc(b.collection)}','${esc(b.base)}')" title="ver registros" style="display:flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--line);border-left:3px solid ${key===_nvEntSel?'var(--acc)':'var(--line)'};border-radius:6px;margin-bottom:5px;cursor:pointer;background:${key===_nvEntSel?'var(--panel2)':'transparent'}">
+      <span style="flex:1;color:var(--ink);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.base)}</span>
+      <span class="muted" style="font-size:11px">${esc(b.tipo)}</span>
+      <span style="color:var(--acc);font-weight:bold;font-size:12px;flex:0 0 auto">${b['count()']!=null?b['count()']:b.c} reg</span></div>`;
+  }).join('');
+  return `<div class="panel">
+    <h2>📦 Entidades extraídas <span class="muted" style="text-transform:none">— Fase 2 · ${total} registros em ${por.length} base(s)</span></h2>
+    <p class="muted" style="margin:0 0 12px;font-size:11px">O dump denso: os registros que o LLM tirou das bases tabulares, guardados no ClickHouse (view entidade_atual). Clique numa base pra ver os registros.</p>
+    <div class="split" style="grid-template-columns:1fr 1.3fr">
+      <div style="max-height:52vh;overflow:auto;padding-right:4px">${linhas}</div>
+      <div id="nv-ent-detail" style="max-height:52vh;overflow:auto">${_nvEntSel?'<span class="muted">carregando…</span>':'<div style="color:var(--dim);border:1px dashed var(--line);border-radius:6px;padding:24px 16px;text-align:center">Selecione uma base à esquerda pra ver os registros extraídos.</div>'}</div>
+    </div></div>`;
+}
+async function nvEntShow(coll, base){
+  _nvEntSel=coll+'/'+base; paintNv1();
+  let d=null; try{d=await jget('/api/nidhogg/entities?collection='+encodeURIComponent(coll)+'&base='+encodeURIComponent(base))}catch(e){}
+  const el=$('#nv-ent-detail'); if(!el) return;
+  const am=(d&&d.amostra)||[];
+  if(!am.length){ el.innerHTML='<span class="muted">sem registros nesta base.</span>'; return; }
+  el.innerHTML = `<div style="color:var(--dim);font-size:11px;margin-bottom:8px">${esc(base)} · ${am.length} registro(s) (amostra, máx 60)</div>`+
+    am.map(a=>`<pre style="margin:0 0 6px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--ink)">${esc(JSON.stringify(a.dado))}</pre>`).join('');
+}
 // [Fase 1] distribuição {natureza,tipo} do banco auxiliar — barras por natureza e por tipo.
 function renderClasses(c){
   if(!c||c.error) return '';
