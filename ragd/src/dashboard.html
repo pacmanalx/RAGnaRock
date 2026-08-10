@@ -1175,18 +1175,18 @@ async function nvpAssign(scope,key,template){
 }
 let _nv1Tab='classes', _nv1data=null;
 async function renderNidViz2(){
-  let s=null,cl=null,dt=null,ent=null;
-  try{s=await jget('/api/nidhogg/summary')}catch(e){}
+  let cl=null,dt=null,ent=null,tpl=null;
   try{cl=await jget('/api/nidhogg/classes')}catch(e){}
   try{dt=await jget('/api/nidhogg/doctypes')}catch(e){}
   try{ent=await jget('/api/nidhogg/entities')}catch(e){}
-  _nv1data={s,cl,dt,ent};
+  try{tpl=await jget('/api/nidhogg/templates')}catch(e){}
+  _nv1data={cl,dt,ent,tpl};
   paintNv1();
 }
-// abas do nível 1: Classificação | Vocabulário | Prompts | Summary (uma seção por vez).
+// abas do nível 1: Classificação | Vocabulário | Entidades | Prompts | Templates (uma seção por vez).
 // Dados ficam em cache (_nv1data) — trocar de aba não re-busca. Regenerar fica fixo na barra.
 function paintNv1(){
-  const d=_nv1data||{}, tabs=[['classes','🏷 Classificação'],['vocab','🧬 Vocabulário'],['entidades','📦 Entidades'],['prompts','⚙ Prompts'],['summary','🧠 Summary']];
+  const d=_nv1data||{}, tabs=[['classes','🏷 Classificação'],['vocab','🧬 Vocabulário'],['entidades','📦 Entidades'],['prompts','⚙ Prompts'],['templates','🧩 Templates']];
   const bar=`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px">
       ${tabs.map(([k,l])=>`<button class="go ${k===_nv1Tab?'':'ghost'}" style="padding:5px 13px" onclick="setNv1Tab('${k}')">${l}</button>`).join('')}
       <span style="flex:1 1 auto"></span>
@@ -1197,8 +1197,33 @@ function paintNv1(){
   else if(_nv1Tab==='vocab') body=renderDoctypes(d.dt)||'<div class="panel"><p class="muted">Vocabulário indisponível.</p></div>';
   else if(_nv1Tab==='entidades') body=renderEntities(d.ent);
   else if(_nv1Tab==='prompts') body=renderPromptsPanel();
-  else body=renderSummaries(d.s,false);
+  else if(_nv1Tab==='templates') body=renderTemplates(d.tpl, (d.ent&&d.ent.por_tipo)||[]);
   $('#nv-future').innerHTML = bar + body;
+}
+// [Fase 3] registry de moldes por tipo: schema, cobertura, e as regras regex ancoradas no rótulo.
+function renderTemplates(tpl, porTipo){
+  const T=(tpl&&tpl.templates)||{};
+  const tipos=Object.keys(T);
+  const cnt={}; (porTipo||[]).forEach(t=>{ if(t.modo==='template') cnt[t.tipo]=t; });
+  if(!tipos.length) return `<div class="panel"><h2>🧩 Registry de moldes <span class="muted" style="text-transform:none">— Fase 3</span></h2>
+    <p class="muted" style="margin:0">Nenhum molde criado ainda. O L1 cria UM molde por tipo <b>natureza=documento</b> (comprovante, nota, holerite…) quando cobre ≥70% dos campos na amostra; o L0 aplica aos N documentos determinístico.</p></div>`;
+  const cards=tipos.map(tp=>{
+    const t=T[tp], cob=(t.cobertura!=null?t.cobertura:0), regras=t.regras||[];
+    const c=cnt[tp]||{}, nqi=(c.nqi!=null?c.nqi:null), reg=c.c||0;
+    const linhas=regras.map(r=>`<div style="display:flex;gap:8px;align-items:baseline;font-size:11px;margin:2px 0">
+        <b style="flex:0 0 130px;color:var(--ink)">${esc(r.campo||'')}</b>
+        <code style="flex:1;color:var(--dim);word-break:break-all;font-size:10px">${esc(r.regex||'')}</code></div>`).join('');
+    return `<div class="panel" style="margin-bottom:10px">
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">
+        <b style="font-size:14px;color:var(--ink)">${esc(tp)}</b>
+        <span style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(150,110,230,.18);color:#9a7ce6;border:1px solid rgba(150,110,230,.4)">⚙ tpl</span>
+        <span class="muted" style="font-size:11px">${regras.length} campo(s) · cobertura da amostra <b style="color:${nvNqiCor(cob)}">${nvNqiPct(cob)}%</b></span>
+        <span style="flex:1"></span>
+        ${nqi!=null?`<span class="muted" style="font-size:11px">${reg} extraídos · NQI médio <b style="color:${nvNqiCor(nqi)}">${nvNqiPct(nqi)}%</b></span>`:''}</div>
+      ${linhas}</div>`;
+  }).join('');
+  return `<div class="panel" style="margin-bottom:10px"><h2>🧩 Registry de moldes <span class="muted" style="text-transform:none">— Fase 3 · ${tipos.length} tipo(s) com molde</span></h2>
+    <p class="muted" style="margin:0;font-size:11px">Cada molde = as <b>regras regex ancoradas no rótulo</b> que o L1 (LLM) aprendeu de UMA amostra e o L0 aplica aos N documentos iguais, determinístico. Só tipos <b>natureza=documento</b> com cobertura ≥70% viram molde.</p></div>${cards}`;
 }
 function setNv1Tab(k){ _nv1Tab=k; paintNv1(); }
 // [Fase 2] card das entidades extraídas (o dump denso do ClickHouse). Lista base→registros à

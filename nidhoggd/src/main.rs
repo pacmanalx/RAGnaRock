@@ -422,6 +422,18 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 }
             }
         }
+        // [Fase 3] templates — o registry de moldes por tipo (schema + regras regex + cobertura).
+        (Method::Get, "/api/nidhogg/templates") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" {
+                (200, json!({"templates": {}, "note": "registry requer clickhouse"}).to_string())
+            } else {
+                match chdb::get_templates(&ch_url) {
+                    Ok(v) => (200, json!({"templates": v}).to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
         // [Fase 1] doctypes — a lista EDITÁVEL de naturezas/tipos que alimenta o enum do classificador.
         (Method::Get, "/api/nidhogg/doctypes") => {
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
