@@ -1697,22 +1697,42 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
 }
 
 // ───────────────────────────── worker ─────────────────────────────
-// Acorda na cadência; se ON e o ragd online, roda um ciclo do nível 0 (respeitando o
-// source_hash: pula coleção sem mudança). A IA (nível >=1) entra aqui nas próximas iterações.
+// Back-off adaptativo: a cadência é o gate "TEM TRABALHO?" — quando um ciclo PROGRIDE (classificou/
+// extraiu/minou/resumiu algo), EMENDA o próximo imediatamente (sem dormir), processando a fila em
+// rajada. Só dorme a `cadence` quando IDLE (nada a fazer), desligado, ou ragd offline. Isso corta a
+// ociosidade entre ciclos quando há backlog (a máquina não fica esperando 5min à toa) e preserva o
+// gate leve quando não há o que fazer. On/online/nível são relidos a cada volta → reativo a pause.
 fn worker(state: Arc<Mutex<State>>) {
     loop {
-        let cadence = { state.lock().unwrap().cadence.max(10) };
-        std::thread::sleep(Duration::from_secs(cadence));
         let (on, online) = { let s = state.lock().unwrap(); (s.on, s.ragd_online) };
-        if !on { continue; }
-        if !online { nlog("ciclo pulado: ragd OFFLINE"); continue; }
-        if !try_start_cycle(&state) { nlog("ciclo da cadência pulado: já há um ciclo (ex. /run) em andamento"); continue; }
-        let r = run_cycle(&state, false);   // cadência NÃO força: respeita o source_hash
-        end_cycle(&state);
-        nlog(&format!("ciclo nível 0 — minou={} pulou={} falhou={}",
-            r["mined"].as_array().map(|a| a.len()).unwrap_or(0),
-            r["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
-            r["failed"].as_array().map(|a| a.len()).unwrap_or(0)));
+        let mut worked = false;
+        if !on {
+            // desligado: nada a fazer, cai no sleep do gate
+        } else if !online {
+            nlog("ciclo pulado: ragd OFFLINE");
+        } else if try_start_cycle(&state) {
+            let r = run_cycle(&state, false);   // cadência NÃO força: respeita o source_hash
+            end_cycle(&state);
+            // PROGRESSO = alguma coleção avançou a fila (base classificada/extraída/minada/resumida).
+            // Só `skipped`/`failed` = nada avançou → idle. `failed` NÃO conta como progresso pra não
+            // emendar em loop quente quando o LLM está caindo (aí o back-off da cadência protege).
+            worked = ["mined", "classified", "extracted", "summarized"].iter()
+                .any(|k| r[k].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+            nlog(&format!("ciclo — minou={} pulou={} falhou={} classificou={} extraiu={} → {}",
+                r["mined"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["failed"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["classified"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["extracted"].as_array().map(|a| a.len()).unwrap_or(0),
+                if worked { "EMENDA (tem backlog)" } else { "IDLE (dorme a cadência)" }));
+        } else {
+            nlog("ciclo da cadência pulado: já há um ciclo (ex. /run) em andamento");
+        }
+        // emendou? volta JÁ. Idle/off/offline/ocupado? espera a cadência antes de reavaliar.
+        if !worked {
+            let cadence = { state.lock().unwrap().cadence.max(10) };
+            std::thread::sleep(Duration::from_secs(cadence));
+        }
     }
 }
 
