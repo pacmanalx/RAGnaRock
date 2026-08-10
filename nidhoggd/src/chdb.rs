@@ -243,7 +243,9 @@ pub struct EntidadeRow {
     pub tipo: String,
     pub idx: u32,
     pub dado: String,        // registro como JSON — JÁ VALIDADO pelo chamador (serde_json)
-    pub modo: String,        // "det" (parser CSV, 100% confiável) | "llm" (janela guiada, pode ter lacuna)
+    pub modo: String,        // "det" (parser CSV, 100% confiável) | "template" (molde regex) | "llm"
+    pub nqi: f64,            // Fase 5: NQI = cobertura × precisão DESTE registro (0..1), agregável
+    pub prov: String,        // Fase 5: path-tree AUTOCONTIDO (origem de cada campo: via/regra/válido)
     pub state_hash: String,
     pub ext_cfg_hash: String,
     pub version: u64,
@@ -253,12 +255,14 @@ pub struct EntidadeRow {
 pub fn ensure_entidade_schema(url: &str) -> Result<(), String> {
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.entidade (collection String, base String, tipo String, \
-         idx UInt32, dado String, modo String DEFAULT 'llm', state_hash String, ext_cfg_hash String, \
-         version UInt64, extracted_at String) ENGINE=MergeTree ORDER BY (collection, base, version, idx)", 15)?;
-    // migração idempotente: tabela antiga não tinha `modo` (extração era 100% LLM → default 'llm')
-    ch_exec(url,
-        "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS modo String DEFAULT 'llm'", 15)?;
-    // OR REPLACE: a view é SELECT * e precisa reincluir a coluna nova
+         idx UInt32, dado String, modo String DEFAULT 'llm', nqi Float64 DEFAULT 0, prov String DEFAULT '', \
+         state_hash String, ext_cfg_hash String, version UInt64, extracted_at String) \
+         ENGINE=MergeTree ORDER BY (collection, base, version, idx)", 15)?;
+    // migrações idempotentes: colunas que tabelas antigas não tinham
+    ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS modo String DEFAULT 'llm'", 15)?;
+    ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS nqi Float64 DEFAULT 0", 15)?;
+    ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS prov String DEFAULT ''", 15)?;
+    // OR REPLACE: a view é SELECT * e precisa reincluir as colunas novas
     ch_exec(url,
         "CREATE OR REPLACE VIEW nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
          WHERE (collection, base, version) IN \
@@ -286,7 +290,8 @@ pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
     for r in rows {
         let line = json!({
             "collection": r.collection, "base": r.base, "tipo": r.tipo, "idx": r.idx,
-            "dado": r.dado, "modo": r.modo, "state_hash": r.state_hash, "ext_cfg_hash": r.ext_cfg_hash,
+            "dado": r.dado, "modo": r.modo, "nqi": r.nqi, "prov": r.prov,
+            "state_hash": r.state_hash, "ext_cfg_hash": r.ext_cfg_hash,
             "version": r.version, "extracted_at": r.extracted_at,
         });
         ndjson.push_str(&line.to_string());
@@ -352,7 +357,7 @@ pub fn ensure_template_schema(url: &str) -> Result<(), String> {
 /// o L0 lê pra decidir se um tipo já tem molde e aplicá-lo.
 pub fn get_templates(url: &str) -> Result<Value, String> {
     let body = ch_exec(url,
-        "SELECT tipo, schema, regras, cobertura FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
+        "SELECT tipo, schema, regras, cobertura, version FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
     let mut map = serde_json::Map::new();
     for line in body.lines() {
         if line.trim().is_empty() { continue; }
@@ -360,7 +365,7 @@ pub fn get_templates(url: &str) -> Result<Value, String> {
         let tipo = match v["tipo"].as_str() { Some(t) if !t.is_empty() => t.to_string(), _ => continue };
         let schema = serde_json::from_str::<Value>(v["schema"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
         let regras = serde_json::from_str::<Value>(v["regras"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
-        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"]}));
+        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"], "version": v["version"]}));
     }
     Ok(Value::Object(map))
 }

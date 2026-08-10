@@ -885,9 +885,9 @@ fn tabular_spec(text: &str) -> Option<(char, usize)> {
 /// schema, logo NUNCA vira registro. Linhas "ragged": células faltantes → `""` (pad), excedentes
 /// ignoradas (o objeto tem exatamente as chaves do cabeçalho). Não trata aspas/escape de CSV
 /// (RFC 4180) — as bases-alvo são planas; um delimitador dentro de aspas cairia no ragged handling.
-fn parse_tabular(text: &str, delim: char) -> Vec<Value> {
+fn parse_tabular(text: &str, delim: char) -> (Vec<String>, Vec<Value>) {
     let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() < 2 { return vec![]; }
+    if lines.len() < 2 { return (vec![], vec![]); }
     let header: Vec<String> = lines[0].split(delim).map(|c| c.trim().to_string()).collect();
     let mut out = Vec::with_capacity(lines.len() - 1);
     for ln in &lines[1..] {
@@ -899,7 +899,7 @@ fn parse_tabular(text: &str, delim: char) -> Vec<Value> {
         }
         out.push(Value::Object(obj));
     }
-    out
+    (header, out)
 }
 /// Deriva a NATUREZA semântica do TIPO — determinística. O classificador acerta o tipo (89,5%
 /// medido) e a natureza cai por gravidade dele, SEM pedir ao LLM (evita o drift de re-tunar o
@@ -945,6 +945,60 @@ fn apply_template(text: &str, compiled: &[(String, regex::Regex, Vec<String>)]) 
         }
     }
     Value::Object(obj)
+}
+/// Fase 5 — data dd/mm/aaaa ou aaaa-mm-dd (só forma, sem calendário; barato, sem regex).
+fn valida_data(v: &str) -> bool {
+    let b = v.as_bytes();
+    if b.len() != 10 { return false; }
+    let dig = |r: &[u8]| r.iter().all(|c| c.is_ascii_digit());
+    (b[2] == b'/' && b[5] == b'/' && dig(&b[0..2]) && dig(&b[3..5]) && dig(&b[6..10]))
+        || (b[4] == b'-' && b[7] == b'-' && dig(&b[0..4]) && dig(&b[5..7]) && dig(&b[8..10]))
+}
+/// Fase 5 — validador heurístico por NOME do campo (a PRECISÃO do NQI). Vazio nunca é válido; o
+/// nome dá o tipo esperado (cnpj=14díg, cpf=11, data=forma, valor/preço=número), o resto é não-vazio.
+fn valida_campo(nome: &str, valor: &str) -> bool {
+    let v = valor.trim();
+    if v.is_empty() { return false; }
+    let n = nome.to_lowercase();
+    let ndig = v.chars().filter(|c| c.is_ascii_digit()).count();
+    if n.contains("cnpj") { return ndig == 14; }
+    if n.contains("cpf") { return ndig == 11; }
+    if n.contains("data") || n == "dt" || n.starts_with("dt_") || n.contains("_data") { return valida_data(v); }
+    if n.contains("valor") || n.contains("preco") || n.contains("preço") || n.contains("total")
+        || n.contains("estoque") || n.contains("qtd") || n.contains("quantidade") || n.contains("multa") {
+        return v.chars().any(|c| c.is_ascii_digit())
+            && v.chars().all(|c| c.is_ascii_digit() || ".,R$% -".contains(c));
+    }
+    true   // demais campos: não-vazio já é válido
+}
+/// Fase 5 — constrói o NQI (cobertura×precisão) + o path-tree AUTOCONTIDO de um registro. `origem`
+/// mapeia campo→(via, detalhe) — pra CSV é ("coluna", "col N"); pra template é ("regex", o padrão).
+/// O prov guarda por campo {valor, via, origem, válido} + a fonte + o molde — rastreável sem depender
+/// do registry (o molde pode mudar depois). NQI agregável; o prov é a auditoria.
+fn qualidade_prov(coll: &str, base: &str, modo: &str, molde: Option<(&str, u64)>,
+                  origem: &std::collections::HashMap<String, (String, String)>,
+                  rec: &Value, n_esperado: usize) -> (f64, String) {
+    let obj = rec.as_object().cloned().unwrap_or_default();
+    let mut campos = serde_json::Map::new();
+    let (mut preench, mut validos) = (0usize, 0usize);
+    for (campo, valor) in &obj {
+        let v = valor.as_str().unwrap_or("");
+        if !v.trim().is_empty() { preench += 1; }
+        let valido = valida_campo(campo, v);
+        if valido { validos += 1; }
+        let (via, det) = origem.get(campo).cloned().unwrap_or_else(|| ("?".into(), String::new()));
+        campos.insert(campo.clone(), json!({"valor": v, "via": via, "origem": det, "valido": valido}));
+    }
+    let cob = if n_esperado > 0 { preench as f64 / n_esperado as f64 } else { 0.0 };
+    let prec = if preench > 0 { validos as f64 / preench as f64 } else { 0.0 };
+    let nqi = cob * prec;
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    let mut prov = json!({
+        "modo": modo, "fonte": {"coll": coll, "base": base},
+        "cob": r2(cob), "prec": r2(prec), "campos": campos,
+    });
+    if let Some((t, ver)) = molde { prov["molde"] = json!({"tipo": t, "version": ver}); }
+    (nqi, prov.to_string())
 }
 /// Janelas de extração por ORÇAMENTO DE CARACTERES (adaptativo): bases densas pegam menos linhas
 /// por janela, estreitas pegam mais — dimensiona a SAÍDA do LLM pra não estourar o teto de tokens
@@ -1660,7 +1714,7 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         return json!({"ok": false, "collection": coll, "error": format!("schema template: {e}")});
     }
     let (sys, _from) = extract_system(lib);
-    let ext_cfg_csv = hash_hex(&format!("extrator|v3modo|{sys}|win{}|tok{}",
+    let ext_cfg_csv = hash_hex(&format!("extrator|v4nqi|{sys}|win{}|tok{}",
         EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
     let templates = chdb::get_templates(ch_url).unwrap_or_else(|_| json!({}));   // registry (Fase 3)
 
@@ -1679,7 +1733,7 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         if is_csv(b) {
             extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone()));
         } else if let Some(t) = templates.get(tipo.as_str()) {
-            let ecfg = hash_hex(&format!("template|{tipo}|{}", hash_hex(&t["regras"].to_string())));
+            let ecfg = hash_hex(&format!("template|v2nqi|{tipo}|{}", hash_hex(&t["regras"].to_string())));
             extraiveis.insert(name, (tipo, false, ecfg));
         }
     }
@@ -1723,25 +1777,36 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         if let Some((delim, _)) = spec {
             // CSV → determinístico: cabeçalho = schema, cada linha = registro.
             modo = "det";
+            let (header, registros) = parse_tabular(&text, delim);
+            // path-tree (Fase 5): cada campo veio de uma COLUNA do cabeçalho
+            let origem: std::collections::HashMap<String, (String, String)> = header.iter().enumerate()
+                .map(|(i, c)| (c.clone(), ("coluna".to_string(), format!("col {i}")))).collect();
             let mut idx: u32 = 0;
-            for rec in parse_tabular(&text, delim) {
+            for rec in &registros {
+                let (nqi, prov) = qualidade_prov(coll, name, "det", None, &origem, rec, header.len());
                 ents.push(chdb::EntidadeRow {
                     collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                    idx, dado: rec.to_string(), modo: "det".to_string(), state_hash: sh.clone(),
-                    ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+                    idx, dado: rec.to_string(), modo: "det".to_string(), nqi, prov,
+                    state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
                 });
                 idx += 1;
             }
         } else {
             // Fase 3: aplica o MOLDE do tipo (regex ancorado). 1 documento = 1 registro. Zero LLM.
             modo = "template";
+            let molde_ver = templates[tipo.as_str()]["version"].as_u64().unwrap_or(0);
             let compiled = compiled_cache.entry(tipo.clone())
                 .or_insert_with(|| compile_template(&templates[tipo.as_str()]["regras"]));
+            // path-tree (Fase 5): cada campo veio de um REGEX ancorado no rótulo
+            let origem: std::collections::HashMap<String, (String, String)> = compiled.iter()
+                .map(|(c, re, _)| (c.clone(), ("regex".to_string(), re.as_str().to_string()))).collect();
+            let n_esperado = compiled.len();
             let rec = apply_template(&text, &compiled[..]);
+            let (nqi, prov) = qualidade_prov(coll, name, "template", Some((&tipo, molde_ver)), &origem, &rec, n_esperado);
             ents.push(chdb::EntidadeRow {
                 collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                idx: 0, dado: rec.to_string(), modo: "template".to_string(), state_hash: sh.clone(),
-                ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+                idx: 0, dado: rec.to_string(), modo: "template".to_string(), nqi, prov,
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
             });
         }
         match chdb::insert_entities(ch_url, &ents) {
