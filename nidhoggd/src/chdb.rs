@@ -50,15 +50,24 @@ fn ch_exec(url: &str, sql: &str, secs: u32) -> Result<String, String> {
 }
 
 /// INSERT em LOTE via JSONEachRow (a query na URL, as linhas no body). ClickHouse detesta inserts
-/// unitários ("too many parts") — SEMPRE agregamos o ciclo num único INSERT.
+/// unitários ("too many parts") — SEMPRE agregamos o ciclo num único INSERT. O NDJSON vai por STDIN
+/// (`--data-binary @-`), NÃO como argumento: um batch grande (base com muitas linhas + prov) passa de
+/// 128KB e estouraria o MAX_ARG_STRLEN do Linux — o insert falharia silencioso e a base travaria.
 fn ch_insert(url: &str, table: &str, rows_ndjson: &str, secs: u32) -> Result<(), String> {
+    use std::io::Write;
     let q = format!("INSERT INTO {table} FORMAT JSONEachRow");
-    // query vai como parâmetro; o body são as linhas NDJSON
     let full = format!("{url}?query={}", urlencode(&q));
-    let out = Command::new("curl")
-        .args(["-s", "-m", &secs.to_string(), &full, "--data-binary", rows_ndjson])
-        .output()
-        .map_err(|e| format!("curl falhou: {e}"))?;
+    let mut child = Command::new("curl")
+        .args(["-s", "-m", &secs.to_string(), &full, "--data-binary", "@-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    {
+        let mut si = child.stdin.take().ok_or_else(|| "sem stdin".to_string())?;
+        si.write_all(rows_ndjson.as_bytes()).map_err(|e| format!("write stdin: {e}"))?;
+    }   // si sai de escopo aqui → fecha o stdin → o curl processa e sai
+    let out = child.wait_with_output().map_err(|e| format!("curl wait: {e}"))?;
     let body = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() || body.contains("DB::Exception") {
         return Err(format!("insert: {}", body.chars().take(200).collect::<String>()));
