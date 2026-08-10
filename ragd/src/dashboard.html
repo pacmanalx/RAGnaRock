@@ -974,9 +974,9 @@ const NV_CHARTS=[
 let _nidk=[], _nvActive='cloud', _nvLevel=0, _nvcache=null, _nvprompts=null, _nvpEdit=null;
 // O que CADA nível ≥1 oferecerá (esqueleto rodando; funcionalidades nas issues #22→#24).
 const NV_LVL_FEATURES={
-  1:['Resumo destilado por coleção (sobrevive à deleção da coleção)','Insights de conteúdo — colecionáveis soltos (personagens, locais, eventos)','Cartões de conhecimento consultáveis'],
-  2:['Grafo navegável de entidades e relações','Ego-grafo: a história pela ótica de um nó (Frodo, ou a tabela `aluno`)','Encaixe de dimensões entre ingestões/projetos'],
-  3:['Detecção de furos e lacunas na base','Sugestões e comentários — código e livros','Aprimoramento autônomo da base de conhecimento'],
+  1:['Classificação {natureza, tipo} por IA leve — vocabulário editável','Dado normalizado no ClickHouse, apontando pro corpus','A camada de significado sobrevive à deleção da coleção'],
+  2:['Grafo navegável de entidades e relações','Ego-grafo: a história pela ótica de um nó (Frodo, ou a tabela `aluno`)','Encaixe de dimensões entre coleções/ingestões'],
+  3:['As perguntas não-perguntadas — lacunas e o que falta','Hipóteses e sugestões sobre o dado normalizado','IA cara só nos pontos de decisão'],
 };
 async function ensureNid(){ if(_nid&&_nid.levels)return _nid; try{_nid=await jget('/api/nidhogg')}catch(e){} return _nid; }
 function openNidViz(level){ _nvLevel=+level||0; selectTab('nidviz'); }

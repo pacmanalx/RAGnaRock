@@ -39,10 +39,10 @@ fn level_num(s: &str) -> u8 {
 }
 fn levels_json() -> Value {
     json!([
-        {"n":0,"name":"minerador","ia":false,"desc":"Só os 3 pilares: índice de raízes, dicionário do corpus, digestão do cache. Zero IA — cava o material bruto."},
-        {"n":1,"name":"consciente","ia":true,"desc":"Insights e resumo por coleção — conhecimento que sobrevive à deleção da coleção."},
-        {"n":2,"name":"estrutural","ia":true,"desc":"Hierarquia e encaixe de dimensões entre projetos/ingestões — sabe o que encaixa em quê."},
-        {"n":3,"name":"propositivo","ia":true,"desc":"Acha furos, sugere, comenta, resume inteligente — código e livros. Aprimora a base de conhecimento."}
+        {"n":0,"name":"minerador","ia":false,"desc":"Zero IA. Minera a estrutura do corpus — assinatura léxica (as raízes que só a coleção tem), dicionário e digest do cache. O material bruto sobre o qual todos os níveis de IA trabalham."},
+        {"n":1,"name":"consciente","ia":true,"desc":"1º nível com IA. Classifica cada documento em {natureza, tipo} por IA leve (vocabulário editável) e normaliza o dado — a camada de significado que vive no ClickHouse, aponta pro corpus e sobrevive à deleção da coleção."},
+        {"n":2,"name":"estrutural","ia":true,"desc":"Grafa as relações sobre o dado já normalizado — entidades, dimensões e como uma coisa encaixa na outra entre coleções. O grafo navegável do conhecimento."},
+        {"n":3,"name":"propositivo","ia":true,"desc":"As perguntas que você não está fazendo. Acha lacunas, levanta hipóteses e aponta o que falta sobre o dado dos níveis anteriores — IA cara só nos pontos de decisão."}
     ])
 }
 
