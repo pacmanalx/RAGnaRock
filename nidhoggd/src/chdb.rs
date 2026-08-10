@@ -225,3 +225,92 @@ pub fn classes_summary(url: &str, collection: Option<&str>) -> Result<Value, Str
         "bases": bases,
     }))
 }
+
+// ───────────────────────────── Fase 2: extração de entidades (o dump denso) ─────────────────────────────
+// `version` POR EXTRAÇÃO da base (todas as entidades de uma extração compartilham version). A view
+// `entidade_atual` mostra só a extração mais RECENTE de cada base — re-extrair com MENOS registros
+// não deixa fantasmas (o que ReplacingMergeTree por (base,idx) deixaria) e sem mutation. Toda leitura
+// passa pela view: a prova de completude (COUNT) e o /entities veem o mesmo número.
+
+pub struct EntidadeRow {
+    pub collection: String,
+    pub base: String,
+    pub tipo: String,
+    pub idx: u32,
+    pub dado: String,        // registro como JSON — JÁ VALIDADO pelo chamador (serde_json)
+    pub state_hash: String,
+    pub ext_cfg_hash: String,
+    pub version: u64,
+    pub extracted_at: String,
+}
+
+pub fn ensure_entidade_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.entidade (collection String, base String, tipo String, \
+         idx UInt32, dado String, state_hash String, ext_cfg_hash String, version UInt64, \
+         extracted_at String) ENGINE=MergeTree ORDER BY (collection, base, version, idx)", 15)?;
+    ch_exec(url,
+        "CREATE VIEW IF NOT EXISTS nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
+         WHERE (collection, base, version) IN \
+         (SELECT collection, base, max(version) FROM nidhogg.entidade GROUP BY collection, base)", 15)?;
+    Ok(())
+}
+
+/// Precisa extrair se não há entidades atuais OU state_hash/ext_cfg_hash divergem. Vazio = precisa.
+pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str) -> Result<bool, String> {
+    let body = ch_query_param(url,
+        "SELECT state_hash, ext_cfg_hash FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} LIMIT 1 FORMAT TabSeparated",
+        &[("coll", collection), ("base", base)], 10)?;
+    let line = body.lines().next().unwrap_or("");
+    if line.is_empty() { return Ok(true); }
+    let mut it = line.split('\t');
+    Ok(it.next().unwrap_or("") != state_hash || it.next().unwrap_or("") != ext_cfg)
+}
+
+/// INSERT em lote das entidades de UMA extração (mesmo version). All-or-nothing: o chamador só chega
+/// aqui se TODAS as janelas da base extraíram — janela falha ⇒ nada é gravado.
+pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
+    if rows.is_empty() { return Ok(()); }
+    let mut ndjson = String::new();
+    for r in rows {
+        let line = json!({
+            "collection": r.collection, "base": r.base, "tipo": r.tipo, "idx": r.idx,
+            "dado": r.dado, "state_hash": r.state_hash, "ext_cfg_hash": r.ext_cfg_hash,
+            "version": r.version, "extracted_at": r.extracted_at,
+        });
+        ndjson.push_str(&line.to_string());
+        ndjson.push('\n');
+    }
+    ch_insert(url, "nidhogg.entidade", &ndjson, 45)
+}
+
+/// Distribuição/amostra das entidades — SEMPRE pela view `entidade_atual` (uma fonte de verdade).
+pub fn entities_summary(url: &str, collection: Option<&str>, base: Option<&str>) -> Result<Value, String> {
+    let mut clauses: Vec<&str> = vec![];
+    let mut params: Vec<(&str, &str)> = vec![];
+    if let Some(c) = collection { if c != "*" { clauses.push("collection={coll:String}"); params.push(("coll", c)); } }
+    if let Some(b) = base { clauses.push("base={base:String}"); params.push(("base", b)); }
+    let where_c = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
+
+    let total: i64 = ch_query_param(url,
+        &format!("SELECT count() FROM nidhogg.entidade_atual{where_c} FORMAT TabSeparated"), &params, 10)?
+        .trim().parse().unwrap_or(0);
+    let bases_body = ch_query_param(url,
+        &format!("SELECT collection, base, tipo, count() c FROM nidhogg.entidade_atual{where_c} \
+                  GROUP BY collection, base, tipo ORDER BY c DESC LIMIT 300 FORMAT JSON"), &params, 15)?;
+    let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json: {e}"))?;
+    let por_base = bv["data"].as_array().cloned().unwrap_or_default();
+
+    let mut amostra: Vec<Value> = vec![];
+    if base.is_some() {
+        let s = ch_query_param(url,
+            &format!("SELECT idx, dado FROM nidhogg.entidade_atual{where_c} ORDER BY idx LIMIT 60 FORMAT JSON"), &params, 15)?;
+        let sv: Value = serde_json::from_str(&s).map_err(|e| format!("json: {e}"))?;
+        for row in sv["data"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            let dado = row["dado"].as_str().and_then(|x| serde_json::from_str::<Value>(x).ok()).unwrap_or(Value::Null);
+            amostra.push(json!({"idx": row["idx"], "dado": dado}));
+        }
+    }
+    Ok(json!({"count": total, "por_base": por_base, "amostra": amostra}))
+}

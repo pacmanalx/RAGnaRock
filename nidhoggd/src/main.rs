@@ -408,6 +408,20 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
+        // [Fase 2] entidades extraídas (o dump denso) — ClickHouse only, sempre via a view entidade_atual.
+        (Method::Get, "/api/nidhogg/entities") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection");
+            let base = query_param(query, "base");
+            if store != "clickhouse" {
+                (200, json!({"count": 0, "note": "extração requer clickhouse"}).to_string())
+            } else {
+                match chdb::entities_summary(&ch_url, coll.as_deref(), base.as_deref()) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
         // [Fase 1] doctypes — a lista EDITÁVEL de naturezas/tipos que alimenta o enum do classificador.
         (Method::Get, "/api/nidhogg/doctypes") => {
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
@@ -634,6 +648,12 @@ const CLASSIFY_MAX_CHARS: usize = 1000;   // primeiros N chars do chunk 0 (bate 
 const CLASSIFY_TIMEOUT_S: u32 = 40;       // curto e FIXO (é ~40 tokens; nada do teto 500s do Summary)
 const CLASSIFY_MAX_FAILS: usize = 2;      // 2 falhas de LLM consecutivas abortam o lote do ciclo
 const CLASSIFY_PER_CYCLE: usize = 40;     // batch por ciclo — classificação é leve (~3s/base), bem além do Summary (4)
+// ── Fase 2: extração de entidades (o dump denso no ClickHouse) ──
+const EXTRACT_PER_CYCLE: usize = 5;          // extração é PESADA (várias janelas/base) — poucos por ciclo
+const EXTRACT_LINES_PER_WINDOW: usize = 60;  // janela por Nº de LINHAS — dimensiona a SAÍDA, não a entrada
+const EXTRACT_MAX_TOKENS: u64 = 1500;
+/// Prompt do extrator (editável no ValHalla como o classificador). `{tipo}` é substituído pela classe.
+const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os REGISTROS como um array JSON — um objeto por linha/registro, com os campos relevantes (nomes de campo claros e minúsculos). Responda APENAS com o array JSON, nada além dele.";
 /// System prompt calibrado (89,5% no Qwen2.5-7B). Os TIPOS não entram aqui — vêm do `enum` do
 /// schema (montado da lista editável de doctypes), então editar a lista muda só o enum.
 /// Os EXEMPLOS-âncora entre parênteses e a cláusula "NÃO um documento individual" são o que
@@ -654,7 +674,10 @@ fn read_prompts(dir: &str) -> Value {
                 "system": BUILTIN_SUMMARY_PROMPT, "updated": "" },
             "classificador": {
                 "description": "Classifica {natureza, tipo} na entrada (Fase 1). Os tipos vêm da lista editável de doctypes.",
-                "system": BUILTIN_CLASSIFY_PROMPT, "updated": "" }
+                "system": BUILTIN_CLASSIFY_PROMPT, "updated": "" },
+            "extrator": {
+                "description": "Extrai os registros das bases tabulares como array JSON (Fase 2). {tipo} = a classe.",
+                "system": BUILTIN_EXTRACT_PROMPT, "updated": "" }
         },
         "level_default": { "1": "padrão" },
         "collections": {}
@@ -698,6 +721,25 @@ fn extract_json_object(s: &str) -> Option<Value> {
     let a = s.find('{')?; let b = s.rfind('}')?;
     if a >= b { return None; }
     match serde_json::from_str::<Value>(&s[a..=b]) { Ok(v) if v.is_object() => Some(v), _ => None }
+}
+/// Extrai um ARRAY JSON de um texto (tolera fences/prosa em volta). Fase 2: os registros extraídos.
+fn extract_json_array(s: &str) -> Option<Vec<Value>> {
+    let a = s.find('[')?; let b = s.rfind(']')?;
+    if a >= b { return None; }
+    serde_json::from_str::<Value>(&s[a..=b]).ok().and_then(|v| v.as_array().cloned())
+}
+/// Resgata um array cortado no teto de tokens: fecha no ÚLTIMO objeto completo e descarta o
+/// elemento parcial. Reaproveita a ideia do salvage de objeto — mas devolve o array já fechado.
+fn salvage_truncated_array(s: &str) -> Option<Vec<Value>> {
+    let a = s.find('[')?;
+    let t = &s[a..];
+    for (cut, _) in t.rmatch_indices('}').take(1) {
+        let candidate = format!("{}]", &t[..=cut]);   // "[{..},{..}" + "]" = array até o último obj completo
+        if let Ok(v) = serde_json::from_str::<Value>(&candidate) {
+            if let Some(arr) = v.as_array() { return Some(arr.clone()); }
+        }
+    }
+    None
 }
 
 // ───────────────────────────── merge genérico do acumulado (normalizado) ─────────────────────────────
@@ -1144,17 +1186,33 @@ fn classify_system(lib: &Value) -> (String, String) {
         _ => (BUILTIN_CLASSIFY_PROMPT.to_string(), "builtin".into()),
     }
 }
+/// System do extrator (Fase 2): template "extrator" editável ou o BUILTIN. `{tipo}` é substituído
+/// pela classe no momento da chamada.
+fn extract_system(lib: &Value) -> (String, String) {
+    match lib["templates"]["extrator"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => (s.to_string(), "template".into()),
+        _ => (BUILTIN_EXTRACT_PROMPT.to_string(), "builtin".into()),
+    }
+}
 
-/// Garante que o template "classificador" existe na biblioteca (pra aparecer no editor do
-/// ValHalla). Idempotente: só grava se faltava.
-fn ensure_classifier_template(dir: &str) {
+/// Garante que os templates "classificador" e "extrator" existem na biblioteca (pra aparecerem no
+/// editor do ValHalla). Idempotente: só grava o que faltava.
+fn ensure_prompt_templates(dir: &str) {
     let mut lib = read_prompts(dir);
+    let mut changed = false;
     if !lib["templates"]["classificador"].is_object() {
         lib["templates"]["classificador"] = json!({
             "description": "Classifica {natureza, tipo} na entrada (Fase 1). Os tipos vêm da lista editável de doctypes.",
             "system": BUILTIN_CLASSIFY_PROMPT, "updated": now_stamp() });
-        write_prompts(dir, &lib);
+        changed = true;
     }
+    if !lib["templates"]["extrator"].is_object() {
+        lib["templates"]["extrator"] = json!({
+            "description": "Extrai os registros das bases tabulares como array JSON (Fase 2). {tipo} = a classe.",
+            "system": BUILTIN_EXTRACT_PROMPT, "updated": now_stamp() });
+        changed = true;
+    }
+    if changed { write_prompts(dir, &lib); }
 }
 
 /// Texto do chunk 0 de uma base (primeiros CLASSIFY_MAX_CHARS chars). Leve — não puxa a base
@@ -1216,6 +1274,7 @@ fn store_ensure(store: &str, dir: &str, ch_url: &str) {
             Ok(_) => println!("   🗄  store = ClickHouse ({ch_url}) — db nidhogg pronto"),
             Err(e) => eprintln!("   ⚠ ClickHouse ensure falhou: {e} — classificação indisponível"),
         }
+        if let Err(e) = chdb::ensure_entidade_schema(ch_url) { eprintln!("   ⚠ entidade (Fase 2) schema falhou: {e}"); }
     } else {
         match db::open(dir) {
             Ok(_) => println!("   🗄  store = SQLite ({:?})", db::db_path(dir)),
@@ -1352,6 +1411,104 @@ fn classify_list_cli(cfg: &Config, path: &str) {
     }
 }
 
+/// Extrai os registros de UMA janela como array JSON. temperature 0. Reusa o salvage pra truncado.
+/// O chamador valida cada elemento (all-or-nothing).
+fn llm_extract_records(llm_url: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
+    let sys_r = sys.replace("{tipo}", tipo);
+    let body = json!({
+        "messages": [{"role":"system","content":sys_r},{"role":"user","content":format!("DOCUMENTO:\n{text}")}],
+        "temperature": 0, "max_tokens": EXTRACT_MAX_TOKENS
+    }).to_string();
+    let to = ((text.len() / 90) + (EXTRACT_MAX_TOKENS as usize / 10) + 90).min(400) as u32;
+    let resp = http_post_t(llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
+    let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
+    let truncated = rv["choices"][0]["finish_reason"].as_str() == Some("length");
+    let content = rv["choices"][0]["message"]["content"].as_str()
+        .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(100).collect::<String>()))?;
+    extract_json_array(content)
+        .or_else(|| if truncated { salvage_truncated_array(content) } else { None })
+        .ok_or_else(|| if truncated { "array cortado no teto (finish=length)".to_string() } else { "não devolveu array JSON".to_string() })
+}
+
+/// Ciclo de EXTRAÇÃO (Fase 2) de UMA coleção — só ClickHouse. Extrai os registros das bases
+/// TABULARES (natureza vem do doc_class) como array JSON, incremental por base (janela por Nº de
+/// linhas → saída bounded), ALL-OR-NOTHING (janela falha ⇒ descarta a base), 1 INSERT em lote por
+/// base (mesmo version). O acumulado vira o dump denso; a completude é COUNT ≥ linhas da fonte.
+fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+    if store != "clickhouse" {
+        return json!({"ok": false, "collection": coll, "error": "extração requer clickhouse"});
+    }
+    if let Err(e) = chdb::ensure_entidade_schema(ch_url) {
+        return json!({"ok": false, "collection": coll, "error": format!("schema: {e}")});
+    }
+    let (sys, _from) = extract_system(lib);
+    let ext_cfg_hash = hash_hex(&format!("extrator|{}", sys));
+
+    // classes TABULARES da coleção (name -> tipo) — só elas têm registros pra extrair
+    let tab_tipos: std::collections::HashMap<String, String> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default()
+        .iter().filter(|b| b["natureza"].as_str() == Some("tabular"))
+        .filter_map(|b| Some((b["name"].as_str()?.to_string(), b["tipo"].as_str().unwrap_or("registro").to_string())))
+        .collect();
+    if tab_tipos.is_empty() {
+        return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "sem tabulares classificadas"});
+    }
+
+    let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(v) => v["bases"].as_array().cloned().unwrap_or_default(),
+        None => return json!({"ok": false, "collection": coll, "error": "ragd /bases sem resposta"}),
+    };
+    let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
+        let name = b["name"].as_str().unwrap_or("");
+        tab_tipos.contains_key(name)
+            && chdb::needs_extract(ch_url, coll, name, &base_state_hash(b), &ext_cfg_hash).unwrap_or(true)
+    }).collect();
+    queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+
+    let pending_before = queue.len();
+    let (mut extracted, mut incompletas, mut fails) = (0usize, 0usize, 0usize);
+    let at = now_stamp();
+    for b in queue.iter().take(EXTRACT_PER_CYCLE) {
+        let name = b["name"].as_str().unwrap_or("");
+        let sh = base_state_hash(b);
+        let tipo = tab_tipos.get(name).cloned().unwrap_or_else(|| "registro".into());
+        let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
+        let rows_src = tabular_rows(&text);
+        let lines: Vec<&str> = text.lines().collect();
+        let version = chdb::now_version();
+        let mut ents: Vec<chdb::EntidadeRow> = vec![];
+        let mut idx: u32 = 0;
+        let mut ok = true;
+        for chunk in lines.chunks(EXTRACT_LINES_PER_WINDOW) {
+            let wtext = chunk.join("\n");
+            match llm_extract_records(llm_url, &sys, &tipo, &wtext) {
+                Ok(recs) => {
+                    for rec in recs {
+                        if !rec.is_object() { continue; }   // valida: só objetos entram no dump
+                        ents.push(chdb::EntidadeRow {
+                            collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
+                            idx, dado: rec.to_string(), state_hash: sh.clone(),
+                            ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
+                        });
+                        idx += 1;
+                    }
+                }
+                Err(e) => { nlog(&format!("extract {coll}/{name}: janela falhou ({e}) — descarta base (all-or-nothing)"));
+                            ok = false; fails += 1; break; }
+            }
+        }
+        if !ok { continue; }   // ALL-OR-NOTHING: nada gravado; a base volta no próximo ciclo
+        match chdb::insert_entities(ch_url, &ents) {
+            Ok(_) => { extracted += 1; if let Some(r) = rows_src { if ents.len() < r { incompletas += 1; } } }
+            Err(e) => { nlog(&format!("extract {coll}/{name}: insert falhou ({e})")); fails += 1; }
+        }
+    }
+    let pending = pending_before.saturating_sub(extracted);
+    json!({"ok": true, "collection": coll, "extracted": extracted,
+           "incompletas": incompletas, "fails": fails, "pending": pending})
+}
+
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     let (api, dir, level, llm_url, store, ch_url) = { let s = state.lock().unwrap();
         (s.ragd_api.clone(), s.dir.clone(), s.level, s.llm_url.clone(), s.store.clone(), s.ch_url.clone()) };
@@ -1363,6 +1520,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         .unwrap_or_default();
     let (mut mined, mut skipped, mut failed, mut summarized) = (vec![], vec![], vec![], vec![]);
     let mut classified: Vec<String> = vec![];
+    let mut extracted_ents: Vec<String> = vec![];
     for coll in &colls {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
@@ -1381,6 +1539,9 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
                     }
+                    // Fase 2: extrai os registros das bases tabulares (ClickHouse); só natureza=tabular.
+                    let ex = mine_entities(&api, &llm_url, &store, &ch_url, &lib, coll);
+                    if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     if let Some(s) = mine_summary(&api, &llm_url, &lib, level, coll, &src, &k["summary"], force) {
                         k["summary"] = s; summ_updated = true;
                     }
@@ -1417,13 +1578,13 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         None => u64::MAX,   // sentinela: ragd não respondeu /expansions
     };
     if let Ok(mut s) = state.lock() {
-        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {}{}",
-            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(), classified.len(),
+        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {} · extraiu {}{}",
+            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(), classified.len(), extracted_ents.len(),
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
            "mined": mined, "skipped": skipped, "failed": failed, "summarized": summarized,
-           "classified": classified,
+           "classified": classified, "extracted": extracted_ents,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
 }
@@ -1498,7 +1659,7 @@ fn main() {
     let _ = std::fs::create_dir_all(&cfg.dir);
     // store do acumulado/classes: ClickHouse (default) ou SQLite (rollback via cfg store=sqlite)
     store_ensure(&cfg.store, &cfg.dir, &cfg.ch_url);
-    ensure_classifier_template(&cfg.dir);   // garante o template editável no ValHalla
+    ensure_prompt_templates(&cfg.dir);   // garante os templates classificador+extrator editáveis no ValHalla
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(),
