@@ -1703,20 +1703,24 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
 // ociosidade entre ciclos quando há backlog (a máquina não fica esperando 5min à toa) e preserva o
 // gate leve quando não há o que fazer. On/online/nível são relidos a cada volta → reativo a pause.
 fn worker(state: Arc<Mutex<State>>) {
+    const SHORT_NAP: u64 = 8;   // re-checagem rápida: ragd offline (boot) ou ciclo ocupado (/run)
     loop {
-        let (on, online) = { let s = state.lock().unwrap(); (s.on, s.ragd_online) };
-        let mut worked = false;
-        if !on {
-            // desligado: nada a fazer, cai no sleep do gate
+        let (on, online, cadence) = { let s = state.lock().unwrap(); (s.on, s.ragd_online, s.cadence.max(10)) };
+        // nap = quanto dormir ANTES de reavaliar. cadence = gate normal (idle/desligado);
+        // SHORT_NAP = condição transitória (ragd subindo no boot, ou /run ocupando) — re-checa logo,
+        // pra um restart não custar 5min ociosos esperando o ragd health-check.
+        let nap = if !on {
+            cadence   // desligado: gate normal
         } else if !online {
-            nlog("ciclo pulado: ragd OFFLINE");
+            nlog("ciclo pulado: ragd OFFLINE (re-checa em breve)");
+            SHORT_NAP.min(cadence)
         } else if try_start_cycle(&state) {
             let r = run_cycle(&state, false);   // cadência NÃO força: respeita o source_hash
             end_cycle(&state);
             // PROGRESSO = alguma coleção avançou a fila (base classificada/extraída/minada/resumida).
             // Só `skipped`/`failed` = nada avançou → idle. `failed` NÃO conta como progresso pra não
             // emendar em loop quente quando o LLM está caindo (aí o back-off da cadência protege).
-            worked = ["mined", "classified", "extracted", "summarized"].iter()
+            let worked = ["mined", "classified", "extracted", "summarized"].iter()
                 .any(|k| r[k].as_array().map(|a| !a.is_empty()).unwrap_or(false));
             nlog(&format!("ciclo — minou={} pulou={} falhou={} classificou={} extraiu={} → {}",
                 r["mined"].as_array().map(|a| a.len()).unwrap_or(0),
@@ -1725,14 +1729,13 @@ fn worker(state: Arc<Mutex<State>>) {
                 r["classified"].as_array().map(|a| a.len()).unwrap_or(0),
                 r["extracted"].as_array().map(|a| a.len()).unwrap_or(0),
                 if worked { "EMENDA (tem backlog)" } else { "IDLE (dorme a cadência)" }));
+            if worked { continue; }   // EMENDA: volta JÁ, sem dormir
+            cadence                   // idle: gate normal
         } else {
-            nlog("ciclo da cadência pulado: já há um ciclo (ex. /run) em andamento");
-        }
-        // emendou? volta JÁ. Idle/off/offline/ocupado? espera a cadência antes de reavaliar.
-        if !worked {
-            let cadence = { state.lock().unwrap().cadence.max(10) };
-            std::thread::sleep(Duration::from_secs(cadence));
-        }
+            nlog("ciclo pulado: já há um ciclo (ex. /run) em andamento");
+            SHORT_NAP.min(cadence)
+        };
+        std::thread::sleep(Duration::from_secs(nap));
     }
 }
 
