@@ -887,6 +887,22 @@ fn parse_tabular(text: &str, delim: char) -> Vec<Value> {
     }
     out
 }
+/// Deriva a NATUREZA semântica do TIPO — determinística. O classificador acerta o tipo (89,5%
+/// medido) e a natureza cai por gravidade dele, SEM pedir ao LLM (evita o drift de re-tunar o
+/// prompt calibrado). Distingue TABELA (átomo de ANÁLISE, N registros homogêneos) de DOCUMENTO
+/// (átomo da PONTA, 1 exemplar individual — comprovante, nota, holerite): a §2 da arquitetura de
+/// escala manda NÃO processar a ponta linha-a-linha. Um CSV regular é sempre `tabela` (ver caller).
+fn natureza_do_tipo(tipo: &str) -> &'static str {
+    match tipo {
+        "cadastro" | "relatorio" => "tabela",
+        "comprovante" | "nota_fiscal" | "recibo" | "boleto" | "balanco" | "extrato"
+            | "dre" | "folha_pagamento" | "ordem_compra" | "cotacao" => "documento",
+        "contrato" | "livro" | "artigo" | "ata" | "carta" | "oficio" | "memorial"
+            | "curriculo" | "discurso" => "narrativo",
+        "codigo_fonte" | "config" | "log" => "codigo",
+        _ => "documento",   // fallback conservador: não é tabela → não extrai (o gate csv decide de fato)
+    }
+}
 /// Janelas de extração por ORÇAMENTO DE CARACTERES (adaptativo): bases densas pegam menos linhas
 /// por janela, estreitas pegam mais — dimensiona a SAÍDA do LLM pra não estourar o teto de tokens
 /// (a causa da sub-extração medida em bases com muitos registros). Ignora linhas vazias (mesma
@@ -1303,11 +1319,16 @@ fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipo
     Ok((nat, tip))
 }
 
-/// Classifica UMA base: chunk 0 + LLM constrangido. Err("sem-texto") se a base não tem texto.
+/// Classifica UMA base: chunk 0 + LLM constrangido. Devolve `(natureza_llm, tipo, csv)`, onde
+/// `csv` = reconhecedor determinístico (tabular_spec sobre o chunk 0 — o delimitador consistente
+/// já aparece no início). O chamador IGNORA `natureza_llm` e deriva a natureza do tipo/csv.
+/// Err("sem-texto") se a base não tem texto.
 fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
-                 naturezas: &[String], tipos: &[String]) -> Result<(String, String), String> {
+                 naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
     let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
-    llm_classify(llm_url, sys, &text, naturezas, tipos)
+    let csv = tabular_spec(&text).is_some();
+    let (nat, tip) = llm_classify(llm_url, sys, &text, naturezas, tipos)?;
+    Ok((nat, tip, csv))
 }
 
 // ── dispatch do STORE do acumulado: ClickHouse (default) ou SQLite (rollback via cfg store=sqlite) ──
@@ -1398,17 +1419,22 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         let name = b["name"].as_str().unwrap_or("");
         let sh = base_state_hash(b);
         let has_text = b["has_text"].as_bool().unwrap_or(true);
-        let mkrow = |nat: &str, tip: &str, conf: f64| chdb::ClassRow {
+        let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
             collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
             cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
-            confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
+            csv, confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
         };
         if !has_text {
-            rows.push(mkrow("?", "sem-texto", 0.0)); no_text += 1; continue;
+            rows.push(mkrow("?", "sem-texto", false, 0.0)); no_text += 1; continue;
         }
         match classify_base(api, llm_url, &sys, coll, name, &naturezas, &tipos) {
-            Ok((nat, tip)) => { rows.push(mkrow(&nat, &tip, 1.0)); classified += 1; consecutive_fails = 0; }
-            Err(e) if e == "sem-texto" => { rows.push(mkrow("?", "sem-texto", 0.0)); no_text += 1; consecutive_fails = 0; }
+            // a natureza do LLM é IGNORADA — derivamos do tipo (89,5%) + csv (determinístico).
+            // um CSV regular é sempre `tabela`; o resto cai por gravidade do tipo.
+            Ok((_nat_llm, tip, csv)) => {
+                let nat = if csv { "tabela" } else { natureza_do_tipo(&tip) };
+                rows.push(mkrow(nat, &tip, csv, 1.0)); classified += 1; consecutive_fails = 0;
+            }
+            Err(e) if e == "sem-texto" => { rows.push(mkrow("?", "sem-texto", false, 0.0)); no_text += 1; consecutive_fails = 0; }
             Err(e) => {
                 nlog(&format!("classify {coll}/{name} falhou: {e}"));
                 fails_total += 1; consecutive_fails += 1;
@@ -1448,11 +1474,13 @@ fn classify_list_cli(cfg: &Config, path: &str) {
             (item["coll"].as_str().unwrap_or("").to_string(),
              item["base"].as_str().unwrap_or("").to_string())
         };
-        let (nat, tip) = match classify_base(&cfg.ragd_api, &cfg.llm_url, &sys, &coll, &base, &naturezas, &tipos) {
-            Ok(x) => x,
-            Err(e) => ("?".to_string(), format!("ERR:{e}")),
-        };
-        println!("{}", json!({"coll": coll, "base": base, "natureza": nat, "tipo": tip}));
+        match classify_base(&cfg.ragd_api, &cfg.llm_url, &sys, &coll, &base, &naturezas, &tipos) {
+            Ok((nat_llm, tip, csv)) => {
+                let nat = if csv { "tabela".to_string() } else { natureza_do_tipo(&tip).to_string() };
+                println!("{}", json!({"coll": coll, "base": base, "natureza": nat, "tipo": tip, "csv": csv, "nat_llm": nat_llm}));
+            }
+            Err(e) => println!("{}", json!({"coll": coll, "base": base, "natureza": "?", "tipo": format!("ERR:{e}")})),
+        }
     }
 }
 
@@ -1493,14 +1521,22 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
     let ext_cfg_hash = hash_hex(&format!("extrator|v3modo|{sys}|win{}|tok{}",
         EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
 
-    // classes TABULARES da coleção (name -> tipo) — só elas têm registros pra extrair
-    let tab_tipos: std::collections::HashMap<String, String> = chdb::classes_summary(ch_url, Some(coll)).ok()
-        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default()
-        .iter().filter(|b| b["natureza"].as_str() == Some("tabular"))
+    // O GATE da Fase 2: só CSV regular (csv=1 no doc_class, DETERMINÍSTICO) tem registros pra
+    // extrair linha-a-linha. A natureza do LLM NÃO manda aqui — o reconhecedor determinístico sim
+    // (o LLM inflou 'tabular' com comprovantes/notas/OCs, que são átomos da PONTA: 1 registro cada,
+    // §2 da arquitetura). Filtrar por csv também torna o gate STICKY (a queue drena, não churna).
+    let bases_class: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    let is_csv = |b: &Value| b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1) || b["csv"].as_str() == Some("1");
+    // ponto cego (§5 da revisão): natureza 'tabela' SEM csv = tabela em formato não-CSV (markdown,
+    // largura fixa) que o parser não pega. Conta pra ficar VISÍVEL em vez de sumir em silêncio.
+    let blind = bases_class.iter().filter(|b| b["natureza"].as_str() == Some("tabela") && !is_csv(b)).count();
+    if blind > 0 { nlog(&format!("extract {coll}: {blind} base(s) natureza=tabela mas csv=0 (tabela não-CSV — não extraída)")); }
+    let tab_tipos: std::collections::HashMap<String, String> = bases_class.iter().filter(|b| is_csv(b))
         .filter_map(|b| Some((b["name"].as_str()?.to_string(), b["tipo"].as_str().unwrap_or("registro").to_string())))
         .collect();
     if tab_tipos.is_empty() {
-        return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "sem tabulares classificadas"});
+        return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "sem CSV regular classificado"});
     }
 
     let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)

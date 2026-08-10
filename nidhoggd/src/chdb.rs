@@ -26,6 +26,7 @@ pub struct ClassRow {
     pub cfg_hash: String,
     pub natureza: String,
     pub tipo: String,
+    pub csv: bool,        // determinístico (tabular_spec): é um CSV regular → gate da Fase 2
     pub confianca: f64,
     pub classified_at: String,
     pub version: u64,
@@ -109,9 +110,12 @@ pub fn ensure_schema(url: &str) -> Result<(), String> {
         "CREATE DATABASE IF NOT EXISTS nidhogg", 15)?;
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doc_class (collection String, name String, \
-         state_hash String, cfg_hash String, natureza String, tipo String, confianca Float64, \
-         classified_at String, version UInt64) ENGINE=ReplacingMergeTree(version) \
+         state_hash String, cfg_hash String, natureza String, tipo String, csv UInt8 DEFAULT 0, \
+         confianca Float64, classified_at String, version UInt64) ENGINE=ReplacingMergeTree(version) \
          ORDER BY (collection, name)", 15)?;
+    // migração idempotente: doc_class antigo não tinha `csv` (o gate determinístico da Fase 2)
+    ch_exec(url,
+        "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS csv UInt8 DEFAULT 0", 15)?;
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doctype (version UInt64, naturezas String, tipos String) \
          ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
@@ -176,6 +180,7 @@ pub fn insert_classes(url: &str, rows: &[ClassRow]) -> Result<(), String> {
         let line = json!({
             "collection": r.collection, "name": r.name, "state_hash": r.state_hash,
             "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo,
+            "csv": if r.csv { 1 } else { 0 },
             "confianca": r.confianca, "classified_at": r.classified_at, "version": r.version,
         });
         ndjson.push_str(&line.to_string());
@@ -213,7 +218,7 @@ pub fn classes_summary(url: &str, collection: Option<&str>) -> Result<Value, Str
     let total: i64 = total_body.trim().parse().unwrap_or(0);
 
     let bases_sql = format!(
-        "SELECT collection, name, natureza, tipo, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
+        "SELECT collection, name, natureza, tipo, csv, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
          ORDER BY collection, name FORMAT JSON");
     let bases_body = ch_query_param(url, &bases_sql, &params, 20)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json bases: {e}"))?;
