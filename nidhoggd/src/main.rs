@@ -662,6 +662,19 @@ const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os RE
 /// (medido: 68,8% → 100% de paridade com o baseline). Bate 100% com o baseline nas bases de
 /// negócio; a versão acentuada só diverge em narrativos ambíguos do `real` (às vezes melhor).
 const BUILTIN_CLASSIFY_PROMPT: &str = "Você classifica um documento em NATUREZA e TIPO.\nNATUREZA: tabular=dados em linhas/colunas, registros, valores (cadastros, notas, comprovantes, balanços, folhas, ordens). narrativo=texto corrido em prosa (livros, artigos, contratos, atas, cartas, currículos). codigo=código-fonte, config, log.\nSe for uma LISTA/TABELA com várias linhas de registros, o TIPO é cadastro ou relatorio, NÃO um documento individual.\nEscolha o TIPO mais específico da lista permitida.";
+/// Fase 3 — prompt criador de MOLDE (validado no gate: ancorar no rótulo dá favorecido≠pagador,
+/// generalizou 6/6 nos comprovantes, regex Rust-compatível). A âncora no rótulo é OBRIGATÓRIA.
+const BUILTIN_TEMPLATE_PROMPT: &str = r#"Você cria um TEMPLATE DE EXTRAÇÃO determinístico para um tipo de documento. Dado UM exemplo, para cada campo rotulado produza um REGEX (sintaxe da crate `regex` do Rust: SEM lookahead/lookbehind, SEM backreference) que:
+1. ANCORA no RÓTULO do campo — o rótulo vem ANTES do grupo de captura. OBRIGATÓRIO: sem âncora, 'favorecido' captura o 'pagador' (a primeira ocorrência).
+2. tem EXATAMENTE UM grupo de captura () isolando SÓ o valor (sem o rótulo).
+3. usa quantificadores GERAIS (\d+, .+?), NUNCA tamanho fixo (\d{8} quebra se variar).
+Inclua TODOS os campos rotulados (não omita nenhum). Separe compostos (nome e CNPJ na mesma linha = 2 campos, cada um ancorado no SEU rótulo).
+Exemplos de regras BOAS:
+  data            -> "Data:\s*(\d{2}/\d{2}/\d{4})"
+  favorecido_nome -> "FAVORECIDO:\s*(.+?)\s+CNPJ"
+  favorecido_cnpj -> "FAVORECIDO:.*?CNPJ\s*([\d./-]+)"
+  valor           -> "VALOR:\s*R\$\s*([\d.,]+)"
+'limpar' é só pra FORMATAÇÃO do valor (remover '.', 'R$'), NUNCA o rótulo."#;
 
 // ───────────────────────────── biblioteca de prompts nomeados (por nível/coleção) ─────────────────────────────
 fn prompts_path(dir: &str) -> std::path::PathBuf { Path::new(dir).join("prompts.json") }
@@ -902,6 +915,35 @@ fn natureza_do_tipo(tipo: &str) -> &'static str {
         "codigo_fonte" | "config" | "log" => "codigo",
         _ => "documento",   // fallback conservador: não é tabela → não extrai (o gate csv decide de fato)
     }
+}
+/// Fase 3 — compila as regras de um molde UMA vez (regex é caro de compilar; reusa nos N documentos
+/// do tipo). Regex inválido é DESCARTADO (o caller nota pela diferença de contagem campo↔regra).
+fn compile_template(regras: &Value) -> Vec<(String, regex::Regex, Vec<String>)> {
+    let mut out = vec![];
+    for r in regras.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let campo = match r["campo"].as_str() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let pat = match r["regex"].as_str() { Some(p) => p, _ => continue };
+        let re = match regex::Regex::new(pat) { Ok(re) => re, Err(_) => continue };   // regex ruim → pula
+        let limpar = r["limpar"].as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default();
+        out.push((campo, re, limpar));
+    }
+    out
+}
+/// Fase 3 — aplica um molde COMPILADO a UM documento → objeto `{campo: valor}`. Cada regra ancora no
+/// rótulo e captura o grupo 1 (o valor); as limpezas removem formatação. Determinístico, L0, zero-LLM
+/// — o oposto do LLM linha-a-linha. Campo sem match não entra (o caller mede a cobertura).
+fn apply_template(text: &str, compiled: &[(String, regex::Regex, Vec<String>)]) -> Value {
+    let mut obj = serde_json::Map::new();
+    for (campo, re, limpar) in compiled {
+        if let Some(caps) = re.captures(text) {
+            let val = caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str()).unwrap_or("");
+            let mut v = val.trim().to_string();
+            for s in limpar { v = v.replace(s.as_str(), ""); }
+            obj.insert(campo.clone(), Value::String(v.trim().to_string()));
+        }
+    }
+    Value::Object(obj)
 }
 /// Janelas de extração por ORÇAMENTO DE CARACTERES (adaptativo): bases densas pegam menos linhas
 /// por janela, estreitas pegam mais — dimensiona a SAÍDA do LLM pra não estourar o teto de tokens
@@ -1255,6 +1297,94 @@ fn extract_system(lib: &Value) -> (String, String) {
         _ => (BUILTIN_EXTRACT_PROMPT.to_string(), "builtin".into()),
     }
 }
+/// System do criador de MOLDE (Fase 3): template "modelador" editável ou o BUILTIN.
+fn template_system(lib: &Value) -> (String, String) {
+    match lib["templates"]["modelador"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => (s.to_string(), "template".into()),
+        _ => (BUILTIN_TEMPLATE_PROMPT.to_string(), "builtin".into()),
+    }
+}
+/// Fase 3 — o L1 cria o molde de um tipo a partir de UMA amostra. Structured output força
+/// `{schema:[...], regras:[{campo,regex,limpar}]}`. Devolve (schema_json, regras_json) como strings.
+fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str) -> Result<(String, String), String> {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "schema": {"type": "array", "items": {"type": "string"}},
+            "regras": {"type": "array", "items": {"type": "object", "properties": {
+                "campo": {"type": "string"}, "regex": {"type": "string"},
+                "limpar": {"type": "array", "items": {"type": "string"}}
+            }, "required": ["campo", "regex"]}}
+        },
+        "required": ["schema", "regras"]
+    });
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!("TIPO: {tipo}\nDOCUMENTO EXEMPLO:\n{amostra}")}
+        ],
+        "temperature": 0, "max_tokens": 1200,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let resp = http_post_t(llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
+    let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
+    let content = rv["choices"][0]["message"]["content"].as_str()
+        .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(120).collect::<String>()))?;
+    let obj = extract_json_object(content).ok_or_else(|| "molde não é JSON válido".to_string())?;
+    let regras = obj["regras"].clone();
+    if !regras.is_array() || regras.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return Err("molde sem regras".into());
+    }
+    Ok((obj["schema"].to_string(), regras.to_string()))
+}
+/// Fase 3 — cria moldes pros tipos NÃO-CSV que ainda não têm template (1 tipo por ciclo, o mais
+/// populoso primeiro = mais valor). Pega 1 amostra, o L1 cria o molde, valida a cobertura aplicando
+/// nela mesma, e grava no registry. O L0 (mine_entities) aplica depois aos N documentos.
+fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+    if let Err(e) = chdb::ensure_template_schema(ch_url) {
+        return json!({"ok": false, "collection": coll, "error": format!("schema template: {e}")});
+    }
+    let templates = chdb::get_templates(ch_url).unwrap_or_else(|_| json!({}));
+    let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    // tipos NÃO-CSV, sem molde ainda → escolhe o mais populoso (name = 1 amostra por tipo)
+    let mut por_tipo: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+    for b in &bases {
+        let is_csv = b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1);
+        let tipo = b["tipo"].as_str().unwrap_or("");
+        let name = b["name"].as_str().unwrap_or("");
+        if is_csv || tipo.is_empty() || tipo == "sem-texto" || name.is_empty() { continue; }
+        if templates.get(tipo).is_some() { continue; }   // já tem molde
+        let e = por_tipo.entry(tipo.to_string()).or_insert((0, name.to_string()));
+        e.0 += 1;
+    }
+    let (tipo, count, aname) = match por_tipo.into_iter().max_by_key(|(_, (c, _))| *c) {
+        Some((t, (c, n))) => (t, c, n),
+        None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "tipos não-CSV já têm molde (ou não há)"}),
+    };
+    let amostra = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let (sys, _from) = template_system(lib);
+    let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra) {
+        Ok(x) => x,
+        Err(e) => { nlog(&format!("template {coll}/{tipo}: {e}")); return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e}); }
+    };
+    // valida cobertura aplicando o molde na própria amostra (% de campos que casaram)
+    let regras_v: Value = serde_json::from_str(&regras).unwrap_or_else(|_| json!([]));
+    let compiled = compile_template(&regras_v);
+    let rec = apply_template(&amostra, &compiled);
+    let n_campos = regras_v.as_array().map(|a| a.len()).unwrap_or(0);
+    let n_ok = rec.as_object().map(|o| o.values().filter(|v| !v.as_str().unwrap_or("").is_empty()).count()).unwrap_or(0);
+    let cobertura = if n_campos > 0 { n_ok as f64 / n_campos as f64 } else { 0.0 };
+    let row = chdb::TemplateRow {
+        tipo: tipo.clone(), schema, regras, cobertura, origem: "llm".into(),
+        created_at: now_stamp(), version: chdb::now_version(),
+    };
+    if let Err(e) = chdb::upsert_template(ch_url, &row) {
+        return json!({"ok": false, "collection": coll, "tipo": tipo, "error": format!("upsert: {e}")});
+    }
+    nlog(&format!("molde criado: tipo={tipo} campos={n_campos} cobertura={:.0}% ({count} exemplares aguardando)", cobertura * 100.0));
+    json!({"ok": true, "collection": coll, "criados": 1, "tipo": tipo, "campos": n_campos, "cobertura": cobertura})
+}
 
 /// Garante que os templates "classificador" e "extrator" existem na biblioteca (pra aparecerem no
 /// editor do ValHalla). Idempotente: só grava o que faltava.
@@ -1507,36 +1637,47 @@ fn llm_extract_records(llm_url: &str, sys: &str, tipo: &str, text: &str) -> Resu
 /// TABULARES (natureza vem do doc_class) como array JSON, incremental por base (janela por Nº de
 /// linhas → saída bounded), ALL-OR-NOTHING (janela falha ⇒ descarta a base), 1 INSERT em lote por
 /// base (mesmo version). O acumulado vira o dump denso; a completude é COUNT ≥ linhas da fonte.
-fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     if store != "clickhouse" {
         return json!({"ok": false, "collection": coll, "error": "extração requer clickhouse"});
     }
     if let Err(e) = chdb::ensure_entidade_schema(ch_url) {
         return json!({"ok": false, "collection": coll, "error": format!("schema: {e}")});
     }
+    if let Err(e) = chdb::ensure_template_schema(ch_url) {
+        return json!({"ok": false, "collection": coll, "error": format!("schema template: {e}")});
+    }
     let (sys, _from) = extract_system(lib);
-    // o hash da config de extração inclui a versão do ALGORITMO (v2det = despacho determinístico),
-    // a JANELA e o TETO — mudá-los reprocessa as bases (senão o deploy vira no-op: as bases batem
-    // o hash antigo e o ciclo pula todas).
-    let ext_cfg_hash = hash_hex(&format!("extrator|v3modo|{sys}|win{}|tok{}",
+    let ext_cfg_csv = hash_hex(&format!("extrator|v3modo|{sys}|win{}|tok{}",
         EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
+    let templates = chdb::get_templates(ch_url).unwrap_or_else(|_| json!({}));   // registry (Fase 3)
 
-    // O GATE da Fase 2: só CSV regular (csv=1 no doc_class, DETERMINÍSTICO) tem registros pra
-    // extrair linha-a-linha. A natureza do LLM NÃO manda aqui — o reconhecedor determinístico sim
-    // (o LLM inflou 'tabular' com comprovantes/notas/OCs, que são átomos da PONTA: 1 registro cada,
-    // §2 da arquitetura). Filtrar por csv também torna o gate STICKY (a queue drena, não churna).
+    // O GATE: extrai só quem tem COMO extrair DETERMINISTICAMENTE —
+    //  · csv=1 → parse_tabular (cabeçalho = schema)
+    //  · csv=0 mas o TIPO tem molde no registry → apply_template (regex ancorado, 1 doc = 1 registro)
+    // A natureza do LLM não manda; o determinístico sim. `ext_cfg` é POR-BASE: CSV inclui a config do
+    // parser; template inclui o HASH DO MOLDE do tipo — mudar um molde re-extrai só o tipo dele.
     let bases_class: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let is_csv = |b: &Value| b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1) || b["csv"].as_str() == Some("1");
-    // ponto cego (§5 da revisão): natureza 'tabela' SEM csv = tabela em formato não-CSV (markdown,
-    // largura fixa) que o parser não pega. Conta pra ficar VISÍVEL em vez de sumir em silêncio.
-    let blind = bases_class.iter().filter(|b| b["natureza"].as_str() == Some("tabela") && !is_csv(b)).count();
-    if blind > 0 { nlog(&format!("extract {coll}: {blind} base(s) natureza=tabela mas csv=0 (tabela não-CSV — não extraída)")); }
-    let tab_tipos: std::collections::HashMap<String, String> = bases_class.iter().filter(|b| is_csv(b))
-        .filter_map(|b| Some((b["name"].as_str()?.to_string(), b["tipo"].as_str().unwrap_or("registro").to_string())))
-        .collect();
-    if tab_tipos.is_empty() {
-        return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "sem CSV regular classificado"});
+    let mut extraiveis: std::collections::HashMap<String, (String, bool, String)> = std::collections::HashMap::new();
+    for b in &bases_class {
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n.to_string(), _ => continue };
+        let tipo = b["tipo"].as_str().unwrap_or("registro").to_string();
+        if is_csv(b) {
+            extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone()));
+        } else if let Some(t) = templates.get(tipo.as_str()) {
+            let ecfg = hash_hex(&format!("template|{tipo}|{}", hash_hex(&t["regras"].to_string())));
+            extraiveis.insert(name, (tipo, false, ecfg));
+        }
+    }
+    // ponto cego: natureza=tabela sem csv E sem molde → ninguém extrai (VISÍVEL, não silencioso)
+    let blind = bases_class.iter()
+        .filter(|b| b["natureza"].as_str() == Some("tabela") && !is_csv(b)
+                && !templates.get(b["tipo"].as_str().unwrap_or("")).is_some()).count();
+    if blind > 0 { nlog(&format!("extract {coll}: {blind} base(s) natureza=tabela sem csv nem molde — não extraídas")); }
+    if extraiveis.is_empty() {
+        return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "nada extraível (sem CSV nem molde)"});
     }
 
     let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)
@@ -1546,71 +1687,61 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
     };
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
         let name = b["name"].as_str().unwrap_or("");
-        tab_tipos.contains_key(name)
-            && chdb::needs_extract(ch_url, coll, name, &base_state_hash(b), &ext_cfg_hash).unwrap_or(true)
+        match extraiveis.get(name) {
+            Some((_, _, ecfg)) => chdb::needs_extract(ch_url, coll, name, &base_state_hash(b), ecfg).unwrap_or(true),
+            None => false,
+        }
     }).collect();
     queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 
     let pending_before = queue.len();
-    let (mut extracted, mut incompletas, mut fails, mut det_bases) = (0usize, 0usize, 0usize, 0usize);
+    let (mut extracted, mut incompletas, mut fails, mut det_bases, mut tpl_bases) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut compiled_cache: std::collections::HashMap<String, Vec<(String, regex::Regex, Vec<String>)>> = std::collections::HashMap::new();
     let at = now_stamp();
     for b in queue.iter().take(EXTRACT_PER_CYCLE) {
         let name = b["name"].as_str().unwrap_or("");
         let sh = base_state_hash(b);
-        let tipo = tab_tipos.get(name).cloned().unwrap_or_else(|| "registro".into());
+        let (tipo, _bcsv, ecfg) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        let spec = tabular_spec(&text);            // Some((delim, n)) = CSV regular → extração determinística
+        let spec = tabular_spec(&text);
         let rows_src = spec.map(|(_, n)| n);
         let version = chdb::now_version();
         let mut ents: Vec<chdb::EntidadeRow> = vec![];
-        let mut idx: u32 = 0;
-        let mut ok = true;
-        let mut det = false;
-        match spec {
-            // CSV REGULAR → determinístico: cabeçalho = schema, cada linha = registro. Zero LLM,
-            // schema único, sem linha pulada (o oposto do LLM linha-a-linha).
-            Some((delim, _)) => {
-                det = true;
-                for rec in parse_tabular(&text, delim) {
-                    ents.push(chdb::EntidadeRow {
-                        collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                        idx, dado: rec.to_string(), modo: "det".to_string(), state_hash: sh.clone(),
-                        ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
-                    });
-                    idx += 1;
-                }
+        let modo: &str;
+        if let Some((delim, _)) = spec {
+            // CSV → determinístico: cabeçalho = schema, cada linha = registro.
+            modo = "det";
+            let mut idx: u32 = 0;
+            for rec in parse_tabular(&text, delim) {
+                ents.push(chdb::EntidadeRow {
+                    collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
+                    idx, dado: rec.to_string(), modo: "det".to_string(), state_hash: sh.clone(),
+                    ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+                });
+                idx += 1;
             }
-            // Sem estrutura CSV (comprovantes, docs) → LLM guiado com janela adaptativa.
-            None => {
-                for wtext in extract_windows(&text, EXTRACT_INPUT_CHARS_PER_WINDOW) {
-                    match llm_extract_records(llm_url, &sys, &tipo, &wtext) {
-                        Ok(recs) => {
-                            for rec in recs {
-                                if !rec.is_object() { continue; }   // valida: só objetos entram no dump
-                                ents.push(chdb::EntidadeRow {
-                                    collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
-                                    idx, dado: rec.to_string(), modo: "llm".to_string(), state_hash: sh.clone(),
-                                    ext_cfg_hash: ext_cfg_hash.clone(), version, extracted_at: at.clone(),
-                                });
-                                idx += 1;
-                            }
-                        }
-                        Err(e) => { nlog(&format!("extract {coll}/{name}: janela falhou ({e}) — descarta base (all-or-nothing)"));
-                                    ok = false; fails += 1; break; }
-                    }
-                }
-            }
+        } else {
+            // Fase 3: aplica o MOLDE do tipo (regex ancorado). 1 documento = 1 registro. Zero LLM.
+            modo = "template";
+            let compiled = compiled_cache.entry(tipo.clone())
+                .or_insert_with(|| compile_template(&templates[tipo.as_str()]["regras"]));
+            let rec = apply_template(&text, &compiled[..]);
+            ents.push(chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
+                idx: 0, dado: rec.to_string(), modo: "template".to_string(), state_hash: sh.clone(),
+                ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            });
         }
-        if !ok { continue; }   // ALL-OR-NOTHING: nada gravado; a base volta no próximo ciclo
         match chdb::insert_entities(ch_url, &ents) {
-            Ok(_) => { extracted += 1; if det { det_bases += 1; }
-                       if let Some(r) = rows_src { if !det && ents.len() < r { incompletas += 1; } } }
+            Ok(_) => { extracted += 1;
+                       if modo == "det" { det_bases += 1; if let Some(r) = rows_src { if ents.len() < r { incompletas += 1; } } }
+                       else { tpl_bases += 1; } }
             Err(e) => { nlog(&format!("extract {coll}/{name}: insert falhou ({e})")); fails += 1; }
         }
     }
     let pending = pending_before.saturating_sub(extracted);
     json!({"ok": true, "collection": coll, "extracted": extracted, "deterministicas": det_bases,
-           "incompletas": incompletas, "fails": fails, "pending": pending})
+           "templates": tpl_bases, "incompletas": incompletas, "fails": fails, "pending": pending})
 }
 
 fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
@@ -1638,10 +1769,14 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
                     }
-                    // Fase 2/4: extrai os registros das bases tabulares (só csv=1, determinístico).
-                    let ex = mine_entities(&api, &llm_url, &store, &ch_url, &lib, coll);
+                    // Fase 3: o L1 cria/mantém os MOLDES dos tipos não-CSV (1 tipo por ciclo). Roda
+                    // ANTES da extração pra o molde já estar no registry quando o L0 for aplicar.
+                    let _tpl = mine_templates(&api, &llm_url, &ch_url, &lib, coll);
+                    // Fase 2/4/3: extrai DETERMINISTICAMENTE — csv=1 via parse_tabular, csv=0-com-molde
+                    // via apply_template (regex). Zero LLM aqui (o LLM só criou o molde acima).
+                    let ex = mine_entities(&api, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
-                    det_total += ex["deterministicas"].as_u64().unwrap_or(0);
+                    det_total += ex["deterministicas"].as_u64().unwrap_or(0) + ex["templates"].as_u64().unwrap_or(0);
                     // Summary d00a009 APOSENTADO (10/ago): o normalizador aberto (1 LLM pesado/base, extração
                     // às cegas + agregação) foi substituído pela Fase 1 (classifica) + Fase 2/4 (extrai
                     // determinístico). mine_summary/normalize_base ficam no código, reservados pra Fase 5

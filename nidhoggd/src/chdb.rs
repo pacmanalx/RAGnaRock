@@ -324,3 +324,52 @@ pub fn entities_summary(url: &str, collection: Option<&str>, base: Option<&str>)
     }
     Ok(json!({"count": total, "por_base": por_base, "amostra": amostra}))
 }
+
+// ───────── Fase 3: registry de templates de extração (o molde por TIPO) ─────────
+// Um template = { schema (campos), regras (regex ancorado no rótulo + limpeza) }. O L1 cria/ajusta
+// (LLM, 1× por tipo); o L0 aplica aos N documentos iguais (determinístico, zero-LLM). Versionado por
+// ReplacingMergeTree: ajustar um molde é INSERT com version maior; o L0 lê o consolidado (FINAL).
+
+pub struct TemplateRow {
+    pub tipo: String,
+    pub schema: String,     // JSON array de campos (nomes)
+    pub regras: String,     // JSON array de {campo, regex, limpar[]}
+    pub cobertura: f64,     // % média de campos preenchidos na amostra de validação
+    pub origem: String,     // "llm" (criado) | "ajuste" (reparado sob gatilho)
+    pub created_at: String,
+    pub version: u64,
+}
+
+pub fn ensure_template_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.template (tipo String, schema String, regras String, \
+         cobertura Float64, origem String, created_at String, version UInt64) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY tipo", 15)?;
+    Ok(())
+}
+
+/// Templates atuais (versão consolidada), por tipo → {schema, regras, cobertura}. É o registry que
+/// o L0 lê pra decidir se um tipo já tem molde e aplicá-lo.
+pub fn get_templates(url: &str) -> Result<Value, String> {
+    let body = ch_exec(url,
+        "SELECT tipo, schema, regras, cobertura FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
+    let mut map = serde_json::Map::new();
+    for line in body.lines() {
+        if line.trim().is_empty() { continue; }
+        let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+        let tipo = match v["tipo"].as_str() { Some(t) if !t.is_empty() => t.to_string(), _ => continue };
+        let schema = serde_json::from_str::<Value>(v["schema"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
+        let regras = serde_json::from_str::<Value>(v["regras"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
+        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"]}));
+    }
+    Ok(Value::Object(map))
+}
+
+/// Grava/atualiza o molde de um tipo (INSERT com version nova; ReplacingMergeTree consolida).
+pub fn upsert_template(url: &str, r: &TemplateRow) -> Result<(), String> {
+    let row = json!({
+        "tipo": r.tipo, "schema": r.schema, "regras": r.regras, "cobertura": r.cobertura,
+        "origem": r.origem, "created_at": r.created_at, "version": r.version,
+    });
+    ch_insert(url, "nidhogg.template", &row.to_string(), 15)
+}
