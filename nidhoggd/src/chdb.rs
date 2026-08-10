@@ -399,3 +399,63 @@ pub fn upsert_template(url: &str, r: &TemplateRow) -> Result<(), String> {
     });
     ch_insert(url, "nidhogg.template", &row.to_string(), 15)
 }
+
+/// Cockpit da ingestão (Fase 6) — os documentos que o motor QUERIA processar mas não viraram dado
+/// útil. NÃO inclui narrativo/codigo (esses não geram registro por natureza — não são refugo).
+///  · natureza=documento, tipo SEM molde no registry → "sem molde"
+///  · natureza=documento, tipo COM molde mas NQI < 0.5 → "nqi baixo" (o molde não casou o doc)
+///  · natureza=tabela mas csv=0 → "tabela não-CSV" (o ponto cego)
+/// Documento com molde ainda-não-extraído é transitório (vai extrair) → NÃO é refugo.
+pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
+    let templates = get_templates(url)?;
+    // nqi médio por (coll, base) — só as extraídas
+    let nqi_body = ch_exec(url,
+        "SELECT collection, base, round(avg(nqi),3) nqi FROM nidhogg.entidade_atual \
+         GROUP BY collection, base FORMAT JSONEachRow", 15)?;
+    let mut nqi_map: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
+    for l in nqi_body.lines() {
+        if l.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            if let (Some(c), Some(b)) = (v["collection"].as_str(), v["base"].as_str()) {
+                nqi_map.insert((c.to_string(), b.to_string()), v["nqi"].as_f64().unwrap_or(0.0));
+            }
+        }
+    }
+    // candidatos: documento OU (tabela com csv=0)
+    let body = ch_exec(url,
+        "SELECT collection, name, natureza, tipo, csv FROM nidhogg.doc_class FINAL \
+         WHERE natureza='documento' OR (natureza='tabela' AND csv=0) FORMAT JSONEachRow", 20)?;
+    let mut lista: Vec<Value> = vec![];
+    for l in body.lines() {
+        if l.trim().is_empty() { continue; }
+        let v: Value = match serde_json::from_str(l) { Ok(v) => v, Err(_) => continue };
+        let coll = v["collection"].as_str().unwrap_or("");
+        let name = v["name"].as_str().unwrap_or("");
+        let natureza = v["natureza"].as_str().unwrap_or("");
+        let tipo = v["tipo"].as_str().unwrap_or("");
+        if name.is_empty() { continue; }
+        let nqi = nqi_map.get(&(coll.to_string(), name.to_string())).copied();
+        let motivo = if natureza == "tabela" {
+            "tabela não-CSV"
+        } else if templates.get(tipo).is_none() {
+            "sem molde"
+        } else {
+            match nqi {
+                Some(n) if n < 0.5 => "nqi baixo",   // extraiu, mas o molde não serviu
+                Some(_) => continue,                  // extraiu bem — não é refugo
+                None => continue,                     // com molde, ainda não extraído — transitório
+            }
+        };
+        lista.push(json!({"collection": coll, "base": name, "natureza": natureza,
+                          "tipo": tipo, "motivo": motivo, "nqi": nqi}));
+    }
+    // pior primeiro: nqi baixo (com nqi) antes de sem molde/ponto cego (sem nqi)
+    lista.sort_by(|a, b| a["nqi"].as_f64().unwrap_or(9.0).partial_cmp(&b["nqi"].as_f64().unwrap_or(9.0)).unwrap());
+    let mut por_motivo = serde_json::Map::new();
+    for r in &lista {
+        let m = r["motivo"].as_str().unwrap_or("?").to_string();
+        let c = por_motivo.get(&m).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+        por_motivo.insert(m, json!(c));
+    }
+    Ok(json!({"count": lista.len(), "por_motivo": por_motivo, "rejeitados": lista}))
+}

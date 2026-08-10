@@ -434,6 +434,19 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 }
             }
         }
+        // [Fase 6/cockpit] rejeitados — os documentos que o motor não conseguiu processar (sem molde,
+        // NQI baixo, tabela não-CSV). O humano vê aqui e ajusta a ingestão específica.
+        (Method::Get, "/api/nidhogg/rejeitados") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" {
+                (200, json!({"count": 0, "rejeitados": [], "note": "requer clickhouse"}).to_string())
+            } else {
+                match chdb::rejeitados_summary(&ch_url) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
         // [Fase 1] doctypes — a lista EDITÁVEL de naturezas/tipos que alimenta o enum do classificador.
         (Method::Get, "/api/nidhogg/doctypes") => {
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
