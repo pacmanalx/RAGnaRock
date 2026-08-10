@@ -469,6 +469,89 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
+        // [Rejeitados/cockpit] re-tipagem MANUAL de uma base. O operador escolhe o tipo certo; gravamos
+        // com origem='humano' → o LLM NUNCA sobrescreve (needs_class curto-circuita). natureza deriva do
+        // tipo, csv é determinístico (tabular_spec no texto real). Re-extrai no próximo ciclo (o novo tipo
+        // muda o ext_cfg → needs_extract dispara). Corrige os mal-tipados e o COMPARATIVO nqi-baixo.
+        (Method::Post, "/api/nidhogg/reclass") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
+            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
+            if coll.is_empty() || base.is_empty() || tipo.is_empty() {
+                return (400, json!({"error":"faltam 'collection', 'base' e 'tipo'"}).to_string());
+            }
+            let (api, store, dir, ch_url) = { let s = st.lock().unwrap(); (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"re-tipagem requer clickhouse"}).to_string()); }
+            if let Err(e) = chdb::ensure_schema(&ch_url) { return (500, json!({"error": format!("schema: {e}")}).to_string()); }
+            let (_nat, tipos) = store_doctypes(&store, &dir, &ch_url);
+            if !tipos.iter().any(|t| t == &tipo) {
+                return (400, json!({"error": format!("tipo desconhecido: {tipo}"), "tipos": tipos}).to_string());
+            }
+            // csv DETERMINÍSTICO (tabular_spec no texto real); natureza deriva do tipo (ou 'tabela' se csv)
+            let csv = fetch_base_text(&api, &coll, &base).map(|t| tabular_spec(&t).is_some()).unwrap_or(false);
+            let natureza = if csv { "tabela".to_string() } else { natureza_do_tipo(&tipo).to_string() };
+            // extraível AGORA? csv (det) OU já existe molde pro tipo. Se não (documento sem molde ainda,
+            // ou narrativo/código que nunca gera registro), NÃO há re-extração — e uma extração ANTIGA
+            // desta base (se houver) PERMANECE no dump sob o tipo velho até um molde existir. Avisamos.
+            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| t.get(tipo.as_str()).is_some()).unwrap_or(false);
+            let extraivel = csv || tem_molde;
+            let nota = if extraivel { "re-extrai no próximo ciclo" }
+                       else if natureza == "documento" { "sem molde ainda — dê um molde dirigido pra extrair" }
+                       else { "natureza não gera registro — extração anterior (se houve) permanece até haver molde" };
+            let (sh, ch) = chdb::get_class_hashes(&ch_url, &coll, &base).unwrap_or_default();
+            let row = chdb::ClassRow {
+                collection: coll.clone(), name: base.clone(), state_hash: sh, cfg_hash: ch,
+                natureza: natureza.clone(), tipo: tipo.clone(), csv, origem: "humano".to_string(),
+                confianca: 1.0, classified_at: now_stamp(), version: chdb::now_version(),
+            };
+            match chdb::insert_classes(&ch_url, &[row]) {
+                Ok(_) => { nlog(&format!("re-tipado (humano): {coll}/{base} → tipo={tipo} natureza={natureza} csv={csv} — LLM não sobrescreve; {nota}"));
+                           (200, json!({"ok":true,"collection":coll,"base":base,"tipo":tipo,"natureza":natureza,"csv":csv,"extraivel":extraivel,"nota":nota}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [Rejeitados/cockpit] molde DIRIGIDO: o operador escreve O QUE extrair (instrucao) + aponta 1
+        // amostra (collection/base); o L1 cria o molde regex ancorado. Destrava os 'sem molde'. NÃO
+        // aplica o gate de cobertura (confia no operador) — só reporta a cobertura medida na amostra.
+        (Method::Post, "/api/nidhogg/molde") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
+            let instrucao = v["instrucao"].as_str().unwrap_or("").trim().to_string();
+            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
+            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            if tipo.is_empty() || coll.is_empty() || base.is_empty() {
+                return (400, json!({"error":"faltam 'tipo', 'collection' e 'base' (a amostra)"}).to_string());
+            }
+            if instrucao.is_empty() {
+                return (400, json!({"error":"molde dirigido exige 'instrucao' (o que extrair)"}).to_string());
+            }
+            let (api, store, dir, llm_url, ch_url) = { let s = st.lock().unwrap(); (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.llm_url.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"registry requer clickhouse"}).to_string()); }
+            if let Err(e) = chdb::ensure_template_schema(&ch_url) { return (500, json!({"error": format!("schema template: {e}")}).to_string()); }
+            let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => t, None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
+            let lib = read_prompts(&dir);
+            let (sys, _from) = template_system(&lib);
+            let (schema, regras) = match llm_make_template(&llm_url, &sys, &tipo, &amostra, &instrucao) {
+                Ok(x) => x,
+                Err(e) => return (502, json!({"error": format!("L1 não criou o molde: {e}")}).to_string()),
+            };
+            let regras_v: Value = serde_json::from_str(&regras).unwrap_or_else(|_| json!([]));
+            let compiled = compile_template(&regras_v);
+            let rec = apply_template(&amostra, &compiled);
+            let n_campos = regras_v.as_array().map(|a| a.len()).unwrap_or(0);
+            let n_ok = rec.as_object().map(|o| o.values().filter(|x| !x.as_str().unwrap_or("").is_empty()).count()).unwrap_or(0);
+            let cobertura = if n_campos > 0 { n_ok as f64 / n_campos as f64 } else { 0.0 };
+            let row = chdb::TemplateRow {
+                tipo: tipo.clone(), schema, regras, cobertura, origem: "humano".into(),
+                created_at: now_stamp(), version: chdb::now_version(),
+            };
+            match chdb::upsert_template(&ch_url, &row) {
+                Ok(_) => { nlog(&format!("molde DIRIGIDO (humano): tipo={tipo} campos={n_campos} cobertura={:.0}% — extrai no próximo ciclo", cobertura * 100.0));
+                           (200, json!({"ok":true,"tipo":tipo,"campos":n_campos,"cobertura":cobertura,"amostra":rec}).to_string()) }
+                Err(e) => (500, json!({"error": format!("upsert: {e}")}).to_string()),
+            }
+        }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
@@ -1386,7 +1469,7 @@ fn template_system(lib: &Value) -> (String, String) {
 }
 /// Fase 3 — o L1 cria o molde de um tipo a partir de UMA amostra. Structured output força
 /// `{schema:[...], regras:[{campo,regex,limpar}]}`. Devolve (schema_json, regras_json) como strings.
-fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str) -> Result<(String, String), String> {
+fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -1398,10 +1481,17 @@ fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str) -> Res
         },
         "required": ["schema", "regras"]
     });
+    // molde DIRIGIDO (cockpit dos Rejeitados): a instrução do operador entra ANTES do exemplo, dizendo
+    // ao L1 exatamente quais campos ancorar. Vazia = mineração automática (o L1 decide sozinho).
+    let user = if instrucao.trim().is_empty() {
+        format!("TIPO: {tipo}\nDOCUMENTO EXEMPLO:\n{amostra}")
+    } else {
+        format!("TIPO: {tipo}\nINSTRUÇÃO DO OPERADOR (o que extrair): {}\nDOCUMENTO EXEMPLO:\n{amostra}", instrucao.trim())
+    };
     let body = json!({
         "messages": [
             {"role": "system", "content": sys},
-            {"role": "user", "content": format!("TIPO: {tipo}\nDOCUMENTO EXEMPLO:\n{amostra}")}
+            {"role": "user", "content": user}
         ],
         "temperature": 0, "max_tokens": 1200,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
@@ -1447,7 +1537,7 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     };
     let amostra = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
     let (sys, _from) = template_system(lib);
-    let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra) {
+    let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra, "") {
         Ok(x) => x,
         Err(e) => { nlog(&format!("template {coll}/{tipo}: {e}")); return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e}); }
     };
@@ -1643,7 +1733,8 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
             collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
             cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
-            csv, confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
+            csv, origem: "llm".to_string(),
+            confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
         };
         if !has_text {
             rows.push(mkrow("?", "sem-texto", false, 0.0)); no_text += 1; continue;
@@ -1984,6 +2075,8 @@ rotas:
   GET  /api/nidhogg/knowledge       conhecimento destilado (?collection=&type=&level=) — só leitura
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
+  POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)
+  POST /api/nidhogg/molde           molde dirigido {{\"tipo\",\"instrucao\",\"collection\",\"base\"}}
   POST /api/nidhogg/run             dispara um ciclo agora (stub)");
 }
 

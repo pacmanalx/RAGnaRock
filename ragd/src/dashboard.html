@@ -1203,27 +1203,86 @@ function paintNv1(){
   else if(_nv1Tab==='rejeitados') body=renderRejeitados(d.rej);
   $('#nv-future').innerHTML = bar + body;
 }
-// [Fase 6/cockpit] documentos que o motor não conseguiu processar — o humano vê e ajusta a ingestão.
+// [Fase 6/cockpit] documentos que o motor não conseguiu processar — o humano vê e AJUSTA a ingestão:
+// re-tipar (override manual, origem=humano) ou molde dirigido (escreve o que extrair → L1 cria o molde).
 function renderRejeitados(rej){
   const lista=(rej&&rej.rejeitados)||[], pm=(rej&&rej.por_motivo)||{};
   if(!lista.length) return `<div class="panel"><h2>🚫 Rejeitados <span class="muted" style="text-transform:none">— cockpit da ingestão</span></h2>
     <p class="muted" style="margin:0">Nada rejeitado — todo documento que entrou virou dado útil, ou é narrativo/código (que não gera registro por natureza). 🎉</p></div>`;
   const corMotivo=(m)=> m==='nqi baixo'?'#d05a5a': m==='sem molde'?'#d0a537':'#8a8aa0';
   const resumo=Object.entries(pm).map(([m,n])=>`<span style="font-size:11px;color:${corMotivo(m)};font-weight:bold;margin-right:12px">${esc(m)}: ${n}</span>`).join('');
-  const linhas=lista.map(r=>{
+  const linhas=lista.map((r,i)=>{
     const nqi=(r.nqi!=null?r.nqi:null);
     const nqiTxt = nqi!=null ? `<span style="flex:0 0 46px;text-align:right;font-size:11px;color:${nvNqiCor(nqi)}">NQI ${nvNqiPct(nqi)}%</span>` : `<span style="flex:0 0 46px;text-align:right;font-size:11px;color:var(--dim)">—</span>`;
-    return `<div style="display:flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--line);border-left:3px solid ${corMotivo(r.motivo)};border-radius:6px;margin-bottom:5px">
-      <span style="flex:1;color:var(--ink);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.base)}</span>
-      <span class="muted" style="font-size:11px;flex:0 0 auto">${esc(r.tipo)}</span>
-      <span style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;color:${corMotivo(r.motivo)};border:1px solid ${corMotivo(r.motivo)};flex:0 0 auto">${esc(r.motivo)}</span>
-      ${nqiTxt}</div>`;
+    return `<div style="border:1px solid var(--line);border-left:3px solid ${corMotivo(r.motivo)};border-radius:6px;margin-bottom:5px">
+      <div style="display:flex;gap:8px;align-items:center;padding:6px 10px">
+        <span style="flex:1;color:var(--ink);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.base)}</span>
+        <span id="rej-htipo-${i}" class="muted" style="font-size:11px;flex:0 0 auto">${esc(r.tipo)}</span>
+        <span style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;color:${corMotivo(r.motivo)};border:1px solid ${corMotivo(r.motivo)};flex:0 0 auto">${esc(r.motivo)}</span>
+        ${nqiTxt}
+        <button class="ghost" style="padding:2px 9px;font-size:11px;flex:0 0 auto" onclick="nvRejToggle(${i})">⚙ ajustar</button>
+      </div>
+      <div id="rej-drawer-${i}"></div></div>`;
   }).join('');
   return `<div class="panel">
     <h2>🚫 Rejeitados <span class="muted" style="text-transform:none">— cockpit da ingestão · ${lista.length} doc(s)</span></h2>
-    <p class="muted" style="margin:0 0 10px;font-size:11px">Documentos que o motor <b>queria</b> processar mas não viraram dado útil. <b style="color:#d05a5a">nqi baixo</b> = o molde não casou · <b style="color:#d0a537">sem molde</b> = o tipo ainda não tem molde · <b style="color:#8a8aa0">tabela não-CSV</b> = estrutura que o parser não pega. <i>(As ações de ajuste — re-tipar e molde dirigido — entram na próxima etapa.)</i></p>
+    <p class="muted" style="margin:0 0 10px;font-size:11px">Documentos que o motor <b>queria</b> processar mas não viraram dado útil. <b style="color:#d05a5a">nqi baixo</b> = o molde não casou · <b style="color:#d0a537">sem molde</b> = o tipo ainda não tem molde · <b style="color:#8a8aa0">tabela não-CSV</b> = estrutura que o parser não pega. Clique <b>⚙ ajustar</b> pra <b>re-tipar</b> (correção manual — o LLM não sobrescreve) ou dar um <b>molde dirigido</b> (você diz o que extrair, o L1 monta o molde).</p>
     <div style="margin-bottom:10px">${resumo}</div>
     <div style="max-height:56vh;overflow:auto;padding-right:4px">${linhas}</div></div>`;
+}
+// abre/fecha o drawer de ações de UMA base rejeitada. Renderiza lazy (não monta 570 selects de uma vez).
+function nvRejToggle(i){
+  const el=$('#rej-drawer-'+i); if(!el) return;
+  if(el.innerHTML.trim()){ el.innerHTML=''; return; }   // já aberto → fecha
+  const r=((_nv1data&&_nv1data.rej&&_nv1data.rej.rejeitados)||[])[i]; if(!r) return;
+  const tipos=((_nv1data&&_nv1data.dt&&_nv1data.dt.tipos)||[]);
+  const opts=tipos.map(t=>`<option value="${esc(t)}"${t===r.tipo?' selected':''}>${esc(t)}</option>`).join('');
+  el.innerHTML=`<div style="padding:8px 10px 10px;border-top:1px dashed var(--line);display:flex;flex-direction:column;gap:9px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="muted" style="font-size:11px;flex:0 0 auto">re-tipar para:</span>
+      <select id="rej-tipo-${i}" style="flex:0 1 200px;padding:3px 6px;font-size:12px">${opts}</select>
+      <button class="go" style="padding:3px 12px;font-size:12px" onclick="nvReclass(${i})">re-tipar</button>
+      <span class="muted" style="font-size:10px;flex:1 1 auto">correção manual · <b>origem=humano</b> — o classificador não mexe mais nesta base</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px">
+      <span class="muted" style="font-size:11px">molde dirigido — o que extrair de <b>${esc(r.tipo)}</b> (usando esta base como amostra):</span>
+      <textarea id="rej-instr-${i}" rows="2" placeholder="ex.: extrair o valor total, o CNPJ do emissor, a data de emissão e o número do documento" style="width:100%;box-sizing:border-box;font-size:12px;padding:5px 7px;resize:vertical"></textarea>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="go" style="padding:3px 12px;font-size:12px" onclick="nvMolde(${i})">criar molde dirigido</button>
+        <span class="muted" style="font-size:10px">o L1 monta o molde regex e o L0 aplica a todo <b>${esc(r.tipo)}</b> no próximo ciclo · pode levar ~1min</span>
+      </div>
+    </div>
+    <div id="rej-msg-${i}" style="font-size:11px;min-height:14px"></div></div>`;
+}
+async function nvReclass(i){
+  const r=((_nv1data&&_nv1data.rej&&_nv1data.rej.rejeitados)||[])[i]; if(!r) return;
+  const tipo=($('#rej-tipo-'+i)||{}).value||''; const msg=$('#rej-msg-'+i);
+  if(tipo===r.tipo){ if(msg){msg.style.color='var(--warn)';msg.textContent='já é esse tipo — escolha outro.';} return; }
+  if(msg){msg.style.color='var(--dim)';msg.textContent='re-tipando…';}
+  try{ const res=await jpost('/api/nidhogg/reclass',{collection:r.collection,base:r.base,tipo});
+    if(res&&res.online===false){ if(msg){msg.style.color='var(--warn)';msg.textContent='o módulo não respondeu — tente de novo.';} return; }
+    if(res&&res.error){ if(msg){msg.style.color='var(--warn)';msg.textContent='falhou: '+res.error;} return; }
+    // sincroniza o cache e a tela: o molde dirigido logo abaixo precisa apontar pro tipo NOVO
+    r.tipo=res.tipo; r.natureza=res.natureza; r.csv=res.csv;
+    const h=$('#rej-htipo-'+i); if(h) h.textContent=res.tipo;
+    const el=$('#rej-drawer-'+i); if(el){ el.innerHTML=''; nvRejToggle(i); }   // redesenha com o tipo novo
+    const m2=$('#rej-msg-'+i);
+    if(m2){m2.style.color=res.extraivel?'var(--ok)':'var(--warn)';
+      m2.textContent=`✓ re-tipado → ${res.tipo} (natureza ${res.natureza}${res.csv?' · csv':''}) — ${res.nota||'re-extrai no próximo ciclo'}.`;}
+  }catch(e){ if(msg){msg.style.color='var(--warn)';msg.textContent='falhou: '+e.message;} }
+}
+async function nvMolde(i){
+  const r=((_nv1data&&_nv1data.rej&&_nv1data.rej.rejeitados)||[])[i]; if(!r) return;
+  const instrucao=(($('#rej-instr-'+i)||{}).value||'').trim(); const msg=$('#rej-msg-'+i);
+  if(!instrucao){ if(msg){msg.style.color='var(--warn)';msg.textContent='escreva o que extrair primeiro.';} return; }
+  if(msg){msg.style.color='var(--dim)';msg.textContent='⏳ criando molde (o L1 lê a amostra e monta o regex — ~1min)…';}
+  try{ const res=await jpost('/api/nidhogg/molde',{tipo:r.tipo,instrucao,collection:r.collection,base:r.base});
+    if(res&&res.online===false){ if(msg){msg.style.color='var(--warn)';msg.textContent='o módulo não respondeu a tempo — tente de novo.';} return; }
+    if(res&&res.error){ if(msg){msg.style.color='var(--warn)';msg.textContent='falhou: '+res.error;} return; }
+    const cob=(res.cobertura!=null?res.cobertura:0);
+    if(msg){msg.style.color=cob>=0.5?'var(--ok)':'var(--warn)';
+      msg.textContent=`✓ molde de ${res.tipo} criado · ${res.campos} campo(s) · cobertura da amostra ${nvNqiPct(cob)}%${cob<0.5?' — baixa: ajuste a instrução e refaça':''}. Extrai no próximo ciclo.`;}
+  }catch(e){ if(msg){msg.style.color='var(--warn)';msg.textContent='falhou: '+e.message;} }
 }
 // [Fase 3] registry de moldes por tipo: schema, cobertura, e as regras regex ancoradas no rótulo.
 function renderTemplates(tpl, porTipo){

@@ -1415,16 +1415,19 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
 /// Proxy HTTP do console (ValHalla) pra um MÓDULO externo (nidhoggd na 11497, etc.) via wget.
 /// O ragd não depende do código do módulo — só conhece a URL. Se o módulo não responder, devolve
 /// {"online":false} com 200 pra UI degradar graciosa (keepalive embutido). Online → injeta online:true.
-fn module_proxy(url: &str, post_body: Option<&str>) -> (u16, String) {
+fn module_proxy(url: &str, post_body: Option<&str>, timeout_secs: u32) -> (u16, String) {
     // portátil: tenta curl (mac/linux), cai pra wget. Ambos por subprocess (sem dep nova).
+    // timeout POR CHAMADA: os polls agregadores ficam em 5s (keepalive rápido), mas ações que acionam
+    // o LLM no módulo (ex.: molde dirigido) precisam de janela longa — senão o proxy corta antes da hora.
+    let to = timeout_secs.to_string();
     let run = |tool: &str| -> Option<String> {
         let mut cmd = std::process::Command::new(tool);
         if tool == "curl" {
-            cmd.args(["-s", "-m", "5"]);
+            cmd.args(["-s", "-m", &to]);
             if let Some(b) = post_body { cmd.args(["-H", "Content-Type: application/json", "-d", b]); }
             cmd.arg(url);
         } else {
-            cmd.args(["-q", "-O", "-", "--tries=1", "--timeout=5"]);
+            cmd.args(["-q", "-O", "-", "--tries=1", &format!("--timeout={to}")]);
             if let Some(b) = post_body { cmd.arg("--header=Content-Type: application/json").arg(format!("--post-data={b}")); }
             cmd.arg(url);
         }
@@ -1668,7 +1671,21 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     if path.starts_with("/api/nidhogg") {
         let url = { state.read().nidhogg_url.clone() };
         let q = if query.is_empty() { String::new() } else { format!("?{query}") };
-        let (code, payload) = module_proxy(&format!("{url}{path}{q}"), if method == Method::Post { Some(&body_str) } else { None });
+        let target = format!("{url}{path}{q}");
+        let post = if method == Method::Post { Some(body_str.clone()) } else { None };
+        // /molde aciona o LLM do módulo (cria o molde regex de uma amostra) — pode levar ~1min. Roda
+        // numa THREAD própria pra NÃO travar o loop single-thread do console durante a criação (mesma
+        // razão do /run async no nidhoggd). Os demais são leituras/gravações rápidas e ficam inline.
+        if path == "/api/nidhogg/molde" {
+            let (ip2, method2, path2, body2) = (ip.clone(), method.clone(), path.clone(), body.clone());
+            thread::spawn(move || {
+                let (code, payload) = module_proxy(&target, post.as_deref(), 200);
+                log_line("valhalla", &ip2, &method2, &path2, "", code, t0.elapsed().as_secs_f64() * 1000.0, &req_extra(&path2, &body2, &payload));
+                respond_json(req, code, payload, None);
+            });
+            return;
+        }
+        let (code, payload) = module_proxy(&target, post.as_deref(), 5);
         log_line("valhalla", &ip, &method, &path, &query, code, t0.elapsed().as_secs_f64() * 1000.0, &req_extra(&path, &body, &payload));
         respond_json(req, code, payload, None);
         return;

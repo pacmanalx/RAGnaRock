@@ -27,6 +27,7 @@ pub struct ClassRow {
     pub natureza: String,
     pub tipo: String,
     pub csv: bool,        // determinístico (tabular_spec): é um CSV regular → gate da Fase 2
+    pub origem: String,   // "llm" (classificou) | "humano" (re-tipado no cockpit — o LLM NÃO sobrescreve)
     pub confianca: f64,
     pub classified_at: String,
     pub version: u64,
@@ -120,11 +121,11 @@ pub fn ensure_schema(url: &str) -> Result<(), String> {
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doc_class (collection String, name String, \
          state_hash String, cfg_hash String, natureza String, tipo String, csv UInt8 DEFAULT 0, \
-         confianca Float64, classified_at String, version UInt64) ENGINE=ReplacingMergeTree(version) \
-         ORDER BY (collection, name)", 15)?;
-    // migração idempotente: doc_class antigo não tinha `csv` (o gate determinístico da Fase 2)
-    ch_exec(url,
-        "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS csv UInt8 DEFAULT 0", 15)?;
+         origem String DEFAULT 'llm', confianca Float64, classified_at String, version UInt64) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY (collection, name)", 15)?;
+    // migrações idempotentes: colunas que doc_class antigo não tinha
+    ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS csv UInt8 DEFAULT 0", 15)?;
+    ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS origem String DEFAULT 'llm'", 15)?;
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doctype (version UInt64, naturezas String, tipos String) \
          ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
@@ -170,7 +171,7 @@ pub fn write_doctypes(url: &str, naturezas: &[String], tipos: &[String]) -> Resu
 /// Resultado vazio (FINAL sem match) = precisa — mapeado INTENCIONALMENTE, não por acidente.
 pub fn needs_class(url: &str, collection: &str, name: &str, state_hash: &str, cfg_hash: &str) -> Result<bool, String> {
     let body = ch_query_param(url,
-        "SELECT state_hash, cfg_hash FROM nidhogg.doc_class FINAL \
+        "SELECT state_hash, cfg_hash, origem FROM nidhogg.doc_class FINAL \
          WHERE collection={coll:String} AND name={name:String} LIMIT 1 FORMAT TabSeparated",
         &[("coll", collection), ("name", name)], 10)?;
     let line = body.lines().next().unwrap_or("");
@@ -178,7 +179,21 @@ pub fn needs_class(url: &str, collection: &str, name: &str, state_hash: &str, cf
     let mut it = line.split('\t');
     let sh = it.next().unwrap_or("");
     let ch = it.next().unwrap_or("");
+    let origem = it.next().unwrap_or("");
+    if origem == "humano" { return Ok(false); }   // re-tipagem manual: o LLM NÃO sobrescreve
     Ok(sh != state_hash || ch != cfg_hash)
+}
+
+/// Lê (state_hash, cfg_hash) da classe atual de uma base — pra re-tipagem manual preservar os hashes
+/// (não fingimos conteúdo). Sem linha ⇒ ("", "").
+pub fn get_class_hashes(url: &str, collection: &str, name: &str) -> Result<(String, String), String> {
+    let body = ch_query_param(url,
+        "SELECT state_hash, cfg_hash FROM nidhogg.doc_class FINAL \
+         WHERE collection={coll:String} AND name={name:String} LIMIT 1 FORMAT TabSeparated",
+        &[("coll", collection), ("name", name)], 10)?;
+    let line = body.lines().next().unwrap_or("");
+    let mut it = line.split('\t');
+    Ok((it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string()))
 }
 
 /// Grava um LOTE de classes (um único INSERT). Reclassificar é INSERT com version maior.
@@ -189,7 +204,7 @@ pub fn insert_classes(url: &str, rows: &[ClassRow]) -> Result<(), String> {
         let line = json!({
             "collection": r.collection, "name": r.name, "state_hash": r.state_hash,
             "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo,
-            "csv": if r.csv { 1 } else { 0 },
+            "csv": if r.csv { 1 } else { 0 }, "origem": r.origem,
             "confianca": r.confianca, "classified_at": r.classified_at, "version": r.version,
         });
         ndjson.push_str(&line.to_string());
@@ -227,7 +242,7 @@ pub fn classes_summary(url: &str, collection: Option<&str>) -> Result<Value, Str
     let total: i64 = total_body.trim().parse().unwrap_or(0);
 
     let bases_sql = format!(
-        "SELECT collection, name, natureza, tipo, csv, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
+        "SELECT collection, name, natureza, tipo, csv, origem, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
          ORDER BY collection, name FORMAT JSON");
     let bases_body = ch_query_param(url, &bases_sql, &params, 20)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json bases: {e}"))?;
