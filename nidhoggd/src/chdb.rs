@@ -324,6 +324,34 @@ pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
     ch_insert(url, "nidhogg.entidade", &ndjson, 45)
 }
 
+/// Apaga TODAS as entidades de uma base (mutation SÍNCRONA — mutations_sync=1). Usado pelo re-tipar
+/// manual quando a base fica NÃO-extraível (narrativo/código, ou documento sem molde): o dump não pode
+/// guardar extração velha de um tipo que a base não tem mais. ALTER DELETE é raro (só no cockpit) e o
+/// volume por base é pequeno → custo aceitável. Params por binding (sem injeção via nome de base).
+pub fn delete_entities(url: &str, collection: &str, base: &str) -> Result<u64, String> {
+    // conta antes (pra reportar quantas saíram) — a mutation em si não devolve contagem
+    let cnt_body = ch_query_param(url,
+        "SELECT count() FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} FORMAT TabSeparated",
+        &[("coll", collection), ("base", base)], 10)?;
+    let n: u64 = cnt_body.trim().parse().unwrap_or(0);
+    if n == 0 { return Ok(0); }   // nada a apagar
+    // mutation via POST (GET é readonly no ClickHouse); mutations_sync=1 espera concluir
+    let full = format!("{url}?mutations_sync=1&param_coll={}&param_base={}",
+                       urlencode(collection), urlencode(base));
+    let sql = "ALTER TABLE nidhogg.entidade DELETE WHERE collection={coll:String} AND base={base:String}";
+    let out = Command::new("curl")
+        .args(["-s", "-m", "30", &full, "--data-binary", sql])
+        .output()
+        .map_err(|e| format!("curl falhou: {e}"))?;
+    if !out.status.success() { return Err(format!("curl status {:?}", out.status.code())); }
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    if body.contains("DB::Exception") || body.starts_with("Code:") {
+        return Err(body.chars().take(200).collect());
+    }
+    Ok(n)
+}
+
 /// Distribuição/amostra das entidades — SEMPRE pela view `entidade_atual` (uma fonte de verdade).
 pub fn entities_summary(url: &str, collection: Option<&str>, base: Option<&str>) -> Result<Value, String> {
     let mut clauses: Vec<&str> = vec![];

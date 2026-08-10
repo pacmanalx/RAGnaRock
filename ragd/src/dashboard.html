@@ -1213,8 +1213,9 @@ async function nvReclass(i){
     const h=$('#rej-htipo-'+i); if(h) h.textContent=res.tipo;
     const el=$('#rej-drawer-'+i); if(el){ el.innerHTML=''; nvRejToggle(i); }   // redesenha com o tipo novo
     const m2=$('#rej-msg-'+i);
+    const purg = res.purgadas ? ` · ${res.purgadas} registro(s) órfão(s) purgado(s)` : '';
     if(m2){m2.style.color=res.extraivel?'var(--ok)':'var(--warn)';
-      m2.textContent=`✓ re-tipado → ${res.tipo} (natureza ${res.natureza}${res.csv?' · csv':''}) — ${res.nota||'re-extrai no próximo ciclo'}.`;}
+      m2.textContent=`✓ re-tipado → ${res.tipo} (natureza ${res.natureza}${res.csv?' · csv':''}) — ${res.nota||'re-extrai no próximo ciclo'}${purg}.`;}
   }catch(e){ if(msg){msg.style.color='var(--warn)';msg.textContent='falhou: '+e.message;} }
 }
 async function nvMolde(i){

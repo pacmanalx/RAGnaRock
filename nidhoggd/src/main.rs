@@ -467,8 +467,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| t.get(tipo.as_str()).is_some()).unwrap_or(false);
             let extraivel = csv || tem_molde;
             let nota = if extraivel { "re-extrai no próximo ciclo" }
-                       else if natureza == "documento" { "sem molde ainda — dê um molde dirigido pra extrair" }
-                       else { "natureza não gera registro — extração anterior (se houve) permanece até haver molde" };
+                       else if natureza == "documento" { "sem molde — extração antiga purgada; dê um molde dirigido pra re-extrair" }
+                       else { "natureza não gera registro — extração antiga purgada do dump" };
             let (sh, ch) = chdb::get_class_hashes(&ch_url, &coll, &base).unwrap_or_default();
             let row = chdb::ClassRow {
                 collection: coll.clone(), name: base.clone(), state_hash: sh, cfg_hash: ch,
@@ -476,8 +476,18 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 confianca: 1.0, classified_at: now_stamp(), version: chdb::now_version(),
             };
             match chdb::insert_classes(&ch_url, &[row]) {
-                Ok(_) => { nlog(&format!("re-tipado (humano): {coll}/{base} → tipo={tipo} natureza={natureza} csv={csv} — LLM não sobrescreve; {nota}"));
-                           (200, json!({"ok":true,"collection":coll,"base":base,"tipo":tipo,"natureza":natureza,"csv":csv,"extraivel":extraivel,"nota":nota}).to_string()) }
+                Ok(_) => {
+                    // base NÃO-extraível (narrativo/código, ou documento sem molde): a extração velha (do
+                    // tipo antigo) vira lixo no dump → PURGA. Extraível: a re-extração do próximo ciclo
+                    // supersede pela version (a view entidade_atual já mostra só a mais recente).
+                    let purgadas = if !extraivel {
+                        chdb::delete_entities(&ch_url, &coll, &base).unwrap_or_else(|e| {
+                            nlog(&format!("re-tipado {coll}/{base}: purge de entidades falhou ({e})")); 0 })
+                    } else { 0 };
+                    let suf = if purgadas > 0 { format!(" ({purgadas} entidade(s) purgada(s))") } else { String::new() };
+                    nlog(&format!("re-tipado (humano): {coll}/{base} → tipo={tipo} natureza={natureza} csv={csv} — LLM não sobrescreve; {nota}{suf}"));
+                    (200, json!({"ok":true,"collection":coll,"base":base,"tipo":tipo,"natureza":natureza,"csv":csv,"extraivel":extraivel,"nota":nota,"purgadas":purgadas}).to_string())
+                }
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
