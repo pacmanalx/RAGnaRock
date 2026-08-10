@@ -649,8 +649,9 @@ const CLASSIFY_TIMEOUT_S: u32 = 40;       // curto e FIXO (é ~40 tokens; nada d
 const CLASSIFY_MAX_FAILS: usize = 2;      // 2 falhas de LLM consecutivas abortam o lote do ciclo
 const CLASSIFY_PER_CYCLE: usize = 40;     // batch por ciclo — classificação é leve (~3s/base), bem além do Summary (4)
 // ── Fase 2: extração de entidades (o dump denso no ClickHouse) ──
-const EXTRACT_PER_CYCLE: usize = 5;          // extração é PESADA (várias janelas/base) — poucos por ciclo
-const EXTRACT_LINES_PER_WINDOW: usize = 60;  // janela por Nº de LINHAS — dimensiona a SAÍDA, não a entrada
+const EXTRACT_PER_CYCLE: usize = 5;               // extração é PESADA (várias janelas/base) — poucos por ciclo
+const EXTRACT_INPUT_CHARS_PER_WINDOW: usize = 1500; // janela por ORÇAMENTO DE CHARS (adaptativo): bases
+                                                    // densas pegam menos linhas → não satura o teto de saída
 const EXTRACT_MAX_TOKENS: u64 = 1500;
 /// Prompt do extrator (editável no ValHalla como o classificador). `{tipo}` é substituído pela classe.
 const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os REGISTROS como um array JSON — um objeto por linha/registro, com os campos relevantes (nomes de campo claros e minúsculos). Responda APENAS com o array JSON, nada além dele.";
@@ -860,6 +861,25 @@ fn tabular_rows(text: &str) -> Option<usize> {
         if consistent * 100 >= lines.len() * 80 { return Some(lines.len() - 1); }
     }
     None
+}
+/// Janelas de extração por ORÇAMENTO DE CARACTERES (adaptativo): bases densas pegam menos linhas
+/// por janela, estreitas pegam mais — dimensiona a SAÍDA do LLM pra não estourar o teto de tokens
+/// (a causa da sub-extração medida em bases com muitos registros). Ignora linhas vazias (mesma
+/// população que `tabular_rows` conta). Uma linha maior que o orçamento vira a própria janela.
+fn extract_windows(text: &str, budget: usize) -> Vec<String> {
+    let mut wins: Vec<String> = vec![];
+    let mut cur: Vec<&str> = vec![];
+    let mut chars = 0usize;
+    for ln in text.lines().filter(|l| !l.trim().is_empty()) {
+        if !cur.is_empty() && chars + ln.len() + 1 > budget {
+            wins.push(cur.join("\n"));
+            cur.clear(); chars = 0;
+        }
+        cur.push(ln);
+        chars += ln.len() + 1;
+    }
+    if !cur.is_empty() { wins.push(cur.join("\n")); }
+    wins
 }
 /// Texto INTEIRO de uma base via /chunk (id 0 + after gigante = todos os chunks). Truncar a
 /// fonte é furo de completude — o normalizador lê tudo e janela depois, se precisar.
@@ -1442,7 +1462,10 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
         return json!({"ok": false, "collection": coll, "error": format!("schema: {e}")});
     }
     let (sys, _from) = extract_system(lib);
-    let ext_cfg_hash = hash_hex(&format!("extrator|{}", sys));
+    // o hash da config de extração inclui a JANELA e o TETO — mudá-los reprocessa as bases
+    // (senão o deploy vira no-op: as bases batem o hash antigo e o ciclo pula todas).
+    let ext_cfg_hash = hash_hex(&format!("extrator|{sys}|win{}|tok{}",
+        EXTRACT_INPUT_CHARS_PER_WINDOW, EXTRACT_MAX_TOKENS));
 
     // classes TABULARES da coleção (name -> tipo) — só elas têm registros pra extrair
     let tab_tipos: std::collections::HashMap<String, String> = chdb::classes_summary(ch_url, Some(coll)).ok()
@@ -1475,13 +1498,11 @@ fn mine_entities(api: &str, llm_url: &str, store: &str, ch_url: &str, lib: &Valu
         let tipo = tab_tipos.get(name).cloned().unwrap_or_else(|| "registro".into());
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
         let rows_src = tabular_rows(&text);
-        let lines: Vec<&str> = text.lines().collect();
         let version = chdb::now_version();
         let mut ents: Vec<chdb::EntidadeRow> = vec![];
         let mut idx: u32 = 0;
         let mut ok = true;
-        for chunk in lines.chunks(EXTRACT_LINES_PER_WINDOW) {
-            let wtext = chunk.join("\n");
+        for wtext in extract_windows(&text, EXTRACT_INPUT_CHARS_PER_WINDOW) {
             match llm_extract_records(llm_url, &sys, &tipo, &wtext) {
                 Ok(recs) => {
                     for rec in recs {
