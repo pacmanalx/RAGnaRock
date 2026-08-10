@@ -1622,7 +1622,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         .and_then(|v| v["collections"].as_array().map(|a| a.iter()
             .filter_map(|c| c["collection"].as_str().map(String::from)).collect()))
         .unwrap_or_default();
-    let (mut mined, mut skipped, mut failed, mut summarized) = (vec![], vec![], vec![], vec![]);
+    let (mut mined, mut skipped, mut failed) = (vec![], vec![], vec![]);
     let mut classified: Vec<String> = vec![];
     let mut extracted_ents: Vec<String> = vec![];
     let mut det_total = 0u64;   // bases extraídas DETERMINISTICAMENTE (CSV, zero LLM) no ciclo
@@ -1632,28 +1632,23 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         match mine_level0(&api, coll) {
             Some((src, pillars, n_bases, total_chunks)) => {
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
-                // nível 1 INCREMENTAL: processa UM batch da fila de não-processadas por ciclo,
-                // acumulando. Some = progrediu (mais bases/entidades); None = convergiu (nada a
-                // fazer) OU o LLM falhou. mine_summary lê/atualiza o acumulado em k["summary"],
-                // reseta se o prompt mudou, e converge em N ciclos até cobrir TODAS as bases.
-                let mut summ_updated = false;
                 if level >= 1 {
-                    // Fase 1: classifica {natureza,tipo} das bases novas/mudadas no banco auxiliar.
-                    // ADITIVO ao Summary — roda ANTES, pra o registry futuro poder chavear por classe.
+                    // Fase 1: classifica {natureza,tipo} das bases novas/mudadas (doc_class no ClickHouse).
                     let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
                     }
-                    // Fase 2: extrai os registros das bases tabulares (ClickHouse); só natureza=tabular.
+                    // Fase 2/4: extrai os registros das bases tabulares (só csv=1, determinístico).
                     let ex = mine_entities(&api, &llm_url, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     det_total += ex["deterministicas"].as_u64().unwrap_or(0);
-                    if let Some(s) = mine_summary(&api, &llm_url, &lib, level, coll, &src, &k["summary"], force) {
-                        k["summary"] = s; summ_updated = true;
-                    }
+                    // Summary d00a009 APOSENTADO (10/ago): o normalizador aberto (1 LLM pesado/base, extração
+                    // às cegas + agregação) foi substituído pela Fase 1 (classifica) + Fase 2/4 (extrai
+                    // determinístico). mine_summary/normalize_base ficam no código, reservados pra Fase 5
+                    // (validador de amostra dos verdes, doc §5) — não rodam mais no ciclo.
                 }
-                // grava se o nível 0 mudou/forçado OU o Summary progrediu (senão nada a persistir).
-                if force || !l0_same || summ_updated {
+                // grava se o nível 0 mudou/forçado (o Summary não gera mais escrita).
+                if force || !l0_same {
                     // o ciclo pode demorar minutos: reler o `enabled` do disco antes de gravar —
                     // um POST /collection {enabled:false} no meio do ciclo não pode ser perdido
                     let cur = read_knowledge(&dir, coll);
@@ -1667,9 +1662,8 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                         "at": now_stamp(), "via": "level0/no-ai",
                         "inputs": {"bases": n_bases, "total_chunks": total_chunks, "source_hash": src},
                     });
-                    write_knowledge(&dir, coll, &k);   // nível 0 + Summary numa escrita atômica
+                    write_knowledge(&dir, coll, &k);   // nível 0 (léxico) numa escrita atômica
                     if !l0_same || force { mined.push(coll.clone()); }
-                    if summ_updated { summarized.push(coll.clone()); }
                 } else {
                     skipped.push(coll.clone());
                 }
@@ -1684,13 +1678,13 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         None => u64::MAX,   // sentinela: ragd não respondeu /expansions
     };
     if let Ok(mut s) = state.lock() {
-        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · resumiu {} · classificou {} · extraiu {}{}{}",
-            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), summarized.len(), classified.len(), extracted_ents.len(),
+        s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · classificou {} · extraiu {}{}{}",
+            now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), classified.len(), extracted_ents.len(),
             if det_total > 0 { format!(" · det {det_total}") } else { String::new() },
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
-           "mined": mined, "skipped": skipped, "failed": failed, "summarized": summarized,
+           "mined": mined, "skipped": skipped, "failed": failed,
            "classified": classified, "extracted": extracted_ents,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
@@ -1717,10 +1711,10 @@ fn worker(state: Arc<Mutex<State>>) {
         } else if try_start_cycle(&state) {
             let r = run_cycle(&state, false);   // cadência NÃO força: respeita o source_hash
             end_cycle(&state);
-            // PROGRESSO = alguma coleção avançou a fila (base classificada/extraída/minada/resumida).
+            // PROGRESSO = alguma coleção avançou a fila (base minada/classificada/extraída).
             // Só `skipped`/`failed` = nada avançou → idle. `failed` NÃO conta como progresso pra não
             // emendar em loop quente quando o LLM está caindo (aí o back-off da cadência protege).
-            let worked = ["mined", "classified", "extracted", "summarized"].iter()
+            let worked = ["mined", "classified", "extracted"].iter()
                 .any(|k| r[k].as_array().map(|a| !a.is_empty()).unwrap_or(false));
             nlog(&format!("ciclo — minou={} pulou={} falhou={} classificou={} extraiu={} → {}",
                 r["mined"].as_array().map(|a| a.len()).unwrap_or(0),
