@@ -991,10 +991,10 @@ async function loadNidViz(){
   $('#nv-tabs').style.display=isL0?'flex':'none';
   $('#nv-pick').style.display=isL0?'':'none';
   if(!isL0){
-    // Nível 1 (consciente) JÁ IMPLEMENTADO (#22): renderiza o Summary destilado por coleção.
+    // Nível 1 (consciente): abas de Classificação, Entidades, Templates, Rejeitados, Prompts.
     if(_nvLevel===1){
       try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){_nvprompts=null;}
-      await renderNidViz2();   // classes + vocabulário (doctypes) + prompts + summaries
+      await renderNidViz2();   // classes + vocabulário (doctypes) + entidades + templates + rejeitados + prompts
       return;
     }
     // Níveis 2/3: ainda esqueleto — placeholder que puxa a implementação.
@@ -1056,44 +1056,6 @@ function vizCache(){
       ${rows}</table></div>
     <p class="muted" style="font-size:11px;margin-top:8px">${esc(c.note||'')}</p></div>`;
 }
-// [#22] Summary do nível 1 — cards por coleção com abstract/themes/entities/key_points.
-function nvChip(x){return `<span class="pill" style="display:inline-block;margin:2px 4px 2px 0">${esc(x)}</span>`;}
-// Render GENÉRICO do content: o template define as próprias chaves, então não assumimos schema.
-// string→parágrafo · array de escalares→chips · array de objetos/objeto→JSON · (raw é especial).
-function renderContentGeneric(c){
-  const lbl=k=>`<b style="font-size:12px;color:#7d8590;text-transform:capitalize">${esc(String(k).replace(/_/g,' '))}</b>`;
-  return Object.entries(c||{}).map(([k,v])=>{
-    if(k==='raw') return `<pre style="white-space:pre-wrap;margin:0;font-size:12px;color:#c9d1d9">${esc(String(v))}</pre>`;
-    if(typeof v==='string') return `<div>${lbl(k)}<p style="margin:2px 0 0;line-height:1.5">${esc(v)}</p></div>`;
-    if(Array.isArray(v)){
-      if(v.every(x=>x===null||typeof x!=='object')) return `<div>${lbl(k)}<div style="margin-top:3px">${v.map(x=>nvChip(String(x))).join('')}</div></div>`;
-      return `<div>${lbl(k)}<pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11px;color:#c9d1d9">${esc(JSON.stringify(v,null,2))}</pre></div>`;
-    }
-    if(typeof v==='object'&&v!==null) return `<div>${lbl(k)}<pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11px;color:#c9d1d9">${esc(JSON.stringify(v,null,2))}</pre></div>`;
-    return `<div>${lbl(k)} ${esc(String(v))}</div>`;
-  }).join('');
-}
-function renderSummaries(s, withPrompts=true){
-  const arr=(s&&s.summaries)||[];
-  const cards=!arr.length ? `<p class="muted">Nenhum Summary destilado ainda — habilite uma coleção e force um ciclo (ou aguarde a cadência). Consome IA (o LLM da frota).</p>`
-    : arr.map(it=>{
-      const su=it.summary||{}, c=su.content||{}, p=su.provenance||{};
-      const prog = (p.total_bases!=null) ? (()=>{
-        const st = su.completude_provada ? ['✓ completude provada','var(--ok)']
-                 : su.cobertura_completa ? ['◐ coberta — prova pendente','var(--warn)']
-                 : ['⏳ varrendo','var(--warn)'];
-        const inc = (p.incompletas&&p.incompletas.length) ? ` · ${p.incompletas.length} incompleta(s)` : '';
-        return `<span title="provada = cada base com prova de completude (contagem tabular ou passada-sem-novidade); coberta = todas vistas ao menos 1×" style="color:${st[1]};font-weight:bold">${st[0]} ${p.processadas||0}/${p.total_bases}${inc}</span>`;
-      })() : '';
-      const head=`<div><b style="font-size:15px;color:#e6edf3">${esc(it.collection)}</b> <span class="muted" style="font-size:11px">· template <b>${esc(p.template||'padrão')}</b> (${esc(p.resolved_from||'?')}) · ${esc(su.updated||'')}</span>${prog?' · '+prog:''}</div>`;
-      const trunc = su.truncated ? `<div style="border:1px solid var(--warn);border-radius:6px;padding:7px 11px;color:var(--warn);font-size:12px;background:rgba(210,153,34,.09)">⚠ Resultado <b>CORTADO</b> no teto de ${(p.max_tokens||'?')} tokens (finish_reason=length). Aumente o <b>max tokens</b> deste template no painel ⚙ Prompts, ou peça algo mais conciso.</div>` : '';
-      return `<div class="dcard" style="flex-direction:column;align-items:stretch;gap:8px;cursor:default">${head}${trunc}${renderContentGeneric(c)}</div>`;
-    }).join('');
-  return `<h2 style="color:var(--accent,#58a6ff);margin:0 0 4px">🧠 Summary destilado por coleção</h2>
-    <p class="muted" style="margin:0 0 10px;font-size:11px">Resumo por IA que sobrevive à deleção da coleção. Conteúdo do corpus vai pro LLM da frota (local) — não sai da rede. As chaves saem do <b>template</b> aplicado.</p>
-    ${withPrompts ? renderPromptsPanel() : ''}
-    ${cards}`;
-}
 // [ciclo async] dispara /run (retorna na hora) e faz poll de cycle_running até terminar, então
 // recarrega a view. O servidor não trava — o botão não congela a tela.
 async function nvRegenNow(){
@@ -1111,13 +1073,12 @@ async function nvPollCycle(){
     running = !!(d&&d.cycle_running);
     const msg=$('#nv-regen-msg'); if(msg) msg.textContent = running ? '⏳ regenerando… (IA da frota, ~1min/coleção)' : '✓ pronto';
   }
-  loadNidViz();   // recarrega Summaries + prompts com o resultado fresco
+  loadNidViz();   // recarrega a view do nível 1 com o resultado fresco
 }
-// [prompts] painel de biblioteca de prompts — CRUD de templates + atribuição por nível/coleção.
+// [prompts] painel de biblioteca de prompts — editor (CRUD) dos templates lidos por nome.
 function renderPromptsPanel(){
-  const L=_nvprompts||{templates:{},level_default:{},collections:{}};
+  const L=_nvprompts||{templates:{}};
   const T=L.templates||{}, tnames=Object.keys(T), ed=_nvpEdit, cur=(ed&&T[ed])||{};
-  const colls=(_nidk||[]).map(c=>c.collection);
   // MASTER — lista de templates, linha inteira clicável, ativa destacada pela barra lateral.
   const list=tnames.map(n=>`<div onclick="nvpEditT('${esc(n)}')" title="editar" style="padding:8px 11px;border:1px solid var(--line);border-left:3px solid ${n===ed?'var(--acc)':'var(--line)'};border-radius:6px;margin-bottom:6px;cursor:pointer;background:${n===ed?'var(--panel2)':'transparent'}">
       <div style="color:var(--ink);font-weight:bold">${esc(n)}</div>
@@ -1137,17 +1098,8 @@ function renderPromptsPanel(){
           <button class="ghost" onclick="_nvpEdit=null;paintNv1()">cancelar</button>
           <span id="nvp-msg" style="color:var(--dim);font-size:11px"></span></div>
       </div>`;
-  // ATRIBUIÇÕES — grid alinhado rótulo|select.
-  const row=(label,sel,onch,none)=>`<div style="color:var(--dim);align-self:center">${esc(label)}</div>
-      <select onchange="${onch}" style="width:100%">${none?'<option value="">(usa default do nível)</option>':''}${tnames.map(n=>`<option value="${esc(n)}" ${sel===n?'selected':''}>${esc(n)}</option>`).join('')}</select>`;
-  const assign=`<div style="margin-top:14px;max-width:540px">
-      <div style="color:var(--dim);font-size:12px;border-bottom:1px solid var(--line);padding-bottom:5px;margin-bottom:8px">APLICAR TEMPLATE POR</div>
-      <div style="display:grid;grid-template-columns:150px 1fr;gap:7px 12px;align-items:center">
-        ${row('nível 1 (default)', (L.level_default||{})['1'], "nvpAssign('level',1,this.value)", false)}
-        ${colls.map(cn=>row('coleção '+cn, (L.collections||{})[cn], `nvpAssign('collection','${esc(cn)}',this.value)`, true)).join('')}
-      </div></div>`;
   return `<details class="prompts-panel" open style="border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:0 0 18px;background:var(--panel)">
-    <summary style="cursor:pointer;color:var(--acc);font-weight:bold;letter-spacing:.3px">⚙ Prompts — direcione o que cada nível · coleção extrai · ${tnames.length} template${tnames.length!==1?'s':''}</summary>
+    <summary style="cursor:pointer;color:var(--acc);font-weight:bold;letter-spacing:.3px">⚙ Prompts — edite o system de cada template (classificador · extrator · moldes) · ${tnames.length} template${tnames.length!==1?'s':''}</summary>
     <div style="display:flex;gap:18px;margin-top:14px;flex-wrap:wrap">
       <div style="flex:1 1 230px;min-width:210px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span style="color:var(--dim);font-size:12px">TEMPLATES</span><button class="ghost" style="padding:5px 13px" onclick="nvpNew()">+ novo</button></div>
@@ -1155,8 +1107,7 @@ function renderPromptsPanel(){
       </div>
       <div style="flex:2 1 330px;min-width:300px">${detail}</div>
     </div>
-    ${assign}
-    <p style="color:var(--dim);font-size:11px;margin:14px 0 0;line-height:1.4">Editar ou reatribuir invalida o Summary da coleção afetada — regenera no próximo ciclo (IA da frota, local). Teto do system: 6000 caracteres.</p>
+    <p style="color:var(--dim);font-size:11px;margin:14px 0 0;line-height:1.4">Editar um template invalida os checkpoints da fase afetada — reprocessa no próximo ciclo (LLM da frota, local). Teto do system: 6000 caracteres.</p>
   </details>`;
 }
 function nvpNew(){ _nvpEdit=''; paintNv1(); }
@@ -1167,11 +1118,6 @@ async function nvpSaveT(){
   const body={name,description,system}; const mt=($('#nvp-mt').value||'').trim(); if(mt) body.max_tokens=+mt;
   try{ await jpost('/api/nidhogg/prompts/template',body); }catch(e){ $('#nvp-msg').textContent='erro: '+e.message; return; }
   _nvpEdit=null; try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} paintNv1();
-}
-async function nvpAssign(scope,key,template){
-  if(scope==='collection'&&!template) return;   // '' = manter default (sem endpoint de unassign por ora)
-  try{ await jpost('/api/nidhogg/prompts/assign', scope==='level'?{level:key,template}:{collection:key,template}); }catch(e){ return; }
-  try{_nvprompts=await jget('/api/nidhogg/prompts')}catch(e){} paintNv1();
 }
 let _nv1Tab='classes', _nv1data=null;
 async function renderNidViz2(){
