@@ -1204,29 +1204,34 @@ function setNv1Tab(k){ _nv1Tab=k; paintNv1(); }
 // [Fase 2] card das entidades extraídas (o dump denso do ClickHouse). Lista base→registros à
 // esquerda; clicar mostra os registros JSON daquela base à direita.
 let _nvEntSel=null;
+function nvNqiCor(v){ return v>=0.9?'#3cb45a': v>=0.5?'#d0a537':'#d05a5a'; }
+function nvNqiPct(v){ return Math.round((v||0)*100); }
+function nvEntBadge(modo){
+  if(modo==='det') return `<span title="parser CSV determinístico (cabeçalho=schema)" style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(60,180,90,.18);color:#3cb45a;border:1px solid rgba(60,180,90,.4);flex:0 0 auto">⚙ det</span>`;
+  if(modo==='template') return `<span title="molde regex (Fase 3): 1 doc = 1 registro, zero LLM" style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(150,110,230,.18);color:#9a7ce6;border:1px solid rgba(150,110,230,.4);flex:0 0 auto">⚙ tpl</span>`;
+  return `<span title="extração por LLM (janela guiada)" style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(90,140,230,.15);color:#5a8ce6;border:1px solid rgba(90,140,230,.4);flex:0 0 auto">◐ LLM</span>`;
+}
 function renderEntities(ent){
   if(!ent||ent.error) return '<div class="panel"><p class="muted">Entidades indisponíveis (extração requer ClickHouse).</p></div>';
-  const total=ent.count||0, por=ent.por_base||[];
+  const total=ent.count||0, por=ent.por_base||[], nqiG=ent.nqi_global||0;
   if(!total) return `<div class="panel"><h2>📦 Entidades extraídas <span class="muted" style="text-transform:none">— Fase 2</span></h2>
-    <p class="muted" style="margin:0">Nenhum registro extraído ainda — as bases tabulares são extraídas ciclo a ciclo (⟳ regenerar força).</p></div>`;
+    <p class="muted" style="margin:0">Nenhum registro extraído ainda — as bases são extraídas ciclo a ciclo (⟳ regenerar força).</p></div>`;
   const linhas=por.map(b=>{
     const key=b.collection+'/'+b.base;
-    const modo=b.modo||'llm';
-    const badge = modo==='det'
-      ? `<span title="parser determinístico (CSV): todas as linhas, schema único, sem LLM" style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(60,180,90,.18);color:#3cb45a;border:1px solid rgba(60,180,90,.4);flex:0 0 auto">⚙ det</span>`
-      : `<span title="extração por LLM: pode ter lacuna ou variação de schema" style="font-size:10px;font-weight:bold;padding:1px 6px;border-radius:4px;background:rgba(90,140,230,.15);color:#5a8ce6;border:1px solid rgba(90,140,230,.4);flex:0 0 auto">◐ LLM</span>`;
-    return `<div onclick="nvEntShow('${esc(b.collection)}','${esc(b.base)}')" title="ver registros" style="display:flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--line);border-left:3px solid ${key===_nvEntSel?'var(--acc)':'var(--line)'};border-radius:6px;margin-bottom:5px;cursor:pointer;background:${key===_nvEntSel?'var(--panel2)':'transparent'}">
+    const nqi=(b.nqi!=null?b.nqi:0), c=(b['count()']!=null?b['count()']:b.c);
+    return `<div onclick="nvEntShow('${esc(b.collection)}','${esc(b.base)}')" title="ver registros + path-tree" style="display:flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--line);border-left:3px solid ${key===_nvEntSel?'var(--acc)':'var(--line)'};border-radius:6px;margin-bottom:5px;cursor:pointer;background:${key===_nvEntSel?'var(--panel2)':'transparent'}">
       <span style="flex:1;color:var(--ink);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.base)}</span>
-      ${badge}
+      ${nvEntBadge(b.modo)}
       <span class="muted" style="font-size:11px">${esc(b.tipo)}</span>
-      <span style="color:var(--acc);font-weight:bold;font-size:12px;flex:0 0 auto">${b['count()']!=null?b['count()']:b.c} reg</span></div>`;
+      <span title="NQI ${nvNqiPct(nqi)}%" style="flex:0 0 40px;height:6px;background:var(--panel2);border-radius:3px;overflow:hidden"><span style="display:block;width:${nvNqiPct(nqi)}%;height:100%;background:${nvNqiCor(nqi)}"></span></span>
+      <span style="color:var(--acc);font-weight:bold;font-size:12px;flex:0 0 auto">${c} reg</span></div>`;
   }).join('');
   return `<div class="panel">
-    <h2>📦 Entidades extraídas <span class="muted" style="text-transform:none">— Fase 2 · ${total} registros em ${por.length} base(s)</span></h2>
-    <p class="muted" style="margin:0 0 12px;font-size:11px">O dump denso: os registros tirados das bases tabulares, guardados no ClickHouse (view entidade_atual). <b style="color:#3cb45a">⚙ det</b> = parser CSV determinístico (todas as linhas, schema único, sem LLM) · <b style="color:#5a8ce6">◐ LLM</b> = extração guiada por LLM (pode ter lacuna). Clique numa base pra ver os registros.</p>
+    <h2>📦 Entidades extraídas <span class="muted" style="text-transform:none">— ${total} registros · ${por.length} base(s) · NQI global <b style="color:${nvNqiCor(nqiG)}">${nvNqiPct(nqiG)}%</b></span></h2>
+    <p class="muted" style="margin:0 0 12px;font-size:11px"><b style="color:#3cb45a">⚙ det</b> CSV · <b style="color:#9a7ce6">⚙ tpl</b> molde regex · <b style="color:#5a8ce6">◐ LLM</b> · a barra é o <b>NQI</b> (cobertura×precisão) da base. Clique pra ver os registros e o <b>path-tree</b> — de onde veio cada campo.</p>
     <div class="split" style="grid-template-columns:1fr 1.3fr">
       <div style="max-height:52vh;overflow:auto;padding-right:4px">${linhas}</div>
-      <div id="nv-ent-detail" style="max-height:52vh;overflow:auto">${_nvEntSel?'<span class="muted">carregando…</span>':'<div style="color:var(--dim);border:1px dashed var(--line);border-radius:6px;padding:24px 16px;text-align:center">Selecione uma base à esquerda pra ver os registros extraídos.</div>'}</div>
+      <div id="nv-ent-detail" style="max-height:52vh;overflow:auto">${_nvEntSel?'<span class="muted">carregando…</span>':'<div style="color:var(--dim);border:1px dashed var(--line);border-radius:6px;padding:24px 16px;text-align:center">Selecione uma base à esquerda.</div>'}</div>
     </div></div>`;
 }
 async function nvEntShow(coll, base){
@@ -1235,8 +1240,20 @@ async function nvEntShow(coll, base){
   const el=$('#nv-ent-detail'); if(!el) return;
   const am=(d&&d.amostra)||[];
   if(!am.length){ el.innerHTML='<span class="muted">sem registros nesta base.</span>'; return; }
-  el.innerHTML = `<div style="color:var(--dim);font-size:11px;margin-bottom:8px">${esc(base)} · ${am.length} registro(s) (amostra, máx 60)</div>`+
-    am.map(a=>`<pre style="margin:0 0 6px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--ink)">${esc(JSON.stringify(a.dado))}</pre>`).join('');
+  el.innerHTML = `<div style="color:var(--dim);font-size:11px;margin-bottom:8px">${esc(base)} · ${am.length} registro(s)</div>`+
+    am.map(a=>{
+      const nqi=(a.nqi!=null?a.nqi:0), prov=a.prov||{}, campos=prov.campos||{};
+      const tree=Object.entries(campos).map(([k,c])=>`<div style="font-size:10px;margin:2px 0;padding-left:8px;border-left:2px solid var(--line)">
+        <b style="color:var(--ink)">${esc(k)}</b> = ${esc(String(c.valor||''))} <span style="color:${c.valido?'#3cb45a':'#d05a5a'}">${c.valido?'✓':'✗'}</span>
+        <div style="color:var(--dim)">← ${esc(c.via||'?')}: <code style="font-size:9px">${esc(String(c.origem||''))}</code></div></div>`).join('');
+      return `<div style="margin-bottom:8px;border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:var(--panel)">
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:4px">
+          <span>registro ${a.idx}</span>
+          <span>NQI <b style="color:${nvNqiCor(nqi)}">${nvNqiPct(nqi)}%</b> · cob ${nvNqiPct(prov.cob)}% · prec ${nvNqiPct(prov.prec)}%</span></div>
+        <pre style="margin:0 0 4px;white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--ink)">${esc(JSON.stringify(a.dado))}</pre>
+        ${tree?`<details><summary style="cursor:pointer;font-size:10px;color:var(--dim)">🌳 path-tree — de onde veio cada campo</summary><div style="margin-top:4px">${tree}</div></details>`:''}
+      </div>`;
+    }).join('');
 }
 // [Fase 1] distribuição {natureza,tipo} do banco auxiliar — barras por natureza e por tipo.
 function renderClasses(c){

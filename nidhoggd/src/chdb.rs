@@ -308,26 +308,38 @@ pub fn entities_summary(url: &str, collection: Option<&str>, base: Option<&str>)
     if let Some(b) = base { clauses.push("base={base:String}"); params.push(("base", b)); }
     let where_c = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
 
-    let total: i64 = ch_query_param(url,
-        &format!("SELECT count() FROM nidhogg.entidade_atual{where_c} FORMAT TabSeparated"), &params, 10)?
-        .trim().parse().unwrap_or(0);
+    // total + NQI GLOBAL (Fase 5): a saúde média da normalização no escopo
+    let tot_body = ch_query_param(url,
+        &format!("SELECT count() c, round(avg(nqi),3) nqi FROM nidhogg.entidade_atual{where_c} FORMAT JSONEachRow"), &params, 10)?;
+    let tv: Value = serde_json::from_str(tot_body.lines().next().unwrap_or("{}")).unwrap_or_else(|_| json!({}));
+    let total = tv["c"].as_i64().or_else(|| tv["c"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+    let nqi_global = tv["nqi"].as_f64().unwrap_or(0.0);
+
     let bases_body = ch_query_param(url,
-        &format!("SELECT collection, base, tipo, any(modo) modo, count() c FROM nidhogg.entidade_atual{where_c} \
+        &format!("SELECT collection, base, tipo, any(modo) modo, round(avg(nqi),3) nqi, count() c FROM nidhogg.entidade_atual{where_c} \
                   GROUP BY collection, base, tipo ORDER BY c DESC LIMIT 300 FORMAT JSON"), &params, 15)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json: {e}"))?;
     let por_base = bv["data"].as_array().cloned().unwrap_or_default();
 
+    // NQI por TIPO (o NQI da §4, por-tipo): revela quais moldes já amadureceram
+    let tipo_body = ch_query_param(url,
+        &format!("SELECT tipo, any(modo) modo, round(avg(nqi),3) nqi, count() c, uniqExact(base) bases FROM nidhogg.entidade_atual{where_c} \
+                  GROUP BY tipo ORDER BY c DESC FORMAT JSON"), &params, 15)?;
+    let pv: Value = serde_json::from_str(&tipo_body).map_err(|e| format!("json: {e}"))?;
+    let por_tipo = pv["data"].as_array().cloned().unwrap_or_default();
+
     let mut amostra: Vec<Value> = vec![];
     if base.is_some() {
         let s = ch_query_param(url,
-            &format!("SELECT idx, dado FROM nidhogg.entidade_atual{where_c} ORDER BY idx LIMIT 60 FORMAT JSON"), &params, 15)?;
+            &format!("SELECT idx, dado, nqi, prov FROM nidhogg.entidade_atual{where_c} ORDER BY idx LIMIT 60 FORMAT JSON"), &params, 15)?;
         let sv: Value = serde_json::from_str(&s).map_err(|e| format!("json: {e}"))?;
         for row in sv["data"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
             let dado = row["dado"].as_str().and_then(|x| serde_json::from_str::<Value>(x).ok()).unwrap_or(Value::Null);
-            amostra.push(json!({"idx": row["idx"], "dado": dado}));
+            let prov = row["prov"].as_str().and_then(|x| serde_json::from_str::<Value>(x).ok()).unwrap_or(Value::Null);
+            amostra.push(json!({"idx": row["idx"], "dado": dado, "nqi": row["nqi"], "prov": prov}));
         }
     }
-    Ok(json!({"count": total, "por_base": por_base, "amostra": amostra}))
+    Ok(json!({"count": total, "nqi_global": nqi_global, "por_base": por_base, "por_tipo": por_tipo, "amostra": amostra}))
 }
 
 // ───────── Fase 3: registry de templates de extração (o molde por TIPO) ─────────
