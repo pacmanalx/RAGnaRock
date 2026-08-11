@@ -680,46 +680,69 @@ fn main() {
         Err(e) => eprintln!("aviso: dashboard não subiu em {dash_addr}: {e}"),
     }
 
-    // 5) API na thread principal
+    // 5) API — THREAD-POOL (M2b): N workers puxam do MESMO Server (tiny_http recv() é thread-safe).
+    // Fim do 1:1 — searches concorrem em paralelo (read lock) e um driver de ingestão lento roda
+    // FORA do lock (ver handle_api), então não trava a fila.
     let api_addr = format!("0.0.0.0:{}", cfg.api_port);
-    let server = Server::http(&api_addr).unwrap_or_else(|e| {
+    let server = Arc::new(Server::http(&api_addr).unwrap_or_else(|e| {
         eprintln!("erro ao subir em {api_addr}: {e}"); std::process::exit(1);
-    });
-    println!("🤘 API em http://{api_addr}/  · /health /bases /collections /drivers /thesaurus /interpret /search /chunk /ingest*");
-    for mut req in server.incoming_requests() {
-        let method = req.method().clone();
-        let full = req.url().to_string();
-        let (path, query) = match full.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (full, String::new()),
-        };
-        let ip = req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "?".into());
-        let headers: Vec<(String, String)> = req.headers().iter()
-            .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
-            .collect();
-        let mut body_bytes: Vec<u8> = Vec::new();
-        if method == Method::Post {
-            let max_read = max_upload.saturating_add(1);
-            req.as_reader().take(max_read as u64).read_to_end(&mut body_bytes).ok();
-        }
-        let t0 = Instant::now();
-        // [#6] Classifica antes de pegar o lock: rotas que mutam o State (ingest, delete,
-        // toggle) pegam write() exclusivo; o resto pega read() — N searches em paralelo.
-        // Caches que search/search_expand precisam mutar (collection_profiles, expansions)
-        // têm interior mutability (Mutex<>) e funcionam sob read() outer.
-        let (code, payload) = if is_write_route(&method, &path) {
-            let mut st = state.write();
-            route(&method, &path, &query, &headers, &body_bytes, &mut *st)
-        } else {
-            let st = state.read();
-            route_ro(&method, &path, &query, &headers, &body_bytes, &*st)
-        };
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
-        let header = Header::from_bytes(&b"Content-Type"[..],
-                                        &b"application/json; charset=utf-8"[..]).unwrap();
-        let _ = req.respond(Response::from_string(payload).with_status_code(code).with_header(header));
+    }));
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
+    println!("🤘 API em http://{api_addr}/  · {n_workers} worker(s) · /health /bases /collections /drivers /search /chunk /ingest* /ingest_any");
+    let mut workers = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let server = server.clone();
+        let state = state.clone();
+        workers.push(thread::spawn(move || loop {
+            match server.recv() {
+                Ok(req) => handle_api(req, &state, max_upload),
+                Err(e) => { eprintln!("api recv: {e}"); break; }
+            }
+        }));
     }
+    for w in workers { let _ = w.join(); }
+}
+
+/// [M2b] Trata UMA request da API — roda em um dos N workers do pool. Uploads (/ingest_any,
+/// /ingest_upload) rodam o driver FORA do lock (resolve_and_convert) e só pegam write() pra gravar
+/// (store_upload); o resto pega write() (mutações) ou read() (N searches em paralelo) como antes.
+fn handle_api(mut req: Request, state: &Arc<RwLock<State>>, max_upload: usize) {
+    let method = req.method().clone();
+    let full = req.url().to_string();
+    let (path, query) = match full.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (full, String::new()),
+    };
+    let ip = req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "?".into());
+    let headers: Vec<(String, String)> = req.headers().iter()
+        .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+        .collect();
+    let mut body_bytes: Vec<u8> = Vec::new();
+    if method == Method::Post {
+        let max_read = max_upload.saturating_add(1);
+        req.as_reader().take(max_read as u64).read_to_end(&mut body_bytes).ok();
+    }
+    let t0 = Instant::now();
+    let is_upload = method == Method::Post && (path == "/ingest_upload" || path == "/ingest_any");
+    let (code, payload) = if is_upload {
+        // driver FORA do lock (é o passo lento); store_upload pega write() só pra tokenizar/gravar.
+        let use_drivers = path == "/ingest_any";
+        let ing = { state.read().ingestors_dir.clone() };
+        match resolve_and_convert(&query, &headers, &body_bytes, &ing, use_drivers, max_upload) {
+            Ok(up) => { let mut st = state.write(); store_upload(up, &mut *st) }
+            Err(e) => e,
+        }
+    } else if is_write_route(&method, &path) {
+        let mut st = state.write();
+        route(&method, &path, &query, &headers, &body_bytes, &mut *st)
+    } else {
+        let st = state.read();
+        route_ro(&method, &path, &query, &headers, &body_bytes, &*st)
+    };
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap();
+    let _ = req.respond(Response::from_string(payload).with_status_code(code).with_header(header));
 }
 
 // ----------------------------- dashboard (porta de controle) -----------------------------
@@ -1989,10 +2012,27 @@ fn run_ingestor(driver: &std::path::Path, payload: &[u8], secs: u32) -> Result<V
 ///
 /// Em ambos os modos: grava ragfiles_dir/<name>-tokenized.json e carrega em memoria.
 /// Limite de tamanho: --max-upload (default 1 GB). Estoura -> HTTP 413.
-fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State, use_drivers: bool) -> (u16, String) {
+/// [#9/M2b] O upload já resolvido (multipart/raw) e JÁ CONVERTIDO pelo driver — passa da parte
+/// SEM lock (`resolve_and_convert`) pra parte sob write() (`store_upload`).
+struct UploadReady {
+    filename: String,
+    content_bytes: Vec<u8>,
+    fields: HashMap<String, String>,
+    driver_used: Option<String>,
+    orig_len: usize,
+    via: &'static str,
+    t0: std::time::Instant,
+}
+
+/// [M2b] Parte SEM lock do upload: resolve o conteúdo (multipart/raw) e RODA O DRIVER de ingestão
+/// (o subprocess, que pode ser lento) FORA do write lock — pra um driver demorado não travar as
+/// outras requests do pool. Só depois o `store_upload` pega o write() pra tokenizar/gravar.
+fn resolve_and_convert(query: &str, headers: &[(String, String)], body: &[u8],
+                       ingestors_dir: &str, use_drivers: bool, max_upload: usize)
+                       -> Result<UploadReady, (u16, String)> {
     let t0 = std::time::Instant::now();
-    if body.len() > state.max_upload {
-        return (413, json!({"error": format!("upload excede limite de {} bytes (--max-upload)", state.max_upload)}).to_string());
+    if body.len() > max_upload {
+        return Err((413, json!({"error": format!("upload excede limite de {} bytes (--max-upload)", max_upload)}).to_string()));
     }
     // helper: case-insensitive lookup de header
     let header = |name: &str| -> Option<String> {
@@ -2004,11 +2044,11 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     // resolve content + metadados
     let (filename, mut content_bytes, fields): (String, Vec<u8>, HashMap<String, String>) = if is_multipart {
         let boundary = match multipart::extract_boundary(&ct) {
-            Some(b) => b, None => return (400, json!({"error": "Content-Type multipart sem boundary"}).to_string()),
+            Some(b) => b, None => return Err((400, json!({"error": "Content-Type multipart sem boundary"}).to_string())),
         };
         let parts = match multipart::parse(body, &boundary) {
             Ok(p) => p,
-            Err(e) => return (400, json!({"error": format!("multipart inválido: {e}")}).to_string()),
+            Err(e) => return Err((400, json!({"error": format!("multipart inválido: {e}")}).to_string())),
         };
         let mut file_bytes: Option<Vec<u8>> = None;
         let mut fname_from_part: Option<String> = None;
@@ -2023,7 +2063,7 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
             }
         }
         let content = match file_bytes {
-            Some(b) => b, None => return (400, json!({"error": "multipart sem campo 'file'"}).to_string()),
+            Some(b) => b, None => return Err((400, json!({"error": "multipart sem campo 'file'"}).to_string())),
         };
         // filename: campo explicito > filename do part > erro
         let filename = fields.get("filename").cloned()
@@ -2044,22 +2084,29 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
 
     let via = if is_multipart { "multipart" } else { "raw" };
     let orig_len = content_bytes.len();
-    tlog("ingest", &format!("┌─ ingest_upload via={via} filename={filename:?} bytes={orig_len} drivers={use_drivers}"));
+    tlog("ingest", &format!("┌─ ingest via={via} filename={filename:?} bytes={orig_len} drivers={use_drivers}"));
 
     // [#9] passo do driver de ingestão (só via /ingest_any): se um driver casa (mime|ext), o script
     // converte os bytes crus em texto/CSV ANTES de tokenizar. Nada casa → segue como texto (normal).
     let mut driver_used: Option<String> = None;
     if use_drivers {
-        if let Some(driver) = resolve_ingestor(&state.ingestors_dir, &ct, &filename) {
+        if let Some(driver) = resolve_ingestor(ingestors_dir, &ct, &filename) {
             tlog("ingest", &format!("   ├─ driver de ingestão: {}", driver.display()));
             match run_ingestor(&driver, &content_bytes, INGESTOR_TIMEOUT_S) {
                 Ok(out) => { content_bytes = out;
                              driver_used = driver.file_name().and_then(|f| f.to_str()).map(|s| s.to_string()); }
                 Err(e) => { tlog("ingest", &format!("   └─ driver FALHOU: {e}"));
-                            return (400, json!({"error": format!("driver de ingestão falhou: {e}")}).to_string()); }
+                            return Err((400, json!({"error": format!("driver de ingestão falhou: {e}")}).to_string())); }
             }
         }
     }
+    Ok(UploadReady { filename, content_bytes, fields, driver_used, orig_len, via, t0 })
+}
+
+/// [M2b] Parte SOB write lock: tokeniza o texto já convertido, grava o `<name>-tokenized.json` e
+/// carrega a base em memória. Rápida (sem subprocess) — só isto precisa do lock exclusivo.
+fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
+    let UploadReady { filename, content_bytes, fields, driver_used, orig_len, via, t0 } = up;
 
     // conteudo precisa ser UTF-8 pra tokenizar como texto
     let text = match std::str::from_utf8(&content_bytes) {
@@ -2164,6 +2211,17 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
                  "appended": did_append, "driver": driver_used,
                  "bases": total, "saved_to": saved_to,
                  "via": via}).to_string())
+}
+
+/// [compat] wrapper monolítico pro caller do dashboard (/api/ingest_upload): resolve+converte e
+/// grava sob o MESMO write lock (upload de UI, baixa concorrência). A API (/ingest_any,
+/// /ingest_upload) usa as DUAS partes separadas pra rodar o driver FORA do lock — ver o dispatch.
+fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State, use_drivers: bool) -> (u16, String) {
+    let (ing, mu) = (state.ingestors_dir.clone(), state.max_upload);
+    match resolve_and_convert(query, headers, body, &ing, use_drivers, mu) {
+        Ok(up) => store_upload(up, state),
+        Err(e) => e,
+    }
 }
 
 /// Decodificacao MINIMA de percent-encoding pra query string (RFC 3986).
