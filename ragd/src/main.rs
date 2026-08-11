@@ -1734,13 +1734,16 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     // o resto roda sob read() — N polls de stats/logs/search do ValHalla em paralelo com a API.
     let is_w = matches!((&method, path.as_str()),
         (Method::Post, "/api/config") | (Method::Post, "/api/thesaurus_toggle")
-        | (Method::Post, "/api/ingest_upload"));
+        | (Method::Post, "/api/ingest_upload") | (Method::Post, "/api/ingest_any"));
     let (code, payload) = if is_w {
         let mut st = state.write();
         match (&method, path.as_str()) {
             (Method::Post, "/api/config")           => set_config(&body_str, &mut *st),
             (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
             (Method::Post, "/api/ingest_upload")    => ingest_upload(&query, &headers, &body, &mut *st, false),
+            // [#9] mesma rota do console, mas COM os drivers de ingestão (pdf/docx/xlsx/...):
+            // espelha a distinção da API pública /ingest_upload (sem driver) vs /ingest_any (com).
+            (Method::Post, "/api/ingest_any")       => ingest_upload(&query, &headers, &body, &mut *st, true),
             _ => unreachable!(),
         }
     } else {

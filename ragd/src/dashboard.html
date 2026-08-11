@@ -200,7 +200,8 @@
   <!-- INGESTÃO -->
   <section class="tabpanel" data-panel="ingest">
     <div class="panel">
-      <h2>Ingestão de código → RAG</h2>
+      <h2>Ingestão de documentos e código → RAG</h2>
+      <div class="muted" style="margin:-4px 0 8px">PDF · DOCX · XLSX · CSV são convertidos pelos drivers de ingestão; código-fonte e texto entram direto. Até 64 MB por arquivo.</div>
       <div class="toolbar">
         <div class="grow"><label>coleção (existente ou nova)</label><input id="ing-coll" list="ing-colls" placeholder="ex: eduxe"><datalist id="ing-colls"></datalist></div>
         <div><label>chunk (chars)</label><input id="ing-chunk" class="sm" type="number" value="2048"></div>
@@ -599,14 +600,16 @@ setInterval(()=>{const p=document.querySelector('.tabpanel[data-panel="logs"]');
 document.querySelectorAll('nav.tabs button').forEach(b=>b.onclick=()=>selectTab(b.dataset.tab));
 {const t=location.hash.slice(1); if(['visao','buscar','ingest','perf','drivers','config','logs'].includes(t))selectTab(t);}
 // ---- Ingestão (upload de arquivos/pasta) ----
-const SRC_EXT=/\.(cs|sql|sh|py|yml|yaml|json|md|markdown|ini|toml|csproj|js|mjs|ts|jsx|tsx|java|go|rs|rb|php|swift|kt|kts|c|cc|cpp|cxx|h|hpp|cshtml|razor|html|css|scss|xml|txt|pas|sql|vb)$/i;
+// [#9] fonte (código/texto) + documentos que os drivers de ingestão convertem (pdf/docx/xlsx/csv)
+const SRC_EXT=/\.(cs|sql|sh|py|yml|yaml|json|md|markdown|ini|toml|csproj|js|mjs|ts|jsx|tsx|java|go|rs|rb|php|swift|kt|kts|c|cc|cpp|cxx|h|hpp|cshtml|razor|html|css|scss|xml|txt|pas|sql|vb|csv|pdf|docx|xlsx)$/i;
 const SKIP=/(^|\/)(node_modules|\.git|bin|obj|\.vs|\.vscode|\.idea|dist|build|out|target|packages|\.next|coverage)(\/|$)/i;
-function filterFiles(list){return [...list].filter(f=>{const p=f.webkitRelativePath||f.name;return SRC_EXT.test(f.name)&&!SKIP.test(p)&&f.size<8*1024*1024;});}
+const ING_MAX_MB=64, ING_MAX=ING_MAX_MB*1024*1024;   // teto da UI (o server ainda tem o --max-upload)
+function filterFiles(list){return [...list].filter(f=>{const p=f.webkitRelativePath||f.name;return SRC_EXT.test(f.name)&&!SKIP.test(p)&&f.size<ING_MAX;});}
 function setIngFiles(list,isDir){
   const all=list.length;
-  const files=isDir?filterFiles(list):[...list].filter(f=>f.size<8*1024*1024);
+  const files=isDir?filterFiles(list):[...list].filter(f=>f.size<ING_MAX);
   window._ingFiles=files;
-  $('#ing-sel').textContent=`${files.length} arquivo(s) selecionado(s)`+(isDir?` (de ${all}; ${all-files.length} ignorados: lixo de build/não-fonte/>8MB)`:(all-files.length?` (${all-files.length} ignorados >8MB)`:''));
+  $('#ing-sel').textContent=`${files.length} arquivo(s) selecionado(s)`+(isDir?` (de ${all}; ${all-files.length} ignorados: lixo de build/não-fonte/>${ING_MAX_MB}MB)`:(all-files.length?` (${all-files.length} ignorados >${ING_MAX_MB}MB)`:''));
   $('#ing-go').disabled=!files.length;
   $('#ing-tbody').innerHTML=files.slice(0,300).map(f=>`<tr><td class="f">${esc(f.webkitRelativePath||f.name)}</td><td class="muted">aguardando</td></tr>`).join('')+(files.length>300?`<tr><td colspan="2" class="muted">… +${files.length-300} (todos serão enviados)</td></tr>`:'')||'<tr><td colspan="2" class="muted">nada após o filtro</td></tr>';
 }
@@ -619,14 +622,16 @@ async function doIngest(){
   let ok=0,fail=0,chunks=0;const t0=performance.now();
   for(let i=0;i<files.length;i++){
     const f=files[i],cell=$('#ing-st-'+i);cell.textContent='enviando…';
-    const rel=f.webkitRelativePath||f.name,name=rel.replace(/\.[^.]+$/,'').replace(/[\/\\]/g,'__');
+    // [#9] mantém a extensão no name (vira sufixo _ext) pra relatorio.pdf e relatorio.docx NÃO
+    // colidirem no mesmo base — antes a UI só aceitava fonte, agora aceita irmãos multi-formato.
+    const rel=f.webkitRelativePath||f.name,name=rel.replace(/[\/\\]/g,'__').replace(/\.([^.]+)$/,'_$1');
     try{
       const buf=await f.arrayBuffer();
-      const u=`/api/ingest_upload?collection=${encodeURIComponent(coll)}&filename=${encodeURIComponent(f.name)}&name=${encodeURIComponent(name)}&chunk=${chunk}`;
+      const u=`/api/ingest_any?collection=${encodeURIComponent(coll)}&filename=${encodeURIComponent(f.name)}&name=${encodeURIComponent(name)}&chunk=${chunk}`;
       const r=await fetch(u,{method:'POST',body:buf});
       if(r.status===401){showLogin();$('#ing-go').disabled=false;return;}
       const j=await r.json();
-      if(j.ok){ok++;chunks+=j.n_chunks||0;cell.innerHTML=`<span style="color:var(--ok)">ok · ${j.n_chunks} chunks</span>`;}
+      if(j.ok){ok++;chunks+=j.n_chunks||0;cell.innerHTML=`<span style="color:var(--ok)">ok · ${j.n_chunks} chunks${j.driver?` · <span class="muted">${esc(j.driver)}</span>`:''}</span>`;}
       else{fail++;cell.innerHTML=`<span style="color:#ff6b6b">${esc(j.error||'erro')}</span>`;}
     }catch(e){fail++;cell.innerHTML=`<span style="color:#ff6b6b">${esc(e.message)}</span>`;}
     $('#ing-out').innerHTML=`<b>${ok}</b> ok · ${fail} falhas · ${chunks} chunks · ${i+1}/${files.length} · coleção <b>${esc(coll)}</b>`;
