@@ -19,6 +19,8 @@ use ragd::ingestor::DriverPick;
 const DEFAULT_PORT: u16 = 11499;            // API
 const DEFAULT_DASH_PORT: u16 = 11498;       // dashboard / supervisório
 const DEFAULT_DRIVERS_DIR: &str = "drivers";
+const DEFAULT_INGESTORS_DIR: &str = "ingestors";   // [#9] drivers de ingestão (scripts shell, pinagem stdin→stdout)
+const INGESTOR_TIMEOUT_S: u32 = 120;               // teto por driver de ingestão (via `timeout` coreutil)
 const DEFAULT_THESAURUS_DIR: &str = "thesaurus";
 const DEFAULT_RAGFILES_DIR: &str = "ragfiles";
 const DEFAULT_MAX_UPLOAD: usize = 1024 * 1024 * 1024;   // 1 GB
@@ -57,6 +59,7 @@ fn is_default_creds(user: &str, pass: &str) -> bool {
 struct State {
     bases: Bases,
     drivers_dir: String,
+    ingestors_dir: String,   // [#9] drivers de ingestão (scripts via shell)
     ragfiles_dir: String,
     max_upload: usize,
     started: Instant,
@@ -86,6 +89,7 @@ struct Config {
     api_port: u16,
     dash_port: u16,
     drivers_dir: String,
+    ingestors_dir: String,   // [#9] drivers de ingestão
     ragfiles_dir: String,
     max_upload: usize,
     autoload: bool,
@@ -111,6 +115,7 @@ impl Default for Config {
         Config {
             api_port: DEFAULT_PORT, dash_port: DEFAULT_DASH_PORT,
             drivers_dir: DEFAULT_DRIVERS_DIR.to_string(),
+            ingestors_dir: DEFAULT_INGESTORS_DIR.to_string(),
             ragfiles_dir: DEFAULT_RAGFILES_DIR.to_string(),
             max_upload: DEFAULT_MAX_UPLOAD, autoload: true,
             admin_user: "admin".to_string(), admin_pass: "admin".to_string(),
@@ -152,6 +157,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "api_port"    => if let Ok(p) = v.parse() { cfg.api_port = p },
             "dash_port"   => if let Ok(p) = v.parse() { cfg.dash_port = p },
             "drivers_dir" => cfg.drivers_dir = v.to_string(),
+            "ingestors_dir" => cfg.ingestors_dir = v.to_string(),
             "ragfiles_dir"=> cfg.ragfiles_dir = v.to_string(),
             "max_upload"  => if let Ok(n) = v.parse() { cfg.max_upload = n },
             "autoload"    => cfg.autoload = matches!(v, "true" | "1" | "yes" | "on"),
@@ -581,6 +587,7 @@ fn main() {
             "--port" => cfg.api_port = it.next().expect("--port N").parse().expect("porta inválida"),
             "--dash-port" => cfg.dash_port = it.next().expect("--dash-port N").parse().expect("porta inválida"),
             "--drivers-dir" => cfg.drivers_dir = it.next().expect("--drivers-dir <path>").clone(),
+            "--ingestors-dir" => cfg.ingestors_dir = it.next().expect("--ingestors-dir <path>").clone(),
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
             "--no-autoload" => no_autoload = true,
@@ -620,7 +627,8 @@ fn main() {
              total_bases(&bases), bases.len(), n_drivers, cfg.ragfiles_dir, cfg.max_upload / (1024 * 1024));
     let max_upload = cfg.max_upload;   // local p/ limitar leitura sem travar o Mutex
     let state = Arc::new(RwLock::new(State {
-        bases, drivers_dir: cfg.drivers_dir.clone(), ragfiles_dir: cfg.ragfiles_dir.clone(),
+        bases, drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
+        ragfiles_dir: cfg.ragfiles_dir.clone(),
         max_upload, started: Instant::now(),
         admin_user: cfg.admin_user.clone(), admin_pass: cfg.admin_pass.clone(),
         dev: cfg.dev,
@@ -1449,7 +1457,7 @@ fn config_json(st: &State) -> String {
     json!({
         "storage": if hybrid { "hybrid" } else { "memory" },
         "config_path": st.config_path,
-        "drivers_dir": st.drivers_dir, "ragfiles_dir": st.ragfiles_dir,
+        "drivers_dir": st.drivers_dir, "ingestors_dir": st.ingestors_dir, "ragfiles_dir": st.ragfiles_dir,
         "max_upload_mb": st.max_upload / (1024 * 1024),
         "admin_user": st.admin_user,
         "admin_is_default": is_default_creds(&st.admin_user, &st.admin_pass),
@@ -1701,7 +1709,7 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
         match (&method, path.as_str()) {
             (Method::Post, "/api/config")           => set_config(&body_str, &mut *st),
             (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
-            (Method::Post, "/api/ingest_upload")    => ingest_upload(&query, &headers, &body, &mut *st),
+            (Method::Post, "/api/ingest_upload")    => ingest_upload(&query, &headers, &body, &mut *st, false),
             _ => unreachable!(),
         }
     } else {
@@ -1748,7 +1756,8 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
 /// [#6] Decide o lock antes do dispatch: rotas que mutam o State pedem write(); o resto read().
 fn is_write_route(method: &Method, path: &str) -> bool {
     matches!((method, path),
-        (Method::Post, "/ingest") | (Method::Post, "/ingest_file") | (Method::Post, "/ingest_upload"))
+        (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
+        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
     || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}
 }
 
@@ -1792,7 +1801,9 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
     match (method, path) {
         (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
-        (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state),
+        (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state, false),
+        // [#9] /ingest_any = /ingest_upload + passo do driver de ingestão (mime|ext → script shell).
+        (Method::Post, "/ingest_any") => ingest_upload(query, headers, body_bytes, state, true),
         (Method::Delete, p) if p.starts_with("/bases/") => {
             let name = &p["/bases/".len()..];
             let coll = query_param(query, "collection").unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
@@ -1912,6 +1923,62 @@ fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Ba
     }
 }
 
+/// [#9] MIME → "kind" (extensão) pros formatos BINÁRIOS. text/plain (ou vazio/octet-stream)
+/// devolve None → o chamador cai na extensão do filename (a família texto — .csv/.mysql/.c é
+/// toda text/plain pro wire). Ver ingestors/README.md.
+fn mime_to_kind(mime: &str) -> Option<&'static str> {
+    match mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "application/pdf" => Some("pdf"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
+        "text/csv" | "application/csv" => Some("csv"),
+        _ => None,
+    }
+}
+
+/// [#9] Resolve o driver de ingestão: MIME primeiro (binário), senão a extensão do filename
+/// (família texto). Devolve o caminho se existir `ingestors_dir/<kind>.py`. Sem match = None
+/// (o chamador trata o corpo como texto, comportamento normal).
+fn resolve_ingestor(ingestors_dir: &str, mime: &str, filename: &str) -> Option<std::path::PathBuf> {
+    let kind = mime_to_kind(mime).map(|s| s.to_string()).or_else(|| {
+        Path::new(filename).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
+    })?;
+    if kind.is_empty() { return None; }
+    let p = Path::new(ingestors_dir).join(format!("{kind}.py"));
+    if p.is_file() { Some(p) } else { None }
+}
+
+/// [#9] Roda um driver de ingestão via shell: `timeout <s> python3 <driver>`, payload no STDIN,
+/// texto/CSV extraído no STDOUT. `PYTHONSAFEPATH=1` reforça o anti-sombreamento da stdlib (o
+/// driver também se protege). O stdin é escrito numa thread enquanto lemos o stdout — evita
+/// deadlock em payload grande. exit≠0 = rejeitado (motivo no stderr); timeout vira exit 124.
+fn run_ingestor(driver: &std::path::Path, payload: &[u8], secs: u32) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("timeout")
+        .arg(secs.to_string()).arg("python3").arg(driver)
+        .env("PYTHONSAFEPATH", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("spawn (timeout/python3 no PATH?): {e}"))?;
+    let mut si = child.stdin.take().ok_or_else(|| "sem stdin".to_string())?;
+    let out = std::thread::scope(|s| {
+        s.spawn(move || { let _ = si.write_all(payload); });   // si dropado no fim da thread → EOF
+        child.wait_with_output()
+    }).map_err(|e| format!("wait: {e}"))?;
+    if !out.status.success() {
+        let code = out.status.code().unwrap_or(-1);
+        if code == 124 { return Err(format!("timeout ({secs}s)")); }
+        let err = String::from_utf8_lossy(&out.stderr);
+        let reason = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").trim();
+        return Err(format!("exit {code}: {}", if reason.is_empty() { "sem motivo no stderr" } else { reason }));
+    }
+    Ok(out.stdout)
+}
+
 /// POST /ingest_upload — recebe o ARQUIVO via HTTP (sem precisar do path local).
 ///
 /// Dois modos via Content-Type:
@@ -1922,7 +1989,7 @@ fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Ba
 ///
 /// Em ambos os modos: grava ragfiles_dir/<name>-tokenized.json e carrega em memoria.
 /// Limite de tamanho: --max-upload (default 1 GB). Estoura -> HTTP 413.
-fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State) -> (u16, String) {
+fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State, use_drivers: bool) -> (u16, String) {
     let t0 = std::time::Instant::now();
     if body.len() > state.max_upload {
         return (413, json!({"error": format!("upload excede limite de {} bytes (--max-upload)", state.max_upload)}).to_string());
@@ -1935,7 +2002,7 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     let is_multipart = ct.to_lowercase().starts_with("multipart/form-data");
 
     // resolve content + metadados
-    let (filename, content_bytes, fields): (String, Vec<u8>, HashMap<String, String>) = if is_multipart {
+    let (filename, mut content_bytes, fields): (String, Vec<u8>, HashMap<String, String>) = if is_multipart {
         let boundary = match multipart::extract_boundary(&ct) {
             Some(b) => b, None => return (400, json!({"error": "Content-Type multipart sem boundary"}).to_string()),
         };
@@ -1976,7 +2043,23 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     };
 
     let via = if is_multipart { "multipart" } else { "raw" };
-    tlog("ingest", &format!("┌─ ingest_upload via={via} filename={filename:?} bytes={}", content_bytes.len()));
+    let orig_len = content_bytes.len();
+    tlog("ingest", &format!("┌─ ingest_upload via={via} filename={filename:?} bytes={orig_len} drivers={use_drivers}"));
+
+    // [#9] passo do driver de ingestão (só via /ingest_any): se um driver casa (mime|ext), o script
+    // converte os bytes crus em texto/CSV ANTES de tokenizar. Nada casa → segue como texto (normal).
+    let mut driver_used: Option<String> = None;
+    if use_drivers {
+        if let Some(driver) = resolve_ingestor(&state.ingestors_dir, &ct, &filename) {
+            tlog("ingest", &format!("   ├─ driver de ingestão: {}", driver.display()));
+            match run_ingestor(&driver, &content_bytes, INGESTOR_TIMEOUT_S) {
+                Ok(out) => { content_bytes = out;
+                             driver_used = driver.file_name().and_then(|f| f.to_str()).map(|s| s.to_string()); }
+                Err(e) => { tlog("ingest", &format!("   └─ driver FALHOU: {e}"));
+                            return (400, json!({"error": format!("driver de ingestão falhou: {e}")}).to_string()); }
+            }
+        }
+    }
 
     // conteudo precisa ser UTF-8 pra tokenizar como texto
     let text = match std::str::from_utf8(&content_bytes) {
@@ -2077,8 +2160,8 @@ fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: 
     tlog("ingest", &format!("   └─ carregado: {collection}/{name} ({n} chunks) · total={total} bases ({:.0}ms)",
                             t0.elapsed().as_secs_f64() * 1000.0));
     (200, json!({"ok": true, "collection": collection, "name": name, "filename": filename,
-                 "corpus": corpus, "n_chunks": n, "bytes": content_bytes.len(),
-                 "appended": did_append,
+                 "corpus": corpus, "n_chunks": n, "bytes": orig_len,
+                 "appended": did_append, "driver": driver_used,
                  "bases": total, "saved_to": saved_to,
                  "via": via}).to_string())
 }
@@ -2895,7 +2978,7 @@ fn help() {
 
 uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
-       [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
+       [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ingestors-dir {DEFAULT_INGESTORS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
        [--max-upload {DEFAULT_MAX_UPLOAD}] [--no-autoload] [--dev]
        [--preload nome=caminho.json ...]
 
@@ -2919,6 +3002,8 @@ rotas:
   POST   /ingest_file    {{\"path\":\"logic_path/01_foo.py\",\"name\":?,\"chunk\":?,\"driver\":?}}        (atalho bruto)
   POST   /ingest_upload  curl -F file=@local.py -F name=hist $H/ingest_upload                    (upload via multipart)
                           curl --data-binary @local.py \"$H/ingest_upload?filename=local.py&name=hist\"   (raw body)
+  POST   /ingest_any     idem /ingest_upload + roda o DRIVER de ingestão (mime|ext → ingestors/<kind>.py)
+                          curl --data-binary @dados.csv \"$H/ingest_any?filename=dados.csv&name=vendas\"   (#9)
   POST   /search    {{\"base\":\"sda\"|\"sd*\"|\"*\",\"query\":\"anel\",\"k\":5,\"rerank\":true}}
   POST   /chunk     {{\"base\":\"sda\",\"id\":87,\"before\":1,\"after\":1}}  ou  {{\"base\":\"sda\",\"ids\":[1,87]}}
   DELETE /bases/{{nome}}");
