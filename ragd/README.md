@@ -17,6 +17,7 @@ cargo build --release
 Opções: `--port N` (default **11499**), `--drivers-dir <path>` (default `drivers`),
 `--ragfiles-dir <path>` (default `ragfiles` — onde `/ingest_file` grava os JSON tokenizados),
 `--max-upload <bytes>` (default 1 GB — limite do `POST /ingest_upload`),
+`--workers N` (tamanho do thread-pool da API; default 0 = auto: nº de CPUs, capado em 2..16),
 `--preload nome=caminho.json` (repetível), `--help`.
 
 ## Rotas (HTTP JSON)

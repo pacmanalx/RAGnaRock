@@ -92,6 +92,7 @@ struct Config {
     ingestors_dir: String,   // [#9] drivers de ingestão
     ragfiles_dir: String,
     max_upload: usize,
+    workers: usize,    // nº de workers do pool da API (0 = auto: nCPUs, clamp 2..16)
     autoload: bool,
     admin_user: String,
     admin_pass: String,
@@ -117,7 +118,7 @@ impl Default for Config {
             drivers_dir: DEFAULT_DRIVERS_DIR.to_string(),
             ingestors_dir: DEFAULT_INGESTORS_DIR.to_string(),
             ragfiles_dir: DEFAULT_RAGFILES_DIR.to_string(),
-            max_upload: DEFAULT_MAX_UPLOAD, autoload: true,
+            max_upload: DEFAULT_MAX_UPLOAD, workers: 0, autoload: true,
             admin_user: "admin".to_string(), admin_pass: "admin".to_string(),
             log_file: "/tmp/ragd-all.log".to_string(),
             log_utc_offset: -3,
@@ -160,6 +161,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "ingestors_dir" => cfg.ingestors_dir = v.to_string(),
             "ragfiles_dir"=> cfg.ragfiles_dir = v.to_string(),
             "max_upload"  => if let Ok(n) = v.parse() { cfg.max_upload = n },
+            "workers"     => if let Ok(n) = v.parse() { cfg.workers = n },
             "autoload"    => cfg.autoload = matches!(v, "true" | "1" | "yes" | "on"),
             "admin_user"  => cfg.admin_user = v.to_string(),
             "admin_pass"  => cfg.admin_pass = v.to_string(),
@@ -590,6 +592,7 @@ fn main() {
             "--ingestors-dir" => cfg.ingestors_dir = it.next().expect("--ingestors-dir <path>").clone(),
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
+            "--workers" => cfg.workers = it.next().expect("--workers N").parse().expect("--workers N"),
             "--no-autoload" => no_autoload = true,
             "--dev" => cfg.dev = true,
             "--storage" => cfg.storage = it.next().expect("--storage memory|hybrid").clone(),
@@ -687,8 +690,13 @@ fn main() {
     let server = Arc::new(Server::http(&api_addr).unwrap_or_else(|e| {
         eprintln!("erro ao subir em {api_addr}: {e}"); std::process::exit(1);
     }));
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
-    println!("🤘 API em http://{api_addr}/  · {n_workers} worker(s) · /health /bases /collections /drivers /search /chunk /ingest* /ingest_any");
+    // --workers N manda; 0 (default) = auto pelo nº de CPUs, capado em 2..16
+    let (n_workers, workers_src) = if cfg.workers > 0 {
+        (cfg.workers.clamp(1, 256), "--workers")
+    } else {
+        (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16), "auto")
+    };
+    println!("🤘 API em http://{api_addr}/  · {n_workers} worker(s) [{workers_src}] · /health /bases /collections /drivers /search /chunk /ingest* /ingest_any");
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
         let server = server.clone();
@@ -3037,11 +3045,12 @@ fn help() {
 uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
        [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ingestors-dir {DEFAULT_INGESTORS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
-       [--max-upload {DEFAULT_MAX_UPLOAD}] [--no-autoload] [--dev]
+       [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
        [--preload nome=caminho.json ...]
 
   config: --config <arq>, senao /etc/ragnarock/ragnarock.cfg, senao ./ragnarock.cfg, senao defaults.
-          (chaves: api_port, dash_port, drivers_dir, ragfiles_dir, max_upload, autoload, admin_user, admin_pass)
+          (chaves: api_port, dash_port, drivers_dir, ragfiles_dir, max_upload, workers, autoload, admin_user, admin_pass)
+  --workers N fixa o tamanho do thread-pool da API (default 0 = auto: nº de CPUs, capado em 2..16).
   duas portas: API (default {DEFAULT_PORT}) + dashboard/supervisorio (default {DEFAULT_DASH_PORT}, login por sessao).
   seguranca: credenciais admin/admin sao recusadas a menos que --dev seja passado. Troque no .cfg ou pelo painel.
   por padrao carrega TODAS as bases de ragfiles-dir no boot (cada subdir = colecao).
