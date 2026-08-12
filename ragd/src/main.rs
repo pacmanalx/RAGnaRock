@@ -1509,14 +1509,7 @@ fn module_proxy(url: &str, post_body: Option<&str>, timeout_secs: u32) -> (u16, 
     }
 }
 
-/// Mascara uma chave de API pra exibição: só os 4 últimos chars ("…abcd").
-fn mask_key(k: &str) -> String {
-    if k.is_empty() { return String::new(); }
-    let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("…{tail}")
-}
-
-/// GET /config — estado da configuração. Chaves SEMPRE mascaradas (o valor cru nunca
+/// GET /config — estado da configuração. Chaves SEMPRE mascaradas via mask_key (o valor cru nunca
 /// sai do daemon — o legado devolvia cru atrás do cookie; corrigido na promoção pra 11499).
 fn config_json(st: &State) -> String {
     let hybrid = !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed);
