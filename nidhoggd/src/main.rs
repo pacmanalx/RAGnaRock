@@ -262,6 +262,14 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| kv.split_once('=').and_then(|(k, v)| (k == key).then(|| v.to_string())))
 }
 
+/// Normalização Unicode NFC — mesmo fix do ragd: o macOS entrega nomes em NFD e o mesmo
+/// documento virava DUAS classes no doc_class (NFD picada + NFC limpa). Aplicar em TODO
+/// nome de base/coleção que entra (API própria e /bases do ragd).
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
+}
+
 /// [#29] Monta a resposta de leitura do conhecimento, aplicando os filtros opcionais
 /// (collection / type / level) sobre os itens de `knowledge[]`.
 fn knowledge_query(st: &State, query: &str) -> Value {
@@ -372,7 +380,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // [Fase 1] classes {natureza,tipo} do banco auxiliar — distribuição por coleção (ou todas).
         (Method::Get, "/api/nidhogg/classes") => {
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
-            let coll = query_param(query, "collection");
+            let coll = query_param(query, "collection").map(|c| nfc(&c));
             match store_classes_summary(&store, &dir, &ch_url, coll.as_deref()) {
                 Ok(v) => (200, v.to_string()),
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
@@ -381,8 +389,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // [Fase 2] entidades extraídas (o dump denso) — ClickHouse only, sempre via a view entidade_atual.
         (Method::Get, "/api/nidhogg/entities") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
-            let coll = query_param(query, "collection");
-            let base = query_param(query, "base");
+            let coll = query_param(query, "collection").map(|c| nfc(&c));
+            let base = query_param(query, "base").map(|b| nfc(&b));
             if store != "clickhouse" {
                 (200, json!({"count": 0, "note": "extração requer clickhouse"}).to_string())
             } else {
@@ -445,8 +453,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // muda o ext_cfg → needs_extract dispara). Corrige os mal-tipados e o COMPARATIVO nqi-baixo.
         (Method::Post, "/api/nidhogg/reclass") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
-            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
-            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
+            let base = nfc(v["base"].as_str().unwrap_or("").trim());
             let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
             if coll.is_empty() || base.is_empty() || tipo.is_empty() {
                 return (400, json!({"error":"faltam 'collection', 'base' e 'tipo'"}).to_string());
@@ -498,8 +506,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
             let instrucao = v["instrucao"].as_str().unwrap_or("").trim().to_string();
-            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
-            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
+            let base = nfc(v["base"].as_str().unwrap_or("").trim());
             if tipo.is_empty() || coll.is_empty() || base.is_empty() {
                 return (400, json!({"error":"faltam 'tipo', 'collection' e 'base' (a amostra)"}).to_string());
             }
@@ -546,7 +554,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // liga/desliga o acesso do Nidhogg a UMA coleção (não re-mastiga a mesma N vezes)
         (Method::Post, "/api/nidhogg/collection") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
-            let coll = match v["collection"].as_str() { Some(c) if !c.is_empty() => c.to_string(), _ => return (400, json!({"error":"falta 'collection'"}).to_string()) };
+            let coll = match v["collection"].as_str() { Some(c) if !c.is_empty() => nfc(c), _ => return (400, json!({"error":"falta 'collection'"}).to_string()) };
             let enabled = v["enabled"].as_bool().unwrap_or(false);
             let s = st.lock().unwrap();
             let mut k = read_knowledge(&s.dir, &coll);
@@ -1269,8 +1277,8 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         None => return json!({"ok": false, "error": "ragd /bases sem resposta"}),
     };
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
-        let name = b["name"].as_str().unwrap_or("");
-        !name.is_empty() && store_needs_class(store, dir, ch_url, coll, name, &base_state_hash(b), &cfg_hash)
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        !name.is_empty() && store_needs_class(store, dir, ch_url, coll, &name, &base_state_hash(b), &cfg_hash)
     }).collect();
     queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 
@@ -1280,7 +1288,8 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
     let at = now_stamp();
     let mut rows: Vec<chdb::ClassRow> = vec![];   // acumula o lote (1 INSERT no fim)
     for b in queue.iter().take(CLASSIFY_PER_CYCLE) {
-        let name = b["name"].as_str().unwrap_or("");
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        let name = name.as_str();
         let sh = base_state_hash(b);
         let has_text = b["has_text"].as_bool().unwrap_or(true);
         let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
@@ -1421,9 +1430,9 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         None => return json!({"ok": false, "collection": coll, "error": "ragd /bases sem resposta"}),
     };
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
-        let name = b["name"].as_str().unwrap_or("");
-        match extraiveis.get(name) {
-            Some((_, _, ecfg)) => chdb::needs_extract(ch_url, coll, name, &base_state_hash(b), ecfg).unwrap_or(true),
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        match extraiveis.get(name.as_str()) {
+            Some((_, _, ecfg)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg).unwrap_or(true),
             None => false,
         }
     }).collect();
@@ -1434,7 +1443,8 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let mut compiled_cache: std::collections::HashMap<String, Vec<(String, regex::Regex, Vec<String>)>> = std::collections::HashMap::new();
     let at = now_stamp();
     for b in queue.iter().take(EXTRACT_PER_CYCLE) {
-        let name = b["name"].as_str().unwrap_or("");
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        let name = name.as_str();
         let sh = base_state_hash(b);
         let (tipo, _bcsv, ecfg) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
