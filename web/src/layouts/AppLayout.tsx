@@ -16,7 +16,7 @@ type Item = { to: string; label: string; icon: LucideIcon; end?: boolean }
 const NAV: { section: string; items: Item[] }[] = [
   { section: 'RAGnaRock', items: [
     { to: '/', label: 'Visão', icon: Eye, end: true },
-    { to: '/buscar', label: 'Buscar', icon: Search },
+    { to: '/comando', label: 'Comando', icon: Search },
     { to: '/ingestao', label: 'Ingestão', icon: Upload },
     { to: '/performance', label: 'Performance', icon: Activity },
   ]},

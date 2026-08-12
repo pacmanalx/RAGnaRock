@@ -1,7 +1,7 @@
-import { createBrowserRouter } from 'react-router-dom'
+import { createBrowserRouter, Navigate } from 'react-router-dom'
 import { AppLayout } from '@/layouts/AppLayout'
 import { Visao } from '@/pages/Visao'
-import { Buscar } from '@/pages/Buscar'
+import { Comando } from '@/pages/Comando'
 import { Ingestao } from '@/pages/Ingestao'
 import { Placeholder } from '@/pages/Placeholder'
 import { Perfis } from '@/pages/admin/Perfis'
@@ -17,7 +17,8 @@ export const router = createBrowserRouter([
     element: <AppLayout />,
     children: [
       { index: true, element: <Visao /> },
-      { path: 'buscar', element: <Buscar /> },
+      { path: 'comando', element: <Comando /> },
+      { path: 'buscar', element: <Navigate to="/comando" replace /> }, // rota antiga
       { path: 'ingestao', element: <Ingestao /> },
       { path: 'performance', element: <Placeholder title="Performance" note="Matched filter, ponto de convergência e histograma (heatmap)." /> },
       { path: 'nidhogg', element: <Placeholder title="Nidhogg — Visão geral" note="Estado da camada de inteligência: coleções, saturação, NQI." /> },

@@ -85,4 +85,17 @@ export interface Hit {
   start: number
   snippet: string
   rank: number
+  via?: string // busca expandida: qual variante casou ('original' | sinônimo | 'literal_fallback')
+}
+
+// /search_expand — busca semântica (cascata 📚 dicionários → 📖 cache → 🧠 IA; two_phase=false força a inferência)
+export interface SearchExpandResponse extends SearchResponse {
+  source?: string // 'phase1' | 'dict' | 'cache' | 'llm' | 'literal' | 'literal_fallback'
+  provider?: string
+  recall?: string
+  expansions?: string[]
+  dropped?: string[] // sinônimos fora do corpus deste escopo (não buscados)
+  absent?: boolean // nada da query ancora no corpus
+  did_you_mean?: string[]
+  needles?: string[]
 }

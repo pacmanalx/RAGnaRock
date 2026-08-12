@@ -1,16 +1,40 @@
 // Funções de API por domínio (molde Innova: um módulo fino sobre o client).
 import { ragd, nidhogg } from './client'
 import type {
-  Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, ThesaurusResponse,
-  ChunkResponse,
+  Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
+  ThesaurusResponse, ChunkResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
 export const getCollections = () => ragd.get<CollectionsResponse>('/collections')
 export const getDrivers = () => ragd.get<DriversResponse>('/drivers')
 export const getThesaurus = () => ragd.get<ThesaurusResponse>('/thesaurus')
-export const search = (query: string, k = 8) =>
-  ragd.post<SearchResponse>('/search', { base: '*', query, k })
+// Opções comuns de escopo da busca (mesmo contrato da aba Buscar do dashboard legado).
+export interface SearchOpts {
+  collection?: string // vazio = todas
+  base?: string // wildcard: 'sda' exata · 'sd*' prefixo · '*' todas
+  k?: number
+  phonetic?: boolean
+}
+const searchBody = (query: string, o: SearchOpts) => ({
+  base: o.base?.trim() || '*',
+  query,
+  k: o.k ?? 8,
+  phonetic: !!o.phonetic,
+  ...(o.collection ? { collection: o.collection } : {}),
+})
+
+// Léxico puro (silábico tf-idf + matched filter).
+export const search = (query: string, opts: SearchOpts = {}) =>
+  ragd.post<SearchResponse>('/search', searchBody(query, opts))
+
+// Semântico: expansão em cascata 📚 dicionários → 📖 cache → 🧠 IA. Com forceInfer,
+// two_phase=false — pula o atalho "léxico já foi forte" e SEMPRE roda a cascata.
+export const searchExpand = (query: string, opts: SearchOpts & { forceInfer?: boolean } = {}) =>
+  ragd.post<SearchExpandResponse>('/search_expand', {
+    ...searchBody(query, opts),
+    ...(opts.forceInfer ? { two_phase: false } : {}),
+  })
 
 // Um chunk (com before/after de contexto). Usado pela modal de inspeção.
 export const fetchChunk = (collection: string, base: string, id: number, before = 0, after = 0) =>
