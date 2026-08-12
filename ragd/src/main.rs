@@ -20,6 +20,7 @@ const DEFAULT_PORT: u16 = 11499;            // API
 const DEFAULT_DASH_PORT: u16 = 11498;       // dashboard / supervisório
 const DEFAULT_DRIVERS_DIR: &str = "drivers";
 const DEFAULT_INGESTORS_DIR: &str = "ingestors";   // [#9] drivers de ingestão (scripts shell, pinagem stdin→stdout)
+const DEFAULT_WEB_DIR: &str = "web/dist";          // [#33] dist/ do frontend React servido na porta dash
 const INGESTOR_TIMEOUT_S: u32 = 120;               // teto por driver de ingestão (via `timeout` coreutil)
 const DEFAULT_THESAURUS_DIR: &str = "thesaurus";
 const DEFAULT_RAGFILES_DIR: &str = "ragfiles";
@@ -61,6 +62,8 @@ struct State {
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão (scripts via shell)
     ragfiles_dir: String,
+    web_dir: String,         // [#33] dist/ do frontend React (servido na porta dash)
+    api_port: u16,           // [#33] porta da API pública (pra o dash proxiar /api/* → 127.0.0.1:api_port)
     max_upload: usize,
     started: Instant,
     admin_user: String,
@@ -91,6 +94,7 @@ struct Config {
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão
     ragfiles_dir: String,
+    web_dir: String,   // [#33] dist/ do frontend React servido na porta dash (11498)
     max_upload: usize,
     workers: usize,    // nº de workers do pool da API (0 = auto: nCPUs, clamp 2..16)
     autoload: bool,
@@ -118,6 +122,7 @@ impl Default for Config {
             drivers_dir: DEFAULT_DRIVERS_DIR.to_string(),
             ingestors_dir: DEFAULT_INGESTORS_DIR.to_string(),
             ragfiles_dir: DEFAULT_RAGFILES_DIR.to_string(),
+            web_dir: DEFAULT_WEB_DIR.to_string(),
             max_upload: DEFAULT_MAX_UPLOAD, workers: 0, autoload: true,
             admin_user: "admin".to_string(), admin_pass: "admin".to_string(),
             log_file: "/tmp/ragd-all.log".to_string(),
@@ -159,6 +164,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "dash_port"   => if let Ok(p) = v.parse() { cfg.dash_port = p },
             "drivers_dir" => cfg.drivers_dir = v.to_string(),
             "ingestors_dir" => cfg.ingestors_dir = v.to_string(),
+            "web_dir"     => cfg.web_dir = v.to_string(),
             "ragfiles_dir"=> cfg.ragfiles_dir = v.to_string(),
             "max_upload"  => if let Ok(n) = v.parse() { cfg.max_upload = n },
             "workers"     => if let Ok(n) = v.parse() { cfg.workers = n },
@@ -590,6 +596,7 @@ fn main() {
             "--dash-port" => cfg.dash_port = it.next().expect("--dash-port N").parse().expect("porta inválida"),
             "--drivers-dir" => cfg.drivers_dir = it.next().expect("--drivers-dir <path>").clone(),
             "--ingestors-dir" => cfg.ingestors_dir = it.next().expect("--ingestors-dir <path>").clone(),
+            "--web-dir" => cfg.web_dir = it.next().expect("--web-dir <path>").clone(),
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
             "--workers" => cfg.workers = it.next().expect("--workers N").parse().expect("--workers N"),
@@ -632,6 +639,7 @@ fn main() {
     let state = Arc::new(RwLock::new(State {
         bases, drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
         ragfiles_dir: cfg.ragfiles_dir.clone(),
+        web_dir: cfg.web_dir.clone(), api_port: cfg.api_port,
         max_upload, started: Instant::now(),
         admin_user: cfg.admin_user.clone(), admin_pass: cfg.admin_pass.clone(),
         dev: cfg.dev,
@@ -1622,9 +1630,127 @@ fn respond_json(req: Request, code: u16, payload: String, set_cookie: Option<&st
     let _ = req.respond(resp);
 }
 
+/// [#33] Console ValHalla = frontend React (dist/) + reverse-proxy pros backends, igual ao
+/// proxy do Vite em dev: `/api/*` → API pública (127.0.0.1:api_port), `/nidhogg/*` → nidhoggd,
+/// e todo o resto → estáticos do `web_dir` com SPA-fallback pro index.html. O dashboard.html
+/// legado fica preservado em `handle_dashboard_legacy` (molde de referência; NÃO servido).
+fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
+    let method = req.method().clone();
+    let full = req.url().to_string();
+    let (path, query) = match full.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (full, String::new()),
+    };
+    let mut body = Vec::new();
+    if method == Method::Post || method == Method::Put {
+        req.as_reader().take(1024 * 1024 * 1024).read_to_end(&mut body).ok();
+    }
+
+    // 1) /nidhogg/* → nidhoggd (mesma origem, sem CORS)
+    if path == "/nidhogg" || path.starts_with("/nidhogg/") {
+        let url = { state.read().nidhogg_url.clone() };
+        let rest = &path["/nidhogg".len()..];
+        proxy_pass(req, &method, &format!("{url}{rest}"), &query, &body);
+        return;
+    }
+    // 2) /api/* → API pública local (127.0.0.1:api_port)
+    if path == "/api" || path.starts_with("/api/") {
+        let port = { state.read().api_port };
+        let rest = &path["/api".len()..];
+        proxy_pass(req, &method, &format!("http://127.0.0.1:{port}{rest}"), &query, &body);
+        return;
+    }
+    // 3) estáticos do dist + SPA fallback
+    let web_dir = { state.read().web_dir.clone() };
+    serve_static(req, &path, &web_dir);
+}
+
+/// [#33] Reverse-proxy cru via curl: repassa método + body + status do upstream (localhost).
+/// Respostas dos backends são JSON, então devolvemos como JSON (respond_json).
+fn proxy_pass(req: Request, method: &Method, url: &str, query: &str, body: &[u8]) {
+    use std::io::Write;
+    let full = if query.is_empty() { url.to_string() } else { format!("{url}?{query}") };
+    const SEP: &str = "\n<<<RAGD_HTTP_STATUS>>>";
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-X", method.as_str(), "-m", "120", "-w", &format!("{SEP}%{{http_code}}"), &full]);
+    let has_body = !body.is_empty();
+    if has_body {
+        cmd.args(["-H", "Content-Type: application/json", "--data-binary", "@-"]);
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => { respond_json(req, 502, json!({"error": format!("proxy spawn: {e}")}).to_string(), None); return; }
+    };
+    if has_body {
+        if let Some(mut si) = child.stdin.take() { let _ = si.write_all(body); }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => { respond_json(req, 502, json!({"error": format!("proxy wait: {e}")}).to_string(), None); return; }
+    };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let (payload, code) = match raw.rsplit_once(SEP) {
+        Some((b, s)) => (b.to_string(), s.trim().parse::<u16>().unwrap_or(502)),
+        None => (raw.to_string(), if out.status.success() { 200 } else { 502 }),
+    };
+    respond_json(req, code, payload, None);
+}
+
+/// [#33] Serve um arquivo do `web_dir`; se não existir, cai no index.html (SPA-fallback do
+/// react-router). Bloqueia path traversal. Assets com hash ganham cache longo; index no-store.
+fn serve_static(req: Request, path: &str, web_dir: &str) {
+    let rel = path.trim_start_matches('/');
+    let candidate = if rel.is_empty() { "index.html".to_string() } else { rel.to_string() };
+    if Path::new(&candidate).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        respond_json(req, 400, json!({"error": "path inválido"}).to_string(), None);
+        return;
+    }
+    let base = Path::new(web_dir);
+    let file = base.join(&candidate);
+    let (bytes, ct) = if file.is_file() {
+        (std::fs::read(&file), mime_by_ext(&file))
+    } else {
+        (std::fs::read(base.join("index.html")), "text/html; charset=utf-8")
+    };
+    match bytes {
+        Ok(b) => {
+            let cache = if candidate.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-store" };
+            let resp = Response::from_data(b)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap())
+                .with_header(Header::from_bytes(&b"Cache-Control"[..], cache.as_bytes()).unwrap());
+            let _ = req.respond(resp);
+        }
+        Err(_) => respond_json(req, 404, json!({"error": "não encontrado (web_dir sem dist?)", "path": path}).to_string(), None),
+    }
+}
+
+fn mime_by_ext(p: &Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Servidor da porta de controle (ValHalla): serve o shell HTML (público — sem segredos)
 /// + endpoints /api/* atrás de SESSÃO POR COOKIE (login/logout reais). Reusa o motor da API.
-fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
+/// [#33] LEGADO — preservado como molde de referência; NÃO é mais servido (a nova
+/// handle_dashboard entrega o React). Mantido pra reaproveitar recursos das telas.
+#[allow(dead_code)]
+fn handle_dashboard_legacy(mut req: Request, state: &Arc<RwLock<State>>) {
     let method = req.method().clone();
     let full = req.url().to_string();
     let (path, query) = match full.split_once('?') {
@@ -3048,7 +3174,7 @@ fn help() {
 uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
        [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ingestors-dir {DEFAULT_INGESTORS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
-       [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
+       [--web-dir {DEFAULT_WEB_DIR}] [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
        [--preload nome=caminho.json ...]
 
   config: --config <arq>, senao /etc/ragnarock/ragnarock.cfg, senao ./ragnarock.cfg, senao defaults.

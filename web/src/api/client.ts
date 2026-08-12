@@ -1,0 +1,49 @@
+// Camada de API — molde Innova (fetch nativo tipado, sem axios/react-query), ADAPTADA pros
+// DOIS backends do RAGnaRock. `makeClient(baseUrl)` gera um cliente; exportamos um por backend.
+// Base URLs vêm de env (VITE_RAGD_URL / VITE_NIDHOGG_URL) — o "desacoplável no futuro".
+// Auth (JWT) fica pra depois: por ora só os GET/POST públicos do ragd, sem Authorization.
+
+export class HttpError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'HttpError'
+    this.status = status
+  }
+}
+
+export function messageFromError(e: unknown): string {
+  if (e instanceof HttpError) return `${e.status}: ${e.message}`
+  if (e instanceof Error) return e.message
+  return String(e)
+}
+
+type Json = Record<string, unknown>
+
+function makeClient(baseUrl: string) {
+  async function request<T>(method: string, path: string, body?: Json): Promise<T> {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const text = await res.text()
+    const data = text ? JSON.parse(text) : null
+    if (!res.ok) {
+      const msg = (data && (data.error as string)) || res.statusText
+      throw new HttpError(res.status, msg)
+    }
+    return data as T
+  }
+  return {
+    baseUrl,
+    get: <T>(path: string) => request<T>('GET', path),
+    post: <T>(path: string, body?: Json) => request<T>('POST', path, body),
+  }
+}
+
+const RAGD_URL = import.meta.env.VITE_RAGD_URL ?? '/api'
+const NIDHOGG_URL = import.meta.env.VITE_NIDHOGG_URL ?? '/nidhogg'
+
+export const ragd = makeClient(RAGD_URL)
+export const nidhogg = makeClient(NIDHOGG_URL)
