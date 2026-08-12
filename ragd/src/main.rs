@@ -1946,7 +1946,8 @@ fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, Strin
         (Method::Get, p) if p.starts_with("/bases/") && p[7..].contains('/') => {   // [#4]
             let rest = &p[7..];
             match rest.split_once('/') {
-                Some((coll, name)) => base_meta(coll, name, &state.bases),
+                // percent_decode: nome com espaço/acento chega %XX no path e dava 404
+                Some((coll, name)) => base_meta(&percent_decode(coll), &percent_decode(name), &state.bases),
                 None => (404, json!({"error": "uso: GET /bases/{coll}/{name}"}).to_string()),
             }
         }
@@ -1975,18 +1976,34 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         // [#9] /ingest_any = /ingest_upload + passo do driver de ingestão (mime|ext → script shell).
         (Method::Post, "/ingest_any") => ingest_upload(query, headers, body_bytes, state, true),
         (Method::Delete, p) if p.starts_with("/bases/") => {
-            let name = &p["/bases/".len()..];
+            // percent_decode: nome com espaço/acento chega %XX no path e dava 404
+            let name = percent_decode(&p["/bases/".len()..]);
             let coll = query_param(query, "collection").unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
-            if remove_base(&mut state.bases, &coll, name) {
-                (200, json!({"ok": true, "removed": name, "collection": coll,
+            if remove_base(&mut state.bases, &coll, &name) {
+                // ?purge=1 apaga também o JSON do disco (senão o autoload ressuscita a base
+                // no próximo boot) — mesmo contrato do DELETE /collections/{name}?purge=1.
+                let purge = query_param(query, "purge").map(|s| s == "true" || s == "1").unwrap_or(false);
+                let mut purged = false;
+                if purge {
+                    let f = Path::new(&state.ragfiles_dir).join(&coll)
+                        .join(format!("{}-tokenized.json", nfc(&name)));
+                    if f.exists() {
+                        if let Err(e) = std::fs::remove_file(&f) {
+                            return (500, json!({"error": format!("removida da memória mas falhou apagar {}: {e}", f.display()),
+                                                "removed": name, "collection": coll}).to_string());
+                        }
+                        purged = true;
+                    }
+                }
+                (200, json!({"ok": true, "removed": name, "collection": coll, "purged": purged,
                              "bases": total_bases(&state.bases)}).to_string())
             } else {
                 (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string())
             }
         }
         (Method::Delete, p) if p.starts_with("/collections/") => {                  // [#2]
-            let name = &p["/collections/".len()..];
-            drop_collection(name, query, state)
+            let name = percent_decode(&p["/collections/".len()..]);
+            drop_collection(&name, query, state)
         }
         _ => (404, json!({"error": "rota write não encontrada", "path": path}).to_string()),
     }
