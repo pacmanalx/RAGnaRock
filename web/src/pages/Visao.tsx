@@ -7,7 +7,7 @@ export function Visao() {
   const cols = useAsync(getCollections, [])
 
   return (
-    <div className="mx-auto max-w-6xl space-y-5">
+    <div className="space-y-5">
       <h1 className="text-lg font-semibold">Visão geral</h1>
 
       {health.error && <ErrorBox message={health.error} onRetry={health.reload} />}

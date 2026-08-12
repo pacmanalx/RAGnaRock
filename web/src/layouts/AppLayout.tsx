@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import {
   PanelLeftClose, PanelLeftOpen, Eye, Search, Upload, Puzzle, Activity, ScrollText,
-  Brain, ListTree, Network, Lightbulb, Users, ShieldCheck, ServerCog, SlidersHorizontal,
+  Brain, Boxes, ListTree, Network, Lightbulb, Users, ShieldCheck, ServerCog, SlidersHorizontal,
   ChevronDown, LogOut, Sun, Moon, type LucideIcon,
 } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
@@ -22,6 +22,7 @@ const NAV: { section: string; items: Item[] }[] = [
   ]},
   { section: 'Nidhogg', items: [
     { to: '/nidhogg', label: 'Visão geral', icon: Brain },
+    { to: '/nidhogg/miner', label: 'L0 · Minerador', icon: Boxes },
     { to: '/nidhogg/summary', label: 'L1 · Summary', icon: ListTree },
     { to: '/nidhogg/tree', label: 'L2 · KnowledgeTree', icon: Network },
     { to: '/nidhogg/gaps', label: 'L3 · Gaps & Propostas', icon: Lightbulb },
@@ -58,7 +59,6 @@ export function AppLayout() {
             {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
           </button>
           <span className="text-[15px] font-bold tracking-tight">⚔ ValHalla</span>
-          <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 text-[10px] text-[var(--color-muted)]">proto</span>
         </div>
 
         <div className="flex items-center gap-4 text-[12px] text-[var(--color-muted)]">

@@ -3,7 +3,7 @@ import { Panel } from '@/components/ui'
 // Abas ainda não modeladas — marcam o mapa da UI (o que vem por aí) sem fingir dado.
 export function Placeholder({ title, note }: { title: string; note: string }) {
   return (
-    <div className="mx-auto max-w-4xl space-y-5">
+    <div className="space-y-5">
       <h1 className="text-lg font-semibold">{title}</h1>
       <Panel>
         <div className="py-10 text-center">

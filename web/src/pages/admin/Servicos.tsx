@@ -14,7 +14,7 @@ export function Servicos() {
   ]
 
   return (
-    <div className="mx-auto max-w-4xl space-y-5">
+    <div className="space-y-5">
       <h1 className="text-lg font-semibold">Serviços do servidor</h1>
       {(ragd.loading || nid.loading) && <Spinner />}
       <Panel title="Daemons">

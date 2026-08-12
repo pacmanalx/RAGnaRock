@@ -70,7 +70,7 @@ function ConfigCard({ groups }: { groups: Group[] }) {
 
 export function Config() {
   return (
-    <div className="mx-auto max-w-5xl space-y-5">
+    <div className="space-y-5">
       <h1 className="text-lg font-semibold">Configuração</h1>
       <div className="grid gap-5 lg:grid-cols-2">
         <div className="space-y-3">

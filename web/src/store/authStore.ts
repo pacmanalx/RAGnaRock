@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
 // authStore — molde Innova. PLACEHOLDER: o JWT (access/refresh) entra aqui depois. Por ora
-// segura só a identidade exibida na topbar; o proto usa os endpoints públicos, sem token.
+// segura só a identidade exibida na topbar; a UI usa os endpoints públicos, sem token.
 export interface Usuario {
   login: string
   nome: string

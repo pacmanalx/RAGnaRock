@@ -28,7 +28,7 @@ export function Drivers() {
   const dicts = useAsync(getThesaurus, [])
 
   return (
-    <div className="mx-auto max-w-5xl space-y-4">
+    <div className="space-y-4">
       <h1 className="text-lg font-semibold">Drivers</h1>
 
       <div className="flex gap-1 border-b border-[var(--color-border)]">

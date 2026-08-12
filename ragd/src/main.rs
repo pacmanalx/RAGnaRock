@@ -1620,10 +1620,12 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
     (200, json!({"ok": true, "notes": notes, "reloaded": reload, "config": serde_json::from_str::<Value>(&config_json(st)).unwrap_or(Value::Null)}).to_string())
 }
 
-/// Responde JSON com status e (opcional) um Set-Cookie.
+/// Responde JSON com status e (opcional) um Set-Cookie. Respostas de API são dinâmicas —
+/// `no-store` impede o browser de servir dado velho (ex.: baixar um .md do cache após re-ingerir).
 fn respond_json(req: Request, code: u16, payload: String, set_cookie: Option<&str>) {
-    let mut resp = Response::from_string(payload).with_status_code(code).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap());
+    let mut resp = Response::from_string(payload).with_status_code(code)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap())
+        .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap());
     if let Some(c) = set_cookie {
         resp.add_header(Header::from_bytes(&b"Set-Cookie"[..], c.as_bytes()).unwrap());
     }

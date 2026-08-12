@@ -11,7 +11,7 @@ const PERFIS = [
 
 export function Perfis() {
   return (
-    <div className="mx-auto max-w-4xl space-y-5">
+    <div className="space-y-5">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">Perfis</h1>
         <button className="flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[13px] font-semibold text-[var(--color-accent-fg)] hover:opacity-90">

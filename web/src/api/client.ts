@@ -35,10 +35,25 @@ function makeClient(baseUrl: string) {
     }
     return data as T
   }
+  // POST com corpo BINÁRIO cru (upload de arquivo). O ragd /ingest_any lê os bytes do body e
+  // roteia o driver por MIME (contentType) ou pela extensão do ?filename=.
+  async function postRaw<T>(path: string, body: ArrayBuffer, contentType: string): Promise<T> {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType || 'application/octet-stream' },
+      body,
+    })
+    const text = await res.text()
+    const data = text ? JSON.parse(text) : null
+    if (!res.ok) throw new HttpError(res.status, (data && (data.error as string)) || res.statusText)
+    return data as T
+  }
+
   return {
     baseUrl,
     get: <T>(path: string) => request<T>('GET', path),
     post: <T>(path: string, body?: Json) => request<T>('POST', path, body),
+    postRaw,
   }
 }
 

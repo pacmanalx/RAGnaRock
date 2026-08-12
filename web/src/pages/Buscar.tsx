@@ -3,12 +3,14 @@ import { search } from '@/api/ragnarock'
 import type { SearchResponse } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
+import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
 
 export function Buscar() {
   const [q, setQ] = useState('Frodo Bolseiro')
   const [res, setRes] = useState<SearchResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [inspect, setInspect] = useState<ChunkTarget | null>(null)
 
   async function run(e?: React.FormEvent) {
     e?.preventDefault()
@@ -20,7 +22,7 @@ export function Buscar() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-5">
+    <div className="space-y-5">
       <h1 className="text-lg font-semibold">Buscar</h1>
 
       <form onSubmit={run} className="flex gap-2">
@@ -42,18 +44,25 @@ export function Buscar() {
         }>
           <div className="space-y-2">
             {res.hits.map((h) => (
-              <div key={`${h.base}-${h.chunk}`} className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
+              <button
+                key={`${h.base}-${h.chunk}`}
+                onClick={() => setInspect({ collection: h.collection, base: h.base, id: h.chunk })}
+                className="block w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-left transition-colors hover:border-[var(--color-accent)]"
+                title="abrir e navegar o documento chunk a chunk"
+              >
                 <div className="mb-1 flex items-center justify-between text-[11px] text-[var(--color-muted)]">
                   <span><span className="text-[var(--color-accent)]">{h.collection}</span> / {h.base} · chunk {h.chunk}</span>
                   <span className="tabular-nums">mf {h.matchpoint.toFixed(2)} · cos {h.cos.toFixed(3)}</span>
                 </div>
                 <div className="text-[13px] leading-relaxed">{h.snippet}</div>
-              </div>
+              </button>
             ))}
             {res.hits.length === 0 && <div className="text-[13px] text-[var(--color-muted)]">nada encontrado.</div>}
           </div>
         </Panel>
       )}
+
+      {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )
 }

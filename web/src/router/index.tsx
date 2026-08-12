@@ -2,6 +2,7 @@ import { createBrowserRouter } from 'react-router-dom'
 import { AppLayout } from '@/layouts/AppLayout'
 import { Visao } from '@/pages/Visao'
 import { Buscar } from '@/pages/Buscar'
+import { Ingestao } from '@/pages/Ingestao'
 import { Placeholder } from '@/pages/Placeholder'
 import { Perfis } from '@/pages/admin/Perfis'
 import { Usuarios } from '@/pages/admin/Usuarios'
@@ -17,9 +18,10 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <Visao /> },
       { path: 'buscar', element: <Buscar /> },
-      { path: 'ingestao', element: <Placeholder title="Ingestão" note="Upload multi-formato (pdf/docx/xlsx/csv) via /ingest_any." /> },
+      { path: 'ingestao', element: <Ingestao /> },
       { path: 'performance', element: <Placeholder title="Performance" note="Matched filter, ponto de convergência e histograma (heatmap)." /> },
       { path: 'nidhogg', element: <Placeholder title="Nidhogg — Visão geral" note="Estado da camada de inteligência: coleções, saturação, NQI." /> },
+      { path: 'nidhogg/miner', element: <Placeholder title="L0 · Minerador" note="Nível determinístico (zero-IA): agrupa os documentos por forma em clusters e aplica os moldes/templates. Os 3 pilares e a saturação." /> },
       { path: 'nidhogg/summary', element: <Placeholder title="L1 · Summary" note="Insights por coleção, com confiança visível." /> },
       { path: 'nidhogg/tree', element: <Placeholder title="L2 · KnowledgeTree" note="Grafo de relações sobre o dado normalizado." /> },
       { path: 'nidhogg/gaps', element: <Placeholder title="L3 · Gaps & Propostas" note="Fila das perguntas não-perguntadas." /> },

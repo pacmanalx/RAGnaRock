@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 
-// Primitivos mínimos do proto (cockpit denso). Serão trocados por Shadcn/design-system
+// Primitivos mínimos (cockpit denso). Serão trocados por Shadcn/design-system
 // quando a linguagem visual for definida — por ora, o suficiente pra modelar.
 
 export function Panel({ title, actions, children, className = '' }: {

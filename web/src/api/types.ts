@@ -53,6 +53,21 @@ export interface Dict {
   kind?: string
 }
 
+export interface ChunkData {
+  id: number
+  start: number
+  len: number
+  tokens: number
+  oov: number
+  norm: number
+  text: string | null
+}
+export interface ChunkResponse {
+  corpus?: string
+  n_chunks?: number
+  chunks: ChunkData[]
+}
+
 export interface SearchResponse {
   query: string
   query_syllables?: string
