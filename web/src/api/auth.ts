@@ -25,6 +25,9 @@ export const apiLogin = (login: string, password: string) =>
 export const apiRefresh = (refresh: string) =>
   ragd.post<{ access: string; expires_in: number }>('/refresh', { refresh })
 
+export const changePassword = (atual: string, nova: string) =>
+  ragd.post<{ ok: boolean }>('/auth/password', { atual, nova })
+
 export const getCaps = () => ragd.get<{ caps: string[] }>('/auth/caps')
 export const listPerfis = () => ragd.get<{ perfis: Perfil[] }>('/auth/perfis')
 export const upsertPerfil = (p: Perfil) => ragd.post<{ ok: boolean; perfil: Perfil }>('/auth/perfis', { ...p })

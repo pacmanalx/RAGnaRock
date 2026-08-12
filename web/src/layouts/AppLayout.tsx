@@ -3,8 +3,10 @@ import { NavLink, Outlet } from 'react-router-dom'
 import {
   PanelLeftClose, PanelLeftOpen, Eye, Search, Upload, Puzzle, Activity, ScrollText,
   Brain, Boxes, ListTree, Network, Lightbulb, Users, ShieldCheck, ServerCog, SlidersHorizontal,
-  ChevronDown, LogOut, Sun, Moon, type LucideIcon,
+  ChevronDown, LogOut, Sun, Moon, KeyRound, type LucideIcon,
 } from 'lucide-react'
+import { changePassword } from '@/api/auth'
+import { messageFromError } from '@/api/client'
 import { useAsync } from '@/hooks/useAsync'
 import { getNidhoggHealth } from '@/api/ragnarock'
 import { useUiStore } from '@/store/uiStore'
@@ -46,6 +48,7 @@ export function AppLayout() {
   const theme = useThemeStore((s) => s.theme)
   const toggleTheme = useThemeStore((s) => s.toggle)
   const [userMenu, setUserMenu] = useState(false)
+  const [pwOpen, setPwOpen] = useState(false)
 
   return (
     <div
@@ -91,6 +94,9 @@ export function AppLayout() {
                   <span className="text-[11px] text-[var(--color-accent)]">trocar</span>
                 </button>
                 <div className="my-1 border-t border-[var(--color-border)]" />
+                <button onClick={() => { setPwOpen(true); setUserMenu(false) }} className="flex w-full items-center gap-2 px-3 py-1.5 text-[13px] hover:bg-[var(--color-panel)]">
+                  <KeyRound size={14} /> Trocar senha
+                </button>
                 <button onClick={() => { logout(); setUserMenu(false) }} className="flex w-full items-center gap-2 px-3 py-1.5 text-[13px] hover:bg-[var(--color-panel)]">
                   <LogOut size={14} /> Sair
                 </button>
@@ -99,6 +105,8 @@ export function AppLayout() {
           </div>
         </div>
       </header>
+
+      {pwOpen && <TrocarSenhaModal onClose={() => setPwOpen(false)} />}
 
       {/* nav lateral colapsável */}
       <nav className="row-start-2 overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-panel)] py-3">
@@ -135,6 +143,63 @@ export function AppLayout() {
       <main className="row-start-2 overflow-y-auto p-5">
         <Outlet />
       </main>
+    </div>
+  )
+}
+
+// Modal de troca da PRÓPRIA senha (menu do usuário). Exige a senha atual —
+// não existe fluxo de "esqueci a senha" (decisão de produto): admin regrava.
+function TrocarSenhaModal({ onClose }: { onClose: () => void }) {
+  const [atual, setAtual] = useState('')
+  const [nova, setNova] = useState('')
+  const [confirma, setConfirma] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [ok, setOk] = useState(false)
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (busy) return
+    if (nova !== confirma) { setError('a confirmação não confere'); return }
+    if (nova.length < 6) { setError('a nova senha precisa de ao menos 6 caracteres'); return }
+    setBusy(true); setError(null)
+    try {
+      await changePassword(atual, nova)
+      setOk(true)
+      setTimeout(onClose, 1200)
+    } catch (err) { setError(messageFromError(err)) }
+    finally { setBusy(false) }
+  }
+
+  const inputCls = 'w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-[13px] outline-none focus:border-[var(--color-accent)]'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <form onSubmit={submit} onClick={(e) => e.stopPropagation()}
+        className="w-[320px] space-y-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-6">
+        <div className="text-[15px] font-semibold">Trocar senha</div>
+        <div>
+          <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">senha atual</div>
+          <input type="password" value={atual} onChange={(e) => setAtual(e.target.value)} autoFocus autoComplete="current-password" className={inputCls} />
+        </div>
+        <div>
+          <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">nova senha</div>
+          <input type="password" value={nova} onChange={(e) => setNova(e.target.value)} autoComplete="new-password" className={inputCls} />
+        </div>
+        <div>
+          <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">confirmar nova senha</div>
+          <input type="password" value={confirma} onChange={(e) => setConfirma(e.target.value)} autoComplete="new-password" className={inputCls} />
+        </div>
+        {error && <div className="text-[12px] text-[var(--color-crit)]">{error}</div>}
+        {ok && <div className="text-[12px] text-[var(--color-ok)]">senha trocada ✓</div>}
+        <div className="flex gap-2">
+          <button disabled={busy || !atual || !nova || !confirma}
+            className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-[13px] font-semibold text-[var(--color-accent-fg)] hover:opacity-90 disabled:opacity-50">
+            {busy ? 'trocando…' : 'trocar'}
+          </button>
+          <button type="button" onClick={onClose} className="rounded-md border border-[var(--color-border)] px-4 py-2 text-[13px] hover:bg-[var(--color-panel-2)]">cancelar</button>
+        </div>
+      </form>
     </div>
   )
 }

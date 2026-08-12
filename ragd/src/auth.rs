@@ -354,6 +354,34 @@ impl Auth {
                      "perfil": novo["perfil"], "ativo": novo["ativo"]}}).to_string())
     }
 
+    /// POST /auth/password — troca a PRÓPRIA senha (self-service, qualquer usuário logado).
+    /// Exige a senha atual; nada de fluxo de recuperação (decisão do Pacman: não existe).
+    pub fn password_change(&mut self, login: &str, body: &str) -> (u16, String) {
+        let v: Value = match serde_json::from_str(body) {
+            Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()),
+        };
+        let atual = v["atual"].as_str().unwrap_or("");
+        let nova = v["nova"].as_str().unwrap_or("");
+        if nova.chars().count() < 6 {
+            return (400, json!({"error": "a nova senha precisa de ao menos 6 caracteres"}).to_string());
+        }
+        let u = match self.usuario(login) {
+            Some(u) => u.clone(),
+            None => return (404, json!({"error": "usuário não existe"}).to_string()),
+        };
+        if !check_password(atual, u["salt"].as_str().unwrap_or(""), u["hash"].as_str().unwrap_or("")) {
+            return (401, json!({"error": "senha atual incorreta"}).to_string());
+        }
+        let (salt, hash) = hash_password(nova);
+        if let Some(us) = self.data["usuarios"].as_array_mut().unwrap()
+            .iter_mut().find(|x| x["login"].as_str() == Some(login)) {
+            us["salt"] = json!(salt);
+            us["hash"] = json!(hash);
+        }
+        self.save();
+        (200, json!({"ok": true, "login": login}).to_string())
+    }
+
     pub fn usuario_delete(&mut self, login: &str) -> (u16, String) {
         if self.eh_ultimo_admin(login) {
             return (409, json!({"error": "é o último usuário ativo com admin.usuarios — não pode ser removido"}).to_string());

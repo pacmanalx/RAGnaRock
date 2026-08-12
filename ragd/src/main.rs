@@ -1947,7 +1947,8 @@ fn is_write_route(method: &Method, path: &str) -> bool {
     matches!((method, path),
         (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
         | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any")
-        | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios"))  // [#33 JWT] CRUD muta o Auth
+        | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios")
+        | (Method::Post, "/auth/password"))  // [#33 JWT] CRUD/troca de senha mutam o Auth
     || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}, /auth/*
 }
 
@@ -2015,6 +2016,11 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         },
         (Method::Post, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
             Ok(_) => state.auth.usuario_upsert(body_str()), Err(e) => e,
+        },
+        // troca da PRÓPRIA senha: basta token válido (sub identifica quem)
+        (Method::Post, "/auth/password") => match auth::bearer_claims(headers, &state.auth.secret) {
+            Some(c) => { let sub = c["sub"].as_str().unwrap_or("").to_string(); state.auth.password_change(&sub, body_str()) }
+            None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
         },
         (Method::Delete, p) if p.starts_with("/auth/perfis/") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
             Ok(_) => { let n = percent_decode(&p["/auth/perfis/".len()..]); state.auth.perfil_delete(&n) }
