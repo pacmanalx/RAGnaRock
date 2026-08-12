@@ -19,6 +19,7 @@ import { Servicos } from '@/pages/admin/Servicos'
 import { Config } from '@/pages/admin/Config'
 import { Drivers } from '@/pages/admin/Drivers'
 import { Logs } from '@/pages/admin/Logs'
+import { NidhoggVisao } from '@/pages/nidhogg/Visao'
 
 // Router central único (molde Innova: rotas explícitas, não file-based).
 export const router = createBrowserRouter([
@@ -32,7 +33,7 @@ export const router = createBrowserRouter([
       { path: 'buscar', element: <Navigate to="/comando" replace /> }, // rota antiga
       { path: 'ingestao', element: <Ingestao /> },
       { path: 'performance', element: <Performance /> },
-      { path: 'nidhogg', element: <Placeholder title="Nidhogg — Visão geral" note="Estado da camada de inteligência: coleções, saturação, NQI." /> },
+      { path: 'nidhogg', element: <NidhoggVisao /> },
       { path: 'nidhogg/miner', element: <Placeholder title="L0 · Minerador" note="Nível determinístico (zero-IA): agrupa os documentos por forma em clusters e aplica os moldes/templates. Os 3 pilares e a saturação." /> },
       { path: 'nidhogg/summary', element: <Placeholder title="L1 · Summary" note="Insights por coleção, com confiança visível." /> },
       { path: 'nidhogg/tree', element: <Placeholder title="L2 · KnowledgeTree" note="Grafo de relações sobre o dado normalizado." /> },

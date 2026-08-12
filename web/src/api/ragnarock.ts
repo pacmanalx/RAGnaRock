@@ -4,6 +4,7 @@ import type {
   Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
   ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
   ConfigResponse, SetConfigResponse, IngestorsResponse,
+  NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -65,6 +66,17 @@ export const getNidhoggStatus = () => nidhogg.get<NidhoggStatus>('/api/nidhogg')
 export const setNidhogg = (cfg: { on?: boolean; level?: number; cadence?: number }) =>
   nidhogg.post<NidhoggStatus>('/api/nidhogg', { ...cfg })
 export const runNidhoggCycle = () => nidhogg.post<{ ok: boolean; started?: boolean; note?: string }>('/api/nidhogg/run')
+
+// ── Nidhogg: visão geral (leituras + habilitar coleção) ──
+export const getNidhoggCollections = () => nidhogg.get<{ collections: NidhoggCollection[] }>('/api/nidhogg/collections')
+export const getNidhoggClasses = (coll?: string) =>
+  nidhogg.get<NidhoggClassesSummary>(`/api/nidhogg/classes${coll ? `?collection=${encodeURIComponent(coll)}` : ''}`)
+export const getNidhoggEntities = () => nidhogg.get<NidhoggEntitiesSummary>('/api/nidhogg/entities')
+export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string, unknown> }>('/api/nidhogg/templates')
+export const getNidhoggRejeitados = () => nidhogg.get<NidhoggRejeitados>('/api/nidhogg/rejeitados')
+// liga/desliga o ACESSO do worm a uma coleção (não re-mastiga a mesma N vezes)
+export const toggleNidhoggCollection = (collection: string, enabled: boolean) =>
+  nidhogg.post<{ ok: boolean }>('/api/nidhogg/collection', { collection, enabled })
 
 // ── tela Logs (guard admin.servicos no backend) ──
 export const getLogs = (n = 300) => ragd.get<{ file: string; log: string }>(`/logs?n=${n}`)

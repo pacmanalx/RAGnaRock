@@ -134,6 +134,35 @@ export interface NidhoggStatus {
   ragd_online: boolean
 }
 
+// ── Nidhogg: leituras da visão geral ──
+export interface NidhoggCollection {
+  collection: string
+  bases: number
+  chunks: number | null
+  enabled: boolean
+  saturation: number
+  updated: string
+  has_knowledge: boolean
+}
+export interface NidhoggClassesSummary {
+  collection: string
+  count: number
+  naturezas: Record<string, number>
+  tipos: Record<string, number>
+  bases: { collection: string; name: string; natureza: string; tipo: string; csv: number; origem: string; confianca: number; classified_at: string }[]
+}
+export interface NidhoggEntitiesSummary {
+  count: number
+  nqi_global: number
+  por_base: { collection: string; base: string; tipo: string; modo: string; nqi: number; c: number }[]
+  por_tipo: { tipo: string; modo: string; nqi: number; c: number; bases: number }[]
+}
+export interface NidhoggRejeitados {
+  count: number
+  por_motivo: Record<string, number>
+  rejeitados: { collection: string; base: string; natureza: string; tipo: string; motivo: string; nqi: number | null }[]
+}
+
 // POST /histogram — visualização do hit #1: matched filter + embedding × query (tela Performance)
 export interface MfTerm {
   term: string
