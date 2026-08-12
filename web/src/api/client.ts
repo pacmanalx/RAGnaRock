@@ -26,6 +26,11 @@ let accessToken: string | null = null
 export function setAuthToken(t: string | null) { accessToken = t }
 export function getAuthToken() { return accessToken }
 
+// [JWT] handler de 401: o authStore registra o renovar() aqui — em access expirado o
+// client renova e repete a request UMA vez, transparente (padrão Innova).
+let onUnauthorized: (() => Promise<boolean>) | null = null
+export function setUnauthorizedHandler(h: () => Promise<boolean>) { onUnauthorized = h }
+
 // Respostas de API nunca devem cachear (o server já manda no-store; isto reforça contra
 // caches teimosos): URL única por request + cache:'no-store' no fetch.
 function bust(path: string): string {
@@ -33,7 +38,7 @@ function bust(path: string): string {
 }
 
 function makeClient(baseUrl: string) {
-  async function request<T>(method: string, path: string, body?: Json): Promise<T> {
+  async function request<T>(method: string, path: string, body?: Json, retried = false): Promise<T> {
     const headers: Record<string, string> = {}
     if (body) headers['Content-Type'] = 'application/json'
     if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`
@@ -46,6 +51,10 @@ function makeClient(baseUrl: string) {
     const text = await res.text()
     const data = text ? JSON.parse(text) : null
     if (!res.ok) {
+      // access expirado → renova pelo refresh e repete UMA vez (não no /login|/refresh)
+      if (res.status === 401 && !retried && onUnauthorized && !path.startsWith('/login') && !path.startsWith('/refresh')) {
+        if (await onUnauthorized()) return request<T>(method, path, body, true)
+      }
       const msg = (data && (data.error as string)) || res.statusText
       throw new HttpError(res.status, msg)
     }

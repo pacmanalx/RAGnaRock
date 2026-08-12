@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { setAuthToken } from '@/api/client'
+import { setAuthToken, setUnauthorizedHandler } from '@/api/client'
 import { apiLogin, apiRefresh } from '@/api/auth'
 
 // authStore — JWT real. Access curto (15min) renovado pelo refresh (session_ttl do
@@ -61,10 +61,18 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'valhalla-auth',
+      // v1 = era do JWT. Estado persistido de versão anterior (o placeholder pré-logado
+      // SEM token) é descartado — senão rehidrata "autenticado" e toda chamada dá 401.
+      version: 1,
+      migrate: () => ({ usuario: null, access: null, refresh: null, isAuthenticated: false }),
       onRehydrateStorage: () => (state) => {
-        // re-injeta o token no client após reload; access curto → renova em background
-        if (state?.access) { setAuthToken(state.access); void state.renovar() }
+        if (!state) return
+        if (state.access) { setAuthToken(state.access); void state.renovar() }
+        else if (state.isAuthenticated) state.logout() // estado inconsistente: "logado" sem token
       },
     },
   ),
 )
+
+// 401 em qualquer chamada → tenta renovar o access UMA vez e repete (client re-injeta).
+setUnauthorizedHandler(() => useAuthStore.getState().renovar())
