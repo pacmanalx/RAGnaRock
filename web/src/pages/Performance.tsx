@@ -52,7 +52,7 @@ interface PerfStats { avg: number; p50: number; min: number; max: number; n: num
 export function Performance() {
   const cols = useAsync(getCollections, [])
   const theme = useThemeStore((s) => s.theme)
-  const [q, setQ] = useState('cálculo de média do aluno')
+  const [q, setQ] = useState('cláusula de rescisão do contrato')
   const [coll, setColl] = useState('')
   const [reps, setReps] = useState(30)
   const [stats, setStats] = useState<PerfStats | null>(null)

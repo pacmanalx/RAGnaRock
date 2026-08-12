@@ -129,7 +129,7 @@ export function Comando() {
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={onKeyDown}
               rows={3}
-              placeholder={'ex: cálculo de média do aluno\ncole aqui um parágrafo inteiro pra buscar por similaridade…'}
+              placeholder={'ex: cláusula de rescisão do contrato\ncole aqui um parágrafo inteiro pra buscar por similaridade…'}
               className={`w-full resize-y ${inputCls} text-[14px]`}
             />
           </div>
