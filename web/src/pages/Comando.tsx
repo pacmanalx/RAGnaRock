@@ -130,8 +130,8 @@ export function Comando() {
             <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">base (wildcard)</div>
             <input value={base} onChange={(e) => setBase(e.target.value)} className={`w-[130px] ${inputCls}`} />
           </div>
-          <div>
-            <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">k</div>
+          <div title="top-K: quantos resultados o motor devolve (os K chunks mais bem rankeados)">
+            <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">resultados</div>
             <input
               type="number" min={1} max={50} value={k}
               onChange={(e) => setK(Math.max(1, +e.target.value || 8))}
