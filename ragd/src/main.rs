@@ -1662,6 +1662,11 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (full, String::new()),
     };
+    // [#33 JWT] o Bearer TEM que atravessar o proxy — sem isto a API vê a request sem
+    // token e o guard devolve 401 mesmo com o usuário logado.
+    let auth_hdr: Option<String> = req.headers().iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+        .map(|h| h.value.as_str().to_string());
     let mut body = Vec::new();
     if method == Method::Post || method == Method::Put {
         req.as_reader().take(1024 * 1024 * 1024).read_to_end(&mut body).ok();
@@ -1671,14 +1676,14 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     if path == "/nidhogg" || path.starts_with("/nidhogg/") {
         let url = { state.read().nidhogg_url.clone() };
         let rest = &path["/nidhogg".len()..];
-        proxy_pass(req, &method, &format!("{url}{rest}"), &query, &body);
+        proxy_pass(req, &method, &format!("{url}{rest}"), &query, &body, auth_hdr.as_deref());
         return;
     }
     // 2) /api/* → API pública local (127.0.0.1:api_port)
     if path == "/api" || path.starts_with("/api/") {
         let port = { state.read().api_port };
         let rest = &path["/api".len()..];
-        proxy_pass(req, &method, &format!("http://127.0.0.1:{port}{rest}"), &query, &body);
+        proxy_pass(req, &method, &format!("http://127.0.0.1:{port}{rest}"), &query, &body, auth_hdr.as_deref());
         return;
     }
     // 3) estáticos do dist + SPA fallback
@@ -1688,12 +1693,15 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
 
 /// [#33] Reverse-proxy cru via curl: repassa método + body + status do upstream (localhost).
 /// Respostas dos backends são JSON, então devolvemos como JSON (respond_json).
-fn proxy_pass(req: Request, method: &Method, url: &str, query: &str, body: &[u8]) {
+fn proxy_pass(req: Request, method: &Method, url: &str, query: &str, body: &[u8], auth: Option<&str>) {
     use std::io::Write;
     let full = if query.is_empty() { url.to_string() } else { format!("{url}?{query}") };
     const SEP: &str = "\n<<<RAGD_HTTP_STATUS>>>";
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-X", method.as_str(), "-m", "120", "-w", &format!("{SEP}%{{http_code}}"), &full]);
+    if let Some(a) = auth {
+        cmd.args(["-H", &format!("Authorization: {a}")]);   // [#33 JWT] Bearer atravessa o proxy
+    }
     let has_body = !body.is_empty();
     if has_body {
         cmd.args(["-H", "Content-Type: application/json", "--data-binary", "@-"]);
