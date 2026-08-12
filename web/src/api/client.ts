@@ -20,10 +20,17 @@ export function messageFromError(e: unknown): string {
 
 type Json = Record<string, unknown>
 
+// Respostas de API nunca devem cachear (o server já manda no-store; isto reforça contra
+// caches teimosos): URL única por request + cache:'no-store' no fetch.
+function bust(path: string): string {
+  return `${path}${path.includes('?') ? '&' : '?'}_cb=${Date.now()}`
+}
+
 function makeClient(baseUrl: string) {
   async function request<T>(method: string, path: string, body?: Json): Promise<T> {
-    const res = await fetch(`${baseUrl}${path}`, {
+    const res = await fetch(`${baseUrl}${bust(path)}`, {
       method,
+      cache: 'no-store',
       headers: body ? { 'Content-Type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
     })
@@ -38,8 +45,9 @@ function makeClient(baseUrl: string) {
   // POST com corpo BINÁRIO cru (upload de arquivo). O ragd /ingest_any lê os bytes do body e
   // roteia o driver por MIME (contentType) ou pela extensão do ?filename=.
   async function postRaw<T>(path: string, body: ArrayBuffer, contentType: string): Promise<T> {
-    const res = await fetch(`${baseUrl}${path}`, {
+    const res = await fetch(`${baseUrl}${bust(path)}`, {
       method: 'POST',
+      cache: 'no-store',
       headers: { 'Content-Type': contentType || 'application/octet-stream' },
       body,
     })

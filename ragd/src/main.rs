@@ -38,8 +38,16 @@ const DEFAULT_COLLECTION: &str = "default";
 /// `<name>-tokenized.json` vira dotfile e SOME do glob de preload `*/*-tokenized.json`
 /// (foi o caso dos `.vscode/` na ingestão do Eduxe_Microservices).
 fn safe_name(n: &str) -> String {
-    let s = n.trim_start_matches('.').trim();
-    if s.is_empty() { "base".to_string() } else { s.to_string() }
+    let s = nfc(n.trim_start_matches('.').trim());
+    if s.is_empty() { "base".to_string() } else { s }
+}
+
+/// [#33] Normaliza pra NFC (Unicode canonical composition). O macOS grava/entrega nomes de
+/// arquivo em NFD (decomposto: "ç" = c + cedilha combinante); sem isto, a forma NFD e a NFC
+/// do mesmo nome viram CHAVES diferentes no HashMap de bases — duas bases pro mesmo documento.
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
 }
 
 /// Mapa de bases agrupadas por coleção: collection -> name -> RagBase.
@@ -450,18 +458,18 @@ fn tail_lines(path: &str, n: usize) -> String {
 fn total_bases(b: &Bases) -> usize { b.values().map(|m| m.len()).sum() }
 
 fn get_base<'a>(b: &'a Bases, coll: &str, name: &str) -> Option<&'a RagBase> {
-    b.get(coll)?.get(name)
+    b.get(coll)?.get(&nfc(name))
 }
 
 fn insert_base(b: &mut Bases, coll: &str, name: String, base: RagBase) {
-    b.entry(coll.to_string()).or_default().insert(name, base);
+    b.entry(coll.to_string()).or_default().insert(nfc(&name), base);
 }
 
 /// [#13] OOM guard: recusa um ingest que criaria uma base NOVA além do teto `max_bases`
 /// (0 = sem limite). Sobrescrever/append de base já existente não conta como nova.
 fn base_count_cap_ok(b: &Bases, coll: &str, name: &str, max_bases: usize) -> Result<(), String> {
     if max_bases == 0 { return Ok(()); }
-    let exists = b.get(coll).map(|m| m.contains_key(name)).unwrap_or(false);
+    let exists = b.get(coll).map(|m| m.contains_key(&nfc(name))).unwrap_or(false);
     if !exists && total_bases(b) >= max_bases {
         return Err(format!("limite de {max_bases} bases atingido (max_bases no cfg) — \
                             remova bases ou aumente o teto"));
@@ -539,7 +547,7 @@ fn autoload_ragfiles(dir: &str, bases: &mut Bases) {
 }
 
 fn remove_base(b: &mut Bases, coll: &str, name: &str) -> bool {
-    let removed = b.get_mut(coll).and_then(|m| m.remove(name)).is_some();
+    let removed = b.get_mut(coll).and_then(|m| m.remove(&nfc(name))).is_some();
     // se a coleção ficou vazia, descarta a entrada também (sem coleções fantasmas)
     if removed {
         if let Some(m) = b.get(coll) {
