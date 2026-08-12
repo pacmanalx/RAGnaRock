@@ -2,7 +2,7 @@
 import { ragd, nidhogg } from './client'
 import type {
   Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
-  ThesaurusResponse, ChunkResponse, HistogramResponse,
+  ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -49,6 +49,13 @@ export const fetchDocument = (collection: string, base: string, nChunks: number)
   ragd.post<ChunkResponse>('/chunk', { collection, base, id: 0, before: 0, after: Math.max(0, nChunks - 1) })
 
 export const getNidhoggHealth = () => nidhogg.get<NidhoggHealth>('/health')
+
+// ── tela Serviços: telemetria + controle dos daemons ──
+export const getStats = () => ragd.get<StatsResponse>('/stats')
+export const getNidhoggStatus = () => nidhogg.get<NidhoggStatus>('/api/nidhogg')
+export const setNidhogg = (cfg: { on?: boolean; level?: number; cadence?: number }) =>
+  nidhogg.post<NidhoggStatus>('/api/nidhogg', { ...cfg })
+export const runNidhoggCycle = () => nidhogg.post<{ ok: boolean; started?: boolean; note?: string }>('/api/nidhogg/run')
 
 // [#9] Resultado do POST /ingest_any (upload → driver → base tokenizada).
 export interface IngestResult {

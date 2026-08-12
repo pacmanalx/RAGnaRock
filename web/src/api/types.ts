@@ -53,6 +53,46 @@ export interface Dict {
   kind?: string
 }
 
+// GET /stats do ragd — telemetria do daemon (tela Serviços)
+export interface StatsResponse {
+  version: string
+  uptime_secs: number
+  collections: number
+  bases: number
+  chunks: number
+  drivers: number
+  dicts_active: number
+  word_syn_entries: number
+  ragfiles_dir: string
+  collections_detail: { collection: string; bases: number; chunks: number }[]
+  mem: {
+    storage: string
+    rss_mb: number
+    sys_total_mb: number
+    sys_avail_mb: number
+    est_text_mb?: number
+    est_vec_mb?: number
+    est_words_mb?: number
+  }
+}
+
+// GET /api/nidhogg — status completo + catálogo de níveis (tela Serviços controla via POST)
+export interface NidhoggLevel { n: number; name: string; ia: boolean; desc: string }
+export interface NidhoggStatus {
+  module: string
+  version: string
+  uptime_secs: number
+  on: boolean
+  level: number
+  level_name: string
+  levels: NidhoggLevel[]
+  needs_ia: boolean
+  cadence_secs: number
+  cycle_running: boolean
+  last_cycle?: string | null
+  ragd_online: boolean
+}
+
 // POST /histogram — visualização do hit #1: matched filter + embedding × query (tela Performance)
 export interface MfTerm {
   term: string
