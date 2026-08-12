@@ -3,6 +3,7 @@ import { ragd, nidhogg } from './client'
 import type {
   Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
   ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
+  ConfigResponse, SetConfigResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -56,6 +57,12 @@ export const getNidhoggStatus = () => nidhogg.get<NidhoggStatus>('/api/nidhogg')
 export const setNidhogg = (cfg: { on?: boolean; level?: number; cadence?: number }) =>
   nidhogg.post<NidhoggStatus>('/api/nidhogg', { ...cfg })
 export const runNidhoggCycle = () => nidhogg.post<{ ok: boolean; started?: boolean; note?: string }>('/api/nidhogg/run')
+
+// ── tela Configuração (guard admin.config no backend) ──
+export const getConfig = () => ragd.get<ConfigResponse>('/config')
+export const setConfig = (patch: Record<string, unknown>) => ragd.post<SetConfigResponse>('/config', patch)
+export const testProvider = (provider: string) =>
+  ragd.post<{ provider: string; ok: boolean; message: string }>('/config/test_provider', { provider })
 
 // [#9] Resultado do POST /ingest_any (upload → driver → base tokenizada).
 export interface IngestResult {

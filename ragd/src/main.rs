@@ -1509,7 +1509,15 @@ fn module_proxy(url: &str, post_body: Option<&str>, timeout_secs: u32) -> (u16, 
     }
 }
 
-/// GET /api/config — estado da configuração (chaves mascaradas, nunca o valor cru).
+/// Mascara uma chave de API pra exibição: só os 4 últimos chars ("…abcd").
+fn mask_key(k: &str) -> String {
+    if k.is_empty() { return String::new(); }
+    let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{tail}")
+}
+
+/// GET /config — estado da configuração. Chaves SEMPRE mascaradas (o valor cru nunca
+/// sai do daemon — o legado devolvia cru atrás do cookie; corrigido na promoção pra 11499).
 fn config_json(st: &State) -> String {
     let hybrid = !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed);
     json!({
@@ -1517,12 +1525,14 @@ fn config_json(st: &State) -> String {
         "config_path": st.config_path,
         "drivers_dir": st.drivers_dir, "ingestors_dir": st.ingestors_dir, "ragfiles_dir": st.ragfiles_dir,
         "max_upload_mb": st.max_upload / (1024 * 1024),
-        "admin_user": st.admin_user,
-        "admin_is_default": is_default_creds(&st.admin_user, &st.admin_pass),
+        "max_bases": st.max_bases, "max_chunks_per_base": st.max_chunks_per_base,
+        "session_ttl": st.session_ttl,
         "dev_mode": st.dev,
-        "anthropic_key_set": !st.anthropic_key.is_empty(), "anthropic_key": st.anthropic_key,
-        "openai_key_set": !st.openai_key.is_empty(), "openai_key": st.openai_key,
+        "anthropic_key_set": !st.anthropic_key.is_empty(), "anthropic_key_masked": mask_key(&st.anthropic_key),
+        "openai_key_set": !st.openai_key.is_empty(), "openai_key_masked": mask_key(&st.openai_key),
         "active_provider": st.active_provider,
+        "local_url": st.local_url,
+        "nidhogg_url": st.nidhogg_url,
         "cache_dir": st.cache_dir,
         "expansions_entries": st.expansions.read().len(),
         "thesaurus_dir": st.thesaurus_dir,
@@ -1617,7 +1627,15 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
         if st.active_provider == "openai" { st.active_provider = "none".into(); set_cfg_key(&st.config_path, "active_provider", "none"); }
         notes.push("openai_key removida".into());
     }
-    // SÓ UM provider ativo por vez: ativar um desativa o outro
+    if let Some(u) = v["local_url"].as_str() { let u = u.trim(); if !u.is_empty() {
+        st.local_url = u.to_string(); set_cfg_key(&st.config_path, "local_url", u);
+        notes.push(format!("local_url → {u}"));
+    }}
+    if let Some(t) = v["session_ttl"].as_u64() { if t >= 60 {
+        st.session_ttl = t; set_cfg_key(&st.config_path, "session_ttl", &t.to_string());
+        notes.push(format!("session_ttl → {t}s (vale pros próximos logins)"));
+    } else { return (400, json!({"error": "session_ttl mínimo: 60s"}).to_string()); }}
+    // SÓ UM provider ativo por vez: ativar um desativa os outros
     if let Some(p) = v["active_provider"].as_str() {
         let p = p.to_lowercase();
         match p.as_str() {
@@ -1626,9 +1644,15 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
                 let has = if p == "anthropic" { !st.anthropic_key.is_empty() } else { !st.openai_key.is_empty() };
                 if !has { return (400, json!({"error": format!("não dá pra ativar '{p}': chave não cadastrada")}).to_string()); }
                 st.active_provider = p.clone(); set_cfg_key(&st.config_path, "active_provider", &p);
-                notes.push(format!("provider ativo → {p} (o outro fica inativo)"));
+                notes.push(format!("provider ativo → {p} (os outros ficam inativos)"));
             }
-            _ => return (400, json!({"error": "active_provider deve ser none|anthropic|openai"}).to_string()),
+            // "local" = llama-server OpenAI-compat (sem chave); só exige local_url configurada
+            "local" => {
+                if st.local_url.trim().is_empty() { return (400, json!({"error": "não dá pra ativar 'local': local_url vazia"}).to_string()); }
+                st.active_provider = "local".into(); set_cfg_key(&st.config_path, "active_provider", "local");
+                notes.push(format!("provider ativo → local ({})", st.local_url));
+            }
+            _ => return (400, json!({"error": "active_provider deve ser none|anthropic|openai|local"}).to_string()),
         }
     }
     if reload {
@@ -1948,7 +1972,8 @@ fn is_write_route(method: &Method, path: &str) -> bool {
         (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
         | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any")
         | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios")
-        | (Method::Post, "/auth/password"))  // [#33 JWT] CRUD/troca de senha mutam o Auth
+        | (Method::Post, "/auth/password")   // [#33 JWT] CRUD/troca de senha mutam o Auth
+        | (Method::Post, "/config"))         // [#33] set_config muta o State (chaves/storage/ttl)
     || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}, /auth/*
 }
 
@@ -1969,6 +1994,21 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
                         "perfil": c["perfil"], "caps": c["caps"], "colls": c["colls"]},
                         "exp": c["exp"]}).to_string()),
             None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
+        },
+        // ── [#33] configuração do daemon (guard: admin.config; chaves saem mascaradas) ──
+        (Method::Get, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => (200, config_json(state)), Err(e) => e,
+        },
+        // testa a chave CADASTRADA do provider com chamada real (lista de modelos)
+        (Method::Post, "/config/test_provider") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => {
+                let v: Value = serde_json::from_str(body_str()).unwrap_or(Value::Null);
+                let p = v["provider"].as_str().unwrap_or("");
+                let key = match p { "anthropic" => state.anthropic_key.clone(), "openai" => state.openai_key.clone(), _ => String::new() };
+                let (ok, msg) = test_provider_key(p, &key);
+                (200, json!({"provider": p, "ok": ok, "message": msg}).to_string())
+            }
+            Err(e) => e,
         },
         (Method::Get, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
             Ok(_) => state.auth.perfis_json(), Err(e) => e,
@@ -2016,6 +2056,10 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         },
         (Method::Post, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
             Ok(_) => state.auth.usuario_upsert(body_str()), Err(e) => e,
+        },
+        // configuração do daemon (persiste no cfg; guard admin.config)
+        (Method::Post, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => set_config(body_str(), state), Err(e) => e,
         },
         // troca da PRÓPRIA senha: basta token válido (sub identifica quem)
         (Method::Post, "/auth/password") => match auth::bearer_claims(headers, &state.auth.secret) {

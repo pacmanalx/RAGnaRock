@@ -76,6 +76,38 @@ export interface StatsResponse {
   }
 }
 
+// GET /config do ragd — configuração do daemon (chaves mascaradas; tela Configuração)
+export interface ConfigResponse {
+  storage: string
+  config_path: string
+  drivers_dir: string
+  ingestors_dir: string
+  ragfiles_dir: string
+  max_upload_mb: number
+  max_bases: number
+  max_chunks_per_base: number
+  session_ttl: number
+  dev_mode: boolean
+  anthropic_key_set: boolean
+  anthropic_key_masked: string
+  openai_key_set: boolean
+  openai_key_masked: string
+  active_provider: string
+  local_url: string
+  nidhogg_url: string
+  cache_dir: string
+  expansions_entries: number
+  thesaurus_dir: string
+  dicts_active: number
+  word_syn_entries: number
+}
+export interface SetConfigResponse {
+  ok: boolean
+  notes: string[]
+  reloaded: boolean
+  config: ConfigResponse
+}
+
 // GET /api/nidhogg — status completo + catálogo de níveis (tela Serviços controla via POST)
 export interface NidhoggLevel { n: number; name: string; ia: boolean; desc: string }
 export interface NidhoggStatus {
