@@ -1,5 +1,13 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom'
 import { AppLayout } from '@/layouts/AppLayout'
+import { Login } from '@/pages/Login'
+import { useAuthStore } from '@/store/authStore'
+
+// Guard de rota: sem JWT → /login. As caps finas ficam por tela (hasCap).
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const ok = useAuthStore((s) => s.isAuthenticated)
+  return ok ? <>{children}</> : <Navigate to="/login" replace />
+}
 import { Visao } from '@/pages/Visao'
 import { Comando } from '@/pages/Comando'
 import { Ingestao } from '@/pages/Ingestao'
@@ -13,9 +21,10 @@ import { Drivers } from '@/pages/admin/Drivers'
 
 // Router central único (molde Innova: rotas explícitas, não file-based).
 export const router = createBrowserRouter([
+  { path: '/login', element: <Login /> },
   {
     path: '/',
-    element: <AppLayout />,
+    element: <RequireAuth><AppLayout /></RequireAuth>,
     children: [
       { index: true, element: <Visao /> },
       { path: 'comando', element: <Comando /> },

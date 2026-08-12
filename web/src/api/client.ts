@@ -20,6 +20,12 @@ export function messageFromError(e: unknown): string {
 
 type Json = Record<string, unknown>
 
+// [JWT] token de acesso corrente — o authStore seta no login/logout/rehidratação.
+// Fica aqui (module-level) pra evitar ciclo client ↔ store.
+let accessToken: string | null = null
+export function setAuthToken(t: string | null) { accessToken = t }
+export function getAuthToken() { return accessToken }
+
 // Respostas de API nunca devem cachear (o server já manda no-store; isto reforça contra
 // caches teimosos): URL única por request + cache:'no-store' no fetch.
 function bust(path: string): string {
@@ -28,10 +34,13 @@ function bust(path: string): string {
 
 function makeClient(baseUrl: string) {
   async function request<T>(method: string, path: string, body?: Json): Promise<T> {
+    const headers: Record<string, string> = {}
+    if (body) headers['Content-Type'] = 'application/json'
+    if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`
     const res = await fetch(`${baseUrl}${bust(path)}`, {
       method,
       cache: 'no-store',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     })
     const text = await res.text()
@@ -61,6 +70,7 @@ function makeClient(baseUrl: string) {
     baseUrl,
     get: <T>(path: string) => request<T>('GET', path),
     post: <T>(path: string, body?: Json) => request<T>('POST', path, body),
+    del: <T>(path: string) => request<T>('DELETE', path),
     postRaw,
   }
 }
