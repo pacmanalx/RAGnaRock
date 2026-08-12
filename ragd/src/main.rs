@@ -562,18 +562,24 @@ fn remove_base(b: &mut Bases, coll: &str, name: &str) -> bool {
 /// - `base_pat = "sda"` exata; `"sd*"` prefixo; `"*"` todas
 /// Devolve lista de (coll, name) ordenada por (coll, name).
 fn resolve_scope(b: &Bases, coll_pat: Option<&str>, base_pat: &str) -> Vec<(String, String)> {
+    // Casamento CASE-INSENSITIVE + NFC: nome de base/coleção é identificador humano
+    // (vem de nome de arquivo, é digitado de memória) — "contrato*" tem que achar
+    // "Contrato de Locação…". A chave armazenada preserva a caixa; só a COMPARAÇÃO dobra.
+    let fold = |s: &str| nfc(s).to_lowercase();
     let mut out = vec![];
     let colls: Vec<&String> = match coll_pat {
         None | Some("*") => b.keys().collect(),
-        Some(exact) => b.keys().filter(|k| k.as_str() == exact).collect(),
+        Some(pat) => { let fp = fold(pat); b.keys().filter(|k| fold(k) == fp).collect() }
     };
-    let base_prefix = base_pat.strip_suffix('*');
+    let bp = fold(base_pat);
+    let base_prefix = bp.strip_suffix('*').map(|p| p.to_string());
     for c in colls {
         if let Some(inner) = b.get(c) {
             for n in inner.keys() {
-                let ok = base_pat == "*"
-                    || base_prefix.map(|p| n.starts_with(p)).unwrap_or(false)
-                    || n == base_pat;
+                let nf = fold(n);
+                let ok = bp == "*"
+                    || base_prefix.as_deref().map(|p| nf.starts_with(p)).unwrap_or(false)
+                    || nf == bp;
                 if ok { out.push((c.clone(), n.clone())); }
             }
         }
