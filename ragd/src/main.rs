@@ -12,7 +12,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
-use ragd::{vocab, rag, ingestor, multipart, tokenizer};
+use ragd::{vocab, rag, ingestor, multipart, tokenizer, auth};
 use ragd::rag::RagBase;
 use ragd::ingestor::DriverPick;
 
@@ -93,6 +93,7 @@ struct State {
     max_bases: usize,                     // teto de bases (0 = sem limite); OOM guard no ingest
     max_chunks_per_base: usize,           // teto de chunks por base (0 = sem limite); OOM guard no ingest
     collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
+    auth: auth::Auth,                     // [#33 JWT] usuários/perfis + secret (persistido em auth_file)
 }
 
 /// Configuração do daemon. Vem de ragnarock.cfg (chave = valor) e/ou CLI (CLI vence).
@@ -122,6 +123,7 @@ struct Config {
     max_bases: usize,  // teto de bases carregadas (0 = sem limite); recusa ingest de base NOVA além disso
     max_chunks_per_base: usize, // teto de chunks por base (0 = sem limite); recusa ingest acima disso
     dev: bool,         // --dev: aceita credenciais padrão admin/admin (só pra desenvolvimento)
+    auth_file: String, // [#33 JWT] JSON de usuários/perfis/secret (default ragnarock-auth.json)
 }
 impl Default for Config {
     fn default() -> Self {
@@ -147,6 +149,7 @@ impl Default for Config {
             max_bases: 0,
             max_chunks_per_base: 0,
             dev: false,
+            auth_file: "ragnarock-auth.json".to_string(),
         }
     }
 }
@@ -190,6 +193,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "thesaurus_dir" => cfg.thesaurus_dir = v.to_string(),
             "nidhogg_url" => cfg.nidhogg_url = v.to_string(),
             "session_ttl" => if let Ok(n) = v.parse() { cfg.session_ttl = n },
+            "auth_file" => cfg.auth_file = v.to_string(),
             "max_bases"   => if let Ok(n) = v.parse() { cfg.max_bases = n },
             "max_chunks_per_base" => if let Ok(n) = v.parse() { cfg.max_chunks_per_base = n },
             other => eprintln!("config:{}: chave desconhecida {other:?}", lineno + 1),
@@ -683,6 +687,7 @@ fn main() {
         session_ttl: cfg.session_ttl,
         max_bases: cfg.max_bases,
         max_chunks_per_base: cfg.max_chunks_per_base,
+        auth: auth::Auth::load(&cfg.auth_file),
     }));
 
     // 4) dashboard / supervisório numa thread separada (porta de controle)
@@ -1933,17 +1938,35 @@ fn handle_dashboard_legacy(mut req: Request, state: &Arc<RwLock<State>>) {
 fn is_write_route(method: &Method, path: &str) -> bool {
     matches!((method, path),
         (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
-        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
-    || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}
+        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any")
+        | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios"))  // [#33 JWT] CRUD muta o Auth
+    || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}, /auth/*
 }
 
 /// [#6] Dispatch READ-ONLY: roda sob `state.read()`, N requests em paralelo. Os caches que
 /// search/search_expand precisam mutar (collection_profiles, expansions) têm interior
 /// mutability (RwLock<>) — sob outer-read continuam funcionando.
-fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, String)],
+fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             body_bytes: &[u8], state: &State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     match (method, path) {
+        // ── [#33 JWT] auth: login/refresh públicos; leituras de CRUD sob admin.usuarios ──
+        (Method::Post, "/login") => state.auth.login(body_str(), state.session_ttl),
+        (Method::Post, "/refresh") => state.auth.refresh(body_str()),
+        (Method::Get, "/auth/caps") =>
+            (200, json!({"caps": auth::CAPS}).to_string()),   // catálogo pro form de perfis
+        (Method::Get, "/auth/me") => match auth::bearer_claims(headers, &state.auth.secret) {
+            Some(c) => (200, json!({"usuario": {"login": c["sub"], "nome": c["name"],
+                        "perfil": c["perfil"], "caps": c["caps"], "colls": c["colls"]},
+                        "exp": c["exp"]}).to_string()),
+            None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
+        },
+        (Method::Get, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.perfis_json(), Err(e) => e,
+        },
+        (Method::Get, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.usuarios_json(), Err(e) => e,
+        },
         (Method::Get, "/health") =>
             (200, json!({"status": "ok", "bases": total_bases(&state.bases),
                          "collections": state.bases.len(),
@@ -1978,6 +2001,21 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
          body_bytes: &[u8], state: &mut State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     match (method, path) {
+        // ── [#33 JWT] CRUD de perfis/usuários (guard: admin.usuarios) ──
+        (Method::Post, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.perfil_upsert(body_str()), Err(e) => e,
+        },
+        (Method::Post, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.usuario_upsert(body_str()), Err(e) => e,
+        },
+        (Method::Delete, p) if p.starts_with("/auth/perfis/") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => { let n = percent_decode(&p["/auth/perfis/".len()..]); state.auth.perfil_delete(&n) }
+            Err(e) => e,
+        },
+        (Method::Delete, p) if p.starts_with("/auth/usuarios/") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => { let n = percent_decode(&p["/auth/usuarios/".len()..]); state.auth.usuario_delete(&n) }
+            Err(e) => e,
+        },
         (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state, false),

@@ -10,3 +10,4 @@ pub mod index;
 pub mod rag;
 pub mod ingestor;
 pub mod multipart;
+pub mod auth;   // [#33] JWT (HS256) + usuários/perfis do ValHalla
