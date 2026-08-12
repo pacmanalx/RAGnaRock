@@ -93,9 +93,10 @@ export function Comando() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [inspect, setInspect] = useState<ChunkTarget | null>(null)
-  // Geração: linguagem escolhida + comandos gerados pelos botões da listagem
+  // Geração: linguagem escolhida + ÚLTIMO comando gerado pelos botões da listagem
+  // (substitutivo, não cumulativo — o novo troca o anterior)
   const [lang, setLang] = useState<Lang>('sql')
-  const [gerados, setGerados] = useState<string[]>([])
+  const [gerado, setGerado] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
 
   const form: FormState = { q, modo, coll, base, k, phonetic }
@@ -121,13 +122,24 @@ export function Comando() {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run()
   }
 
-  function gerar(cmd: string) {
-    setGerados((g) => (g.includes(cmd) ? g : [...g, cmd]))
-  }
-
   async function copiar() {
-    const texto = [genSelect(lang, form), ...gerados].join('\n\n')
-    try { await navigator.clipboard.writeText(texto); setCopied(true); setTimeout(() => setCopied(false), 1500) } catch { /* clipboard indisponível (http) */ }
+    // a sequência completa: a busca atual + o comando gerado (se houver)
+    const texto = [genSelect(lang, form), ...(gerado ? [gerado] : [])].join('\n\n')
+    // clipboard API exige contexto seguro (https) — em http cai no execCommand
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(texto)
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = texto
+        ta.style.position = 'fixed'; ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        ta.remove()
+      }
+      setCopied(true); setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard bloqueado pelo browser */ }
   }
 
   const dropped = new Set(res?.dropped ?? [])
@@ -212,11 +224,16 @@ export function Comando() {
                 <button type="button" onClick={() => setLang('sql')} className={segBtn(lang === 'sql')}>SQL</button>
                 <button type="button" onClick={() => setLang('graphql')} className={segBtn(lang === 'graphql')}>GraphQL</button>
               </div>
-              {gerados.length > 0 && (
-                <button type="button" onClick={() => setGerados([])} className="text-[11px] text-[var(--color-muted)] hover:text-[var(--color-fg)]">limpar</button>
+              {gerado && (
+                <button type="button" onClick={() => setGerado(null)} className="text-[11px] text-[var(--color-muted)] hover:text-[var(--color-fg)]">limpar</button>
               )}
-              <button type="button" onClick={copiar} className="text-[11px] text-[var(--color-accent)] hover:opacity-80">
-                {copied ? 'copiado ✓' : 'copiar'}
+              <button
+                type="button"
+                onClick={copiar}
+                title="copia a sequência (busca + comando gerado) — pronta pra colar num código ou rodar num client SQL"
+                className="rounded-md border border-[var(--color-accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--color-accent)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-fg)]"
+              >
+                {copied ? 'copiado ✓' : '📋 copiar sequência'}
               </button>
             </div>
           }
@@ -228,20 +245,13 @@ export function Comando() {
             <pre className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-[12px] leading-relaxed">
               {genSelect(lang, form)}
             </pre>
-            {gerados.map((g, i) => (
-              <pre key={i} className="group relative overflow-x-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-[12px] leading-relaxed">
-                {g}
-                <button
-                  type="button"
-                  onClick={() => setGerados((arr) => arr.filter((_, j) => j !== i))}
-                  className="absolute right-1.5 top-1.5 hidden rounded px-1 text-[10px] text-[var(--color-muted)] hover:text-[var(--color-fg)] group-hover:block"
-                  title="descartar este comando"
-                >✕</button>
+            {gerado ? (
+              <pre className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-[12px] leading-relaxed">
+                {gerado}
               </pre>
-            ))}
-            {gerados.length === 0 && (
+            ) : (
               <div className="text-[11px] text-[var(--color-muted)]">
-                use <b>⌦ chunk</b> / <b>⌦ base</b> num resultado pra gerar o DELETE aqui.
+                use <b>⌦ chunk</b> / <b>⌦ base</b> num resultado pra gerar o DELETE aqui (o novo substitui o anterior).
               </div>
             )}
           </div>
@@ -325,13 +335,13 @@ export function Comando() {
                         {/* geração de DELETE — só escreve no painel Geração, NÃO apaga nada */}
                         <button
                           type="button"
-                          onClick={(e) => { e.stopPropagation(); gerar(genDeleteChunk(lang, h.collection, h.base, h.chunk)) }}
+                          onClick={(e) => { e.stopPropagation(); setGerado(genDeleteChunk(lang, h.collection, h.base, h.chunk)) }}
                           className={miniBtn}
                           title="gerar o DELETE deste chunk no painel Geração (não executa)"
                         >⌦ chunk</button>
                         <button
                           type="button"
-                          onClick={(e) => { e.stopPropagation(); gerar(genDeleteBase(lang, h.collection, h.base)) }}
+                          onClick={(e) => { e.stopPropagation(); setGerado(genDeleteBase(lang, h.collection, h.base)) }}
                           className={miniBtn}
                           title="gerar o DELETE da base inteira (PURGE) no painel Geração (não executa)"
                         >⌦ base</button>
