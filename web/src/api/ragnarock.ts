@@ -2,7 +2,7 @@
 import { ragd, nidhogg } from './client'
 import type {
   Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
-  ThesaurusResponse, ChunkResponse,
+  ThesaurusResponse, ChunkResponse, HistogramResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -27,6 +27,10 @@ const searchBody = (query: string, o: SearchOpts) => ({
 // Léxico puro (silábico tf-idf + matched filter).
 export const search = (query: string, opts: SearchOpts = {}) =>
   ragd.post<SearchResponse>('/search', searchBody(query, opts))
+
+// Histograma do hit #1: matched filter (query deslizando no chunk) + embedding × query.
+export const getHistogram = (query: string, opts: SearchOpts = {}) =>
+  ragd.post<HistogramResponse>('/histogram', searchBody(query, opts))
 
 // Semântico: expansão em cascata 📚 dicionários → 📖 cache → 🧠 IA. Com forceInfer,
 // two_phase=false — pula o atalho "léxico já foi forte" e SEMPRE roda a cascata.

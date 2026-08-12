@@ -53,6 +53,32 @@ export interface Dict {
   kind?: string
 }
 
+// POST /histogram — visualização do hit #1: matched filter + embedding × query (tela Performance)
+export interface MfTerm {
+  term: string
+  k: number
+  peak: number
+  peak_pos: number
+  points: [number, number][] // [posição na sequência, fração que casa 0..1]
+}
+export interface ChunkDim { dim: number; c: number }
+export interface QueryDim { dim: number; c: number; syl: string; hit: boolean } // hit = dim também no chunk (converge no cosseno)
+export interface HistogramResponse {
+  found: boolean
+  collection?: string
+  base?: string
+  chunk_id?: number
+  coverage?: number
+  cos?: number
+  query_syllables?: string
+  vocab_size?: number
+  seq_len?: number
+  mf?: MfTerm[]
+  chunk?: ChunkDim[]
+  query?: QueryDim[]
+  query_oov?: number
+}
+
 export interface ChunkData {
   id: number
   start: number

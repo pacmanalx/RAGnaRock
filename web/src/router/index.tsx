@@ -3,6 +3,7 @@ import { AppLayout } from '@/layouts/AppLayout'
 import { Visao } from '@/pages/Visao'
 import { Comando } from '@/pages/Comando'
 import { Ingestao } from '@/pages/Ingestao'
+import { Performance } from '@/pages/Performance'
 import { Placeholder } from '@/pages/Placeholder'
 import { Perfis } from '@/pages/admin/Perfis'
 import { Usuarios } from '@/pages/admin/Usuarios'
@@ -20,7 +21,7 @@ export const router = createBrowserRouter([
       { path: 'comando', element: <Comando /> },
       { path: 'buscar', element: <Navigate to="/comando" replace /> }, // rota antiga
       { path: 'ingestao', element: <Ingestao /> },
-      { path: 'performance', element: <Placeholder title="Performance" note="Matched filter, ponto de convergência e histograma (heatmap)." /> },
+      { path: 'performance', element: <Performance /> },
       { path: 'nidhogg', element: <Placeholder title="Nidhogg — Visão geral" note="Estado da camada de inteligência: coleções, saturação, NQI." /> },
       { path: 'nidhogg/miner', element: <Placeholder title="L0 · Minerador" note="Nível determinístico (zero-IA): agrupa os documentos por forma em clusters e aplica os moldes/templates. Os 3 pilares e a saturação." /> },
       { path: 'nidhogg/summary', element: <Placeholder title="L1 · Summary" note="Insights por coleção, com confiança visível." /> },

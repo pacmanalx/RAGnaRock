@@ -1967,6 +1967,8 @@ fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, Strin
         (Method::Post, "/search") => search(body_str(), &state.bases, &state.collection_profiles),
         (Method::Post, "/search_expand") => search_expand(body_str(), state),
         (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases),
+        // histograma do hit #1 (matched filter + embedding × query) — tela Performance do ValHalla
+        (Method::Post, "/histogram") => histogram(body_str(), &state.bases),
         _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
     }
 }
