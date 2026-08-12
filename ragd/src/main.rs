@@ -775,7 +775,10 @@ fn handle_api(mut req: Request, state: &Arc<RwLock<State>>, max_upload: usize) {
         route_ro(&method, &path, &query, &headers, &body_bytes, &*st)
     };
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
+    // /logs fica fora do log: a tela de Logs faz poll e viraria feedback-loop de si mesma
+    if path != "/logs" {
+        log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
+    }
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap();
     let _ = req.respond(Response::from_string(payload).with_status_code(code).with_header(header));
 }
@@ -1988,6 +1991,14 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
                         "perfil": c["perfil"], "caps": c["caps"], "colls": c["colls"]},
                         "exp": c["exp"]}).to_string()),
             None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
+        },
+        // tail do log do daemon (guard: admin.servicos) — ?n=300 linhas
+        (Method::Get, "/logs") => match auth::require_cap(headers, &state.auth, "admin.servicos") {
+            Ok(_) => {
+                let n = query_param(query, "n").and_then(|s| s.parse().ok()).unwrap_or(300usize).min(5000);
+                (200, json!({"file": state.log_file, "log": tail_lines(&state.log_file, n)}).to_string())
+            }
+            Err(e) => e,
         },
         // ── [#33] configuração do daemon (guard: admin.config; chaves saem mascaradas) ──
         (Method::Get, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {

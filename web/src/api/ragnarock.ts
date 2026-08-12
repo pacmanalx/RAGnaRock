@@ -66,6 +66,9 @@ export const setNidhogg = (cfg: { on?: boolean; level?: number; cadence?: number
   nidhogg.post<NidhoggStatus>('/api/nidhogg', { ...cfg })
 export const runNidhoggCycle = () => nidhogg.post<{ ok: boolean; started?: boolean; note?: string }>('/api/nidhogg/run')
 
+// ── tela Logs (guard admin.servicos no backend) ──
+export const getLogs = (n = 300) => ragd.get<{ file: string; log: string }>(`/logs?n=${n}`)
+
 // ── tela Configuração (guard admin.config no backend) ──
 export const getConfig = () => ragd.get<ConfigResponse>('/config')
 export const setConfig = (patch: Record<string, unknown>) => ragd.post<SetConfigResponse>('/config', patch)

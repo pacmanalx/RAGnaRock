@@ -18,6 +18,7 @@ import { Usuarios } from '@/pages/admin/Usuarios'
 import { Servicos } from '@/pages/admin/Servicos'
 import { Config } from '@/pages/admin/Config'
 import { Drivers } from '@/pages/admin/Drivers'
+import { Logs } from '@/pages/admin/Logs'
 
 // Router central único (molde Innova: rotas explícitas, não file-based).
 export const router = createBrowserRouter([
@@ -41,7 +42,7 @@ export const router = createBrowserRouter([
       { path: 'admin/servicos', element: <Servicos /> },
       { path: 'admin/config', element: <Config /> },
       { path: 'admin/drivers', element: <Drivers /> },
-      { path: 'admin/logs', element: <Placeholder title="Logs" note="Tail ao vivo do daemon (via /api/logs, sob auth)." /> },
+      { path: 'admin/logs', element: <Logs /> },
       { path: '*', element: <Placeholder title="404" note="rota não encontrada" /> },
     ],
   },
