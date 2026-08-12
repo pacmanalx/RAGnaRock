@@ -3,12 +3,20 @@ import { ragd, nidhogg } from './client'
 import type {
   Health, NidhoggHealth, CollectionsResponse, DriversResponse, SearchResponse, SearchExpandResponse,
   ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
-  ConfigResponse, SetConfigResponse,
+  ConfigResponse, SetConfigResponse, IngestorsResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
 export const getCollections = () => ragd.get<CollectionsResponse>('/collections')
 export const getDrivers = () => ragd.get<DriversResponse>('/drivers')
+export const getDriversOut = () => ragd.get<DriversResponse>('/drivers_out')
+export const getIngestors = () => ragd.get<IngestorsResponse>('/ingestors')
+// instala/desinstala driver de linguagem (move drivers ↔ drivers.out; guard admin.config)
+export const moveDriver = (file: string, action: 'install' | 'uninstall') =>
+  ragd.post<{ ok: boolean; installed: number }>('/driver_move', { file, action })
+// liga/desliga dicionário (inuse.flag) — reflete na busca expandida na hora
+export const toggleDict = (code: string, enable: boolean) =>
+  ragd.post<{ ok: boolean; active: number; word_entries: number }>('/thesaurus_toggle', { code, action: enable ? 'enable' : 'disable' })
 export const getThesaurus = () => ragd.get<ThesaurusResponse>('/thesaurus')
 // Opções comuns de escopo da busca (mesmo contrato da aba Buscar do dashboard legado).
 export interface SearchOpts {

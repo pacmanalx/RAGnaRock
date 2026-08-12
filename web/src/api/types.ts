@@ -27,6 +27,7 @@ export interface CollectionRow {
 }
 
 export interface DriversResponse {
+  count?: number
   drivers: Driver[]
 }
 export interface Driver {
@@ -35,6 +36,14 @@ export interface Driver {
   description: string
   extensions: string[]
   syllables: number
+  keywords?: number
+}
+
+// GET /ingestors — drivers de ingestão (scripts do ingestors_dir)
+export interface IngestorsResponse {
+  ingestors_dir: string
+  count: number
+  ingestors: { name: string; bytes: number; description: string }[]
 }
 
 export interface ThesaurusResponse {

@@ -1966,7 +1966,8 @@ fn is_write_route(method: &Method, path: &str) -> bool {
         | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any")
         | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios")
         | (Method::Post, "/auth/password")   // [#33 JWT] CRUD/troca de senha mutam o Auth
-        | (Method::Post, "/config"))         // [#33] set_config muta o State (chaves/storage/ttl)
+        | (Method::Post, "/config")          // [#33] set_config muta o State (chaves/storage/ttl)
+        | (Method::Post, "/driver_move") | (Method::Post, "/thesaurus_toggle"))  // [#33] tela Drivers
     || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}, /auth/*
 }
 
@@ -2027,6 +2028,14 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
         (Method::Get, "/expansions") => (200, expansions_json(state)),              // [#48] cache p/ CacheDigest
         (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
+        // drivers DESINSTALADOS (drivers.out) — a outra coluna da tela Drivers
+        (Method::Get, "/drivers_out") => {
+            let out = format!("{}.out", state.drivers_dir);
+            if Path::new(&out).is_dir() { list_drivers(query, &out) }
+            else { (200, json!({"drivers_dir": out, "match": "*", "count": 0, "drivers": []}).to_string()) }
+        }
+        // drivers de INGESTÃO (scripts shell/python do ingestors_dir) — listagem real
+        (Method::Get, "/ingestors") => list_ingestors(&state.ingestors_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
         (Method::Post, "/search") => search(body_str(), &state.bases, &state.collection_profiles),
@@ -2053,6 +2062,14 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
         // configuração do daemon (persiste no cfg; guard admin.config)
         (Method::Post, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {
             Ok(_) => set_config(body_str(), state), Err(e) => e,
+        },
+        // instala/desinstala driver de linguagem (move drivers ↔ drivers.out)
+        (Method::Post, "/driver_move") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => driver_move(body_str(), &state.drivers_dir), Err(e) => e,
+        },
+        // liga/desliga dicionário (inuse.flag) e recarrega o mapa por-palavra na hora
+        (Method::Post, "/thesaurus_toggle") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => dict_toggle(body_str(), state), Err(e) => e,
         },
         // troca da PRÓPRIA senha: basta token válido (sub identifica quem)
         (Method::Post, "/auth/password") => match auth::bearer_claims(headers, &state.auth.secret) {
@@ -3061,6 +3078,31 @@ fn driver_language(fname: &str) -> String {
 
 /// GET /drivers  — lista os drivers .drv instalados. ?match=ASP* (wildcard, default todos).
 /// Cada item traz header / description / extensions extraidos do cabecalho do .drv.
+/// GET /ingestors — lista os drivers de ingestão (scripts em ingestors_dir).
+/// A descrição vem da primeira linha de comentário/docstring do script, se houver.
+fn list_ingestors(dir: &str) -> (u16, String) {
+    let mut items: Vec<Value> = vec![];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if !p.is_file() || name.starts_with('.') { continue; }
+            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            // primeira linha de comentário (# … ou """…) vira a descrição
+            let desc = std::fs::read_to_string(&p).ok().and_then(|t| t.lines()
+                .filter(|l| !l.starts_with("#!"))
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix('#').or_else(|| l.strip_prefix("\"\"\""))
+                        .map(|s| s.trim().trim_end_matches("\"\"\"").trim().to_string())
+                })).filter(|s| !s.is_empty()).unwrap_or_default();
+            items.push(json!({"name": name, "bytes": bytes, "description": desc}));
+        }
+    }
+    items.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    (200, json!({"ingestors_dir": dir, "count": items.len(), "ingestors": items}).to_string())
+}
+
 fn list_drivers(query: &str, drivers_dir: &str) -> (u16, String) {
     let pattern = query_param(query, "match").unwrap_or_else(|| "*".to_string());
     let abs_dir = std::fs::canonicalize(drivers_dir)
