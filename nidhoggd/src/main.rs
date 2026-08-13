@@ -183,6 +183,42 @@ fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
     }
     None
 }
+// ── Diário de mastigação do LLM ("o esquilinho") ──
+// TODA chamada de IA (classificador, modelador, extrator…) passa por llm_post e deixa registro
+// COMPLETO em JSONL: prompt, resposta, contexto e latência. É o que permite ver a evolução do
+// entendimento ciclo a ciclo. Caminho: <dir>/llm-ledger.jsonl (setado no boot a partir do cfg).
+static LLM_LEDGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn llm_post(tag: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<String> {
+    let t0 = std::time::Instant::now();
+    let resp = http_post_t(url, body, secs);
+    let ms = t0.elapsed().as_millis() as u64;
+    let (conteudo, finish) = match resp.as_deref() {
+        Some(r) => {
+            let rv: Value = serde_json::from_str(r).unwrap_or_else(|_| json!({}));
+            (rv["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string(),
+             rv["choices"][0]["finish_reason"].as_str().unwrap_or("").to_string())
+        }
+        None => (String::new(), String::new()),
+    };
+    if let Some(path) = LLM_LEDGER.get() {
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        let entry = json!({
+            "ts": now_stamp(), "tag": tag, "ctx": ctx, "ms": ms, "ok": resp.is_some(),
+            "url": url, "messages": req["messages"], "finish": finish, "resposta": conteudo,
+        });
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{entry}");
+        }
+    }
+    // rastro curto no log principal (o diário guarda o inteiro teor)
+    nlog(&format!("🐿️ llm {tag} [{ctx}] {ms}ms → {}", if resp.is_some() {
+        format!("{}ch{}", conteudo.len(), if finish == "length" { " (CORTADO)" } else { "" })
+    } else { "SEM RESPOSTA".to_string() }));
+    resp
+}
+
 /// Busca o /health do ragd (usado SÓ pela thread de keepalive, nunca no caminho do request).
 fn fetch_ragd_health(api: &str) -> Option<Value> {
     http_get(&format!("{api}/health")).and_then(|s| serde_json::from_str(&s).ok())
@@ -999,7 +1035,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => t, None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
             let lib = read_prompts(&dir);
             let (sys, _from) = template_system(&lib);
-            let (schema, regras) = match llm_make_template(&llm_url, &sys, &tipo, &amostra, &instrucao) {
+            let (schema, regras) = match llm_make_template(&llm_url, &format!("molde-dirigido {coll}/{base} tipo={tipo}"), &sys, &tipo, &amostra, &instrucao) {
                 Ok(x) => x,
                 Err(e) => return (502, json!({"error": format!("L1 não criou o molde: {e}")}).to_string()),
             };
@@ -1509,7 +1545,7 @@ fn template_system(lib: &Value) -> (String, String) {
 }
 /// Fase 3 — o L1 cria o molde de um tipo a partir de UMA amostra. Structured output força
 /// `{schema:[...], regras:[{campo,regex,limpar}]}`. Devolve (schema_json, regras_json) como strings.
-fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
+fn llm_make_template(llm_url: &str, ctx: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -1536,7 +1572,7 @@ fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str, instru
         "temperature": 0, "max_tokens": 1200,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = http_post_t(llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
+    let resp = llm_post("modelador", ctx, llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
         .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(120).collect::<String>()))?;
@@ -1605,7 +1641,7 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
         }
     }
     let (sys, _from) = template_system(lib);
-    let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra, "") {
+    let (schema, regras) = match llm_make_template(llm_url, &format!("mineração {coll} tipo={tipo}"), &sys, &tipo, &amostra, "") {
         Ok(x) => x,
         Err(e) => { nlog(&format!("template {coll}/{tipo}: {e}")); return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e}); }
     };
@@ -1691,7 +1727,7 @@ fn fetch_chunk0(api: &str, coll: &str, name: &str) -> Option<String> {
 
 /// Uma classificação por LLM com CONSTRAINED DECODING (json_schema/enum). temperature 0.
 /// Err carrega o motivo. Devolve (natureza, tipo).
-fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
+fn llm_classify(llm_url: &str, ctx: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
     -> Result<(String, String), String>
 {
     let schema = json!({
@@ -1710,7 +1746,7 @@ fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipo
         "temperature": 0, "max_tokens": 40,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = http_post_t(llm_url, &body, CLASSIFY_TIMEOUT_S)
+    let resp = llm_post("classificador", ctx, llm_url, &body, CLASSIFY_TIMEOUT_S)
         .ok_or(format!("sem resposta (timeout {CLASSIFY_TIMEOUT_S}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -1730,7 +1766,7 @@ fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
                  naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
     let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
     let csv = tabular_spec(&text).is_some();
-    let (nat, tip) = llm_classify(llm_url, sys, &text, naturezas, tipos)?;
+    let (nat, tip) = llm_classify(llm_url, &format!("classe {coll}/{name}"), sys, &text, naturezas, tipos)?;
     Ok((nat, tip, csv))
 }
 
@@ -1896,14 +1932,14 @@ fn classify_list_cli(cfg: &Config, path: &str) {
 
 /// Extrai os registros de UMA janela como array JSON. temperature 0. Reusa o salvage pra truncado.
 /// O chamador valida cada elemento (all-or-nothing).
-fn llm_extract_records(llm_url: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
+fn llm_extract_records(llm_url: &str, ctx: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
     let sys_r = sys.replace("{tipo}", tipo);
     let body = json!({
         "messages": [{"role":"system","content":sys_r},{"role":"user","content":format!("DOCUMENTO:\n{text}")}],
         "temperature": 0, "max_tokens": EXTRACT_MAX_TOKENS
     }).to_string();
     let to = ((text.len() / 90) + (EXTRACT_MAX_TOKENS as usize / 10) + 90).min(400) as u32;
-    let resp = http_post_t(llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
+    let resp = llm_post("extrator", ctx, llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let truncated = rv["choices"][0]["finish_reason"].as_str() == Some("length");
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -2224,6 +2260,9 @@ fn main() {
         p
     };
     if Path::new(&cfg_path).exists() { load_cfg(&mut cfg, &cfg_path); } else { cfg.cfg_path = cfg_path.clone(); }
+    // diário de mastigação do LLM: <dir>/llm-ledger.jsonl (todas as consultas/respostas de IA)
+    let _ = std::fs::create_dir_all(&cfg.dir);
+    let _ = LLM_LEDGER.set(format!("{}/llm-ledger.jsonl", cfg.dir.trim_end_matches('/')));
     // CLI sobrescreve
     let mut it = args.iter();
     while let Some(a) = it.next() {
