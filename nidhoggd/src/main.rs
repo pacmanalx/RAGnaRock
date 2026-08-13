@@ -318,8 +318,9 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
     if t.contains('/') && digits.len() == 8 && t.chars().count() <= 10 { return None; }
     // numérico longo (CNPJ/CPF/conta/ticket): a chave são os dígitos crus
     if digits.len() >= 8 && digits.len() * 2 >= t.chars().count() { return Some(digits); }
-    // texto: precisa de corpo (≥5 chars, com letra) — chave = minúsculo sem acento
-    if t.chars().count() < 5 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
+    // texto: precisa de corpo (≥5 chars, com letra) e ser NOME, não descrição — frase longa
+    // ("originator of the Project Gutenberg concept; produced…") não é identidade, é atributo
+    if t.chars().count() < 5 || t.chars().count() > 60 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
     use unicode_normalization::UnicodeNormalization;
     let folded: String = t.nfd()
         .filter(|ch| !unicode_normalization::char::is_combining_mark(*ch))
@@ -336,7 +337,8 @@ const FICHA_WIN_CHARS: usize = 2000;
 
 fn mine_fichas(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let sys = lib["templates"]["fichas"]["system"].as_str().unwrap_or(BUILTIN_FICHA_PROMPT).to_string();
-    let ecfg = hash_hex(&format!("ficha|v1|{}", hash_hex(&sys)));
+    // v2: janelas no miolo + filtro de nome≤60 chars no ligador (re-extrai tudo da v1)
+    let ecfg = hash_hex(&format!("ficha|v2|{}", hash_hex(&sys)));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -348,11 +350,14 @@ fn mine_fichas(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) 
         let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
         if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        // janelas espalhadas: início + pontos internos (um livro não cabe no LLM; amostramos)
+        // janelas espalhadas SÓ NO MIOLO (8%–92%): início/fim de ebook é boilerplate
+        // (a licença Gutenberg virou o "protagonista" da biblioteca na v1 — lição aprendida)
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
+        let (lo, hi) = (n * 8 / 100, (n * 92 / 100).saturating_sub(FICHA_WIN_CHARS).max(n * 8 / 100));
+        let span = hi.saturating_sub(lo);
         let wins: Vec<String> = (0..FICHA_WINDOWS).map(|i| {
-            let start = if FICHA_WINDOWS == 1 { 0 } else { i * n.saturating_sub(FICHA_WIN_CHARS) / (FICHA_WINDOWS - 1) };
+            let start = lo + if FICHA_WINDOWS == 1 { 0 } else { i * span / (FICHA_WINDOWS - 1) };
             chars[start.min(n)..(start + FICHA_WIN_CHARS).min(n)].iter().collect()
         }).collect();
         // merge por nome folded: atributos acumulam (dedup), relações acumulam (dedup)
@@ -441,6 +446,9 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
                 });
             }
         }
+    }
+    if let Err(e) = chdb::clear_nos(ch_url, coll) {
+        return json!({"ok": false, "collection": coll, "error": format!("clear nós: {e}")});
     }
     if let Err(e) = chdb::insert_nos(ch_url, &rows) {
         return json!({"ok": false, "collection": coll, "error": format!("insert nós: {e}")});

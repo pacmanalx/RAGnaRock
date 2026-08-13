@@ -555,6 +555,15 @@ pub fn max_entity_version(url: &str, coll: &str) -> Result<u64, String> {
     Ok(body.trim().parse().unwrap_or(0))
 }
 
+/// Limpa os nós de UMA coleção antes do re-link (senão chaves antigas viram fantasmas —
+/// a régua de normalização pode mudar entre versões). Tabela pequena; mutation síncrona.
+pub fn clear_nos(url: &str, coll: &str) -> Result<(), String> {
+    let esc = coll.replace('\'', "''");
+    ch_exec(url, &format!(
+        "ALTER TABLE nidhogg.no_valor DELETE WHERE collection='{esc}' SETTINGS mutations_sync=1"), 60)?;
+    Ok(())
+}
+
 pub fn insert_nos(url: &str, rows: &[NoValorRow]) -> Result<(), String> {
     if rows.is_empty() { return Ok(()); }
     let mut ndjson = String::new();
