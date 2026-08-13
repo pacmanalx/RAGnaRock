@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { Crosshair, RotateCcw } from 'lucide-react'
-import { getNavNode, getNavSuggest } from '@/api/ragnarock'
+import { Crosshair, RotateCcw, X } from 'lucide-react'
+import { getNavNode, getNavSuggest, search } from '@/api/ragnarock'
+import type { SearchResponse } from '@/api/types'
 import { messageFromError } from '@/api/client'
+import { Spinner } from '@/components/ui'
+import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
 
 // Think Navigator — mindmap infinito sobre o grafo de co-ocorrência do L2.
 // Tema central → clica → relacionados irradiam → clica num relacionado → a teia cresce.
@@ -32,6 +35,9 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
   const [tema, setTema] = useState('')
   const [sugestoes, setSugestoes] = useState<{ valor: string; valor_norm: string }[]>([])
   const [sugVazio, setSugVazio] = useState(false)
+  const [refs, setRefs] = useState<{ valor: string } | null>(null)   // modal de referências (duplo clique)
+  const [inspect, setInspect] = useState<ChunkTarget | null>(null)   // documento chunk a chunk
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [view, setView] = useState({ x: 0, y: 0, zoom: 1 })
   const viewRef = useRef(view)
   viewRef.current = view
@@ -227,7 +233,20 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
           {lista.map((n) => {
             const r = raioDe(n)
             return (
-              <g key={n.norm} className="cursor-pointer" style={{ animation: 'navpop .45s ease-out' }} onClick={(e) => { e.stopPropagation(); expandir(n.norm) }}>
+              <g
+                key={n.norm} className="cursor-pointer" style={{ animation: 'navpop .45s ease-out' }}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  // clique simples espera 260ms — se vier o segundo, é duplo (referências)
+                  if (clickTimer.current) return
+                  clickTimer.current = setTimeout(() => { clickTimer.current = null; expandir(n.norm) }, 260)
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation()
+                  if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null }
+                  setRefs({ valor: n.valor })
+                }}
+              >
                 <circle
                   cx={n.x} cy={n.y} r={r}
                   fill={n.expanded ? 'var(--color-accent)' : 'var(--color-panel)'}
@@ -250,11 +269,79 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
           })}
           {nodes.size === 0 && (
             <text x={0} y={0} textAnchor="middle" style={{ fill: 'var(--color-muted)', fontSize: 13 }}>
-              o pensamento começa por um tema ☝
+              o pensamento começa por um tema ☝ (clique expande · duplo clique abre o corpus)
             </text>
           )}
         </g>
       </svg>
+
+      {refs && <RefsModal valor={refs.valor} escopo={escopo} onClose={() => setRefs(null)}
+        onOpenDoc={(t) => { setRefs(null); setInspect(t) }} />}
+      {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
+    </div>
+  )
+}
+
+// ───────── modal de referências: o valor buscado no CORPUS (a camada RAGnaRock) ─────────
+function RefsModal({ valor, escopo, onClose, onOpenDoc }: {
+  valor: string
+  escopo: string
+  onClose: () => void
+  onOpenDoc: (t: ChunkTarget) => void
+}) {
+  const [res, setRes] = useState<SearchResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    search(valor, { collection: escopo === '*' ? undefined : escopo, k: 12 })
+      .then((r) => { if (alive) setRes(r) })
+      .catch((e) => { if (alive) setError(messageFromError(e)) })
+    return () => { alive = false }
+  }, [valor, escopo])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()}
+        className="flex max-h-[80vh] w-[720px] max-w-[92vw] flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]">
+        <header className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+          <div className="text-[14px] font-semibold">
+            referências no corpus — <span className="text-[var(--color-accent)]">{valor}</span>
+            <span className="ml-2 text-[11px] font-normal text-[var(--color-muted)]">
+              {escopo === '*' ? 'todas as coleções' : `coleção ${escopo}`}
+            </span>
+          </div>
+          <button onClick={onClose} className="rounded p-1 text-[var(--color-muted)] hover:text-[var(--color-fg)]"><X size={16} /></button>
+        </header>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
+          {error && <div className="text-[12px] text-[var(--color-crit)]">{error}</div>}
+          {!res && !error && <Spinner label="buscando no corpus…" />}
+          {res?.hits.map((h) => (
+            <button
+              key={`${h.collection}-${h.base}-${h.chunk}`}
+              onClick={() => onOpenDoc({ collection: h.collection, base: h.base, id: h.chunk })}
+              title="abrir o documento chunk a chunk"
+              className="block w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-left transition-colors hover:border-[var(--color-accent)]"
+            >
+              <div className="mb-1 flex items-center justify-between text-[11px] text-[var(--color-muted)]">
+                <span><span className="text-[var(--color-accent)]">{h.collection}</span> / {h.base} · chunk {h.chunk}</span>
+                <span className="tabular-nums">cos {(h.cos ?? 0).toFixed(3)}</span>
+              </div>
+              <div className="text-[13px] leading-relaxed">
+                {(h.snippet ?? '').split(/[«»]/).map((p, i) =>
+                  i % 2 === 1 ? <b key={i} className="text-[var(--color-accent)]">{p}</b> : <span key={i}>{p}</span>)}
+              </div>
+            </button>
+          ))}
+          {res && res.hits.length === 0 && <div className="text-[13px] text-[var(--color-muted)]">nenhuma referência no corpus para este escopo.</div>}
+        </div>
+      </div>
     </div>
   )
 }
