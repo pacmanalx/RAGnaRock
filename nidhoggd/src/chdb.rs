@@ -620,12 +620,16 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
     // CO-OCORRÊNCIA: assuntos que aparecem NO MESMO registro dos assuntos do topo — é a
     // profundidade da árvore (EssenciaViva → seus favorecidos; Frodo → Sam/Gandalf).
     // O DISTINCT do WITH mata a inflação de contagem por versões do ReplacingMergeTree.
+    // menções co-ocorrem POR BASE (Frodo↔Gandalf = mesmo livro); registros estruturados
+    // co-ocorrem POR REGISTRO (pagador↔favorecido = mesmo comprovante) — CSV por base viraria
+    // ruído (400 consultores todos "ligados").
     let co_body = ch_query_param(url, &format!(
-        "WITH p AS (SELECT DISTINCT valor_norm, valor, base, idx FROM nidhogg.no_valor FINAL \
+        "WITH p AS (SELECT DISTINCT valor_norm, valor, tipo, base, idx FROM nidhogg.no_valor FINAL \
                     WHERE collection={{coll:String}}) \
          SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) v, count() n \
-         FROM p a INNER JOIN p b ON a.base=b.base AND a.idx=b.idx \
+         FROM p a INNER JOIN p b ON a.base=b.base \
          WHERE a.valor_norm IN ({}) AND b.valor_norm != a.valor_norm \
+           AND (a.idx=b.idx OR (a.tipo='mencao' AND b.tipo='mencao')) \
          GROUP BY pai, filho ORDER BY n DESC LIMIT 800 FORMAT JSONEachRow", in_list.join(",")),
         &[("coll", coll)], 25).unwrap_or_default();
     let mut co_map: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();

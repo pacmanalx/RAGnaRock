@@ -388,7 +388,12 @@ fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
                 let lf = lower_freq.get(&seq[0].to_lowercase()).copied().unwrap_or(0);
                 if lf >= 2 { continue; }
             }
-            let nome = seq.join(" ");
+            // poda ponto final de palavra NÃO-inicial ("Gandalf." → "Gandalf"; "G." fica)
+            let nome = seq.iter().map(|w| {
+                if w.ends_with('.') && w.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
+                    w.trim_end_matches('.')
+                } else { w }
+            }).collect::<Vec<_>>().join(" ");
             if nome.chars().filter(|c| c.is_alphabetic()).count() >= 3 && nome.chars().count() <= 50 {
                 *counts.entry(nome).or_insert(0) += 1;
             }
@@ -401,9 +406,9 @@ fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
 }
 
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
-    // v3: CENSO determinístico do texto inteiro (o LLM sai do caminho crítico; o prompt
-    // "fichas" fica na biblioteca pro enriquecimento dirigido futuro)
-    let ecfg = hash_hex("mencao|v3|top40");
+    // v4: CENSO determinístico do texto inteiro (poda de ponto final; o LLM fica na
+    // biblioteca pro enriquecimento dirigido futuro)
+    let ecfg = hash_hex("mencao|v4|top40");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
