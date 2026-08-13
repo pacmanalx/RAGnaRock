@@ -586,11 +586,14 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
     let mut params: Vec<(&str, &str)> = vec![("coll", coll)];
     if !q.is_empty() { params.push(("q", q)); }
     // alias v (NÃO "valor"): o CH resolveria o filtro do WHERE pro agregado any() e
-    // explodiria com ILLEGAL_AGGREGATION quando ?q= entra
+    // explodiria com ILLEGAL_AGGREGATION quando ?q= entra.
+    // Gate ≥2 SÓ na árvore espontânea: busca explícita mostra tudo que casa (Gandalf vive
+    // numa base só — a trilogia é UM arquivo — e sumia da busca com o gate).
+    let having = if q.is_empty() { "HAVING regs >= 2" } else { "" };
     let tops_body = ch_query_param(url, &format!(
         "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nbases \
          FROM nidhogg.no_valor FINAL WHERE collection={{coll:String}}{filter_q} \
-         GROUP BY valor_norm HAVING regs >= 2 \
+         GROUP BY valor_norm {having} \
          ORDER BY nbases DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
     let tops: Vec<Value> = tops_body.lines().filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok()).collect();
