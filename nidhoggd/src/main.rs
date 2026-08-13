@@ -663,6 +663,20 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 }
             }
         }
+        // [Think Navigator] sugestões leves de tema (prefixo → valores, sem ramos/co).
+        (Method::Get, "/api/nidhogg/suggest") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c))).unwrap_or_default();
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" || coll.is_empty() || q.is_empty() {
+                (400, json!({"error": "requer clickhouse + ?collection= + ?q="}).to_string())
+            } else {
+                match chdb::suggest_json(&ch_url, &coll, &q, 8) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
         // [Think Navigator] expande UM nó do mindmap: relacionados por co-ocorrência.
         (Method::Get, "/api/nidhogg/node") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Crosshair, RotateCcw } from 'lucide-react'
-import { getNavNode, getNidhoggTree } from '@/api/ragnarock'
+import { getNavNode, getNavSuggest } from '@/api/ragnarock'
 import { messageFromError } from '@/api/client'
 
 // Think Navigator — mindmap infinito sobre o grafo de co-ocorrência do L2.
@@ -32,15 +32,19 @@ export function ThinkNavigator({ collection }: { collection: string }) {
   const svgRef = useRef<SVGSVGElement>(null)
 
   const num = (v: number | string) => typeof v === 'number' ? v : parseInt(v || '0', 10) || 0
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // ── busca do tema central (sugestões via árvore com q) ──
-  async function buscarTema(q: string) {
+  // ── busca do tema central (endpoint leve + debounce 300ms) ──
+  function buscarTema(q: string) {
     setTema(q)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
     if (q.trim().length < 2) { setSugestoes([]); return }
-    try {
-      const r = await getNidhoggTree(collection, q.trim())
-      setSugestoes(r.nodes.slice(0, 8).map((n) => ({ valor: n.valor, valor_norm: n.valor_norm })))
-    } catch { setSugestoes([]) }
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const r = await getNavSuggest(collection, q.trim())
+        setSugestoes(r.nodes.map((n) => ({ valor: n.valor, valor_norm: n.valor_norm })))
+      } catch (e) { setError(messageFromError(e)); setSugestoes([]) }
+    }, 300)
   }
 
   async function centrar(valor: string, norm: string) {

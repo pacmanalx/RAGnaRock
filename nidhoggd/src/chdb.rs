@@ -580,6 +580,22 @@ pub fn insert_nos(url: &str, rows: &[NoValorRow]) -> Result<(), String> {
 
 /// A ÁRVORE: assuntos (nós com ≥2 participações) → ramos por tipo → registros.
 /// `q` filtra por substring do valor (a busca de assunto da tela).
+/// [Think Navigator] Sugestões LEVES: só (valor, norm, contagens) casando o prefixo —
+/// sem ramos nem co-ocorrência (a árvore completa pesa MB; digitação pede ms).
+pub fn suggest_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
+    let body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nb \
+         FROM nidhogg.no_valor FINAL \
+         WHERE collection={{coll:String}} AND positionCaseInsensitive(valor, {{q:String}}) > 0 \
+         GROUP BY valor_norm ORDER BY nb DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &[("coll", coll), ("q", q)], 15)?;
+    let nodes: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|t| json!({"valor": t["v"], "valor_norm": t["valor_norm"], "registros": t["regs"], "bases": t["nb"]}))
+        .collect();
+    Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
+}
+
 pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
     let filter_q = if q.is_empty() { String::new() }
                    else { " AND positionCaseInsensitive(valor, {q:String}) > 0".to_string() };

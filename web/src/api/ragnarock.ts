@@ -78,6 +78,10 @@ export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string,
 // [L2] a árvore de assuntos: nós de valor ligando registros do dump (?q= busca)
 export const getNidhoggTree = (collection: string, q = '') =>
   nidhogg.get<TreeResponse>(`/api/nidhogg/tree?collection=${encodeURIComponent(collection)}${q ? `&q=${encodeURIComponent(q)}` : ''}`)
+// [Think Navigator] sugestões leves de tema (sem ramos/co — responde em ms)
+export const getNavSuggest = (collection: string, q: string) =>
+  nidhogg.get<{ nodes: { valor: string; valor_norm: string }[] }>(
+    `/api/nidhogg/suggest?collection=${encodeURIComponent(collection)}&q=${encodeURIComponent(q)}`)
 // [Think Navigator] expande um nó do mindmap (relacionados por co-ocorrência)
 export const getNavNode = (collection: string, norm: string) =>
   nidhogg.get<NavNode>(`/api/nidhogg/node?collection=${encodeURIComponent(collection)}&norm=${encodeURIComponent(norm)}`)
