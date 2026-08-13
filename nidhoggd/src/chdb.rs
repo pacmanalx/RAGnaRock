@@ -649,9 +649,8 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
         "WITH p AS (SELECT DISTINCT valor_norm, valor, tipo, base, idx FROM nidhogg.no_valor FINAL \
                     WHERE collection={{coll:String}}) \
          SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) v, count() n \
-         FROM p a INNER JOIN p b ON a.base=b.base \
+         FROM p a INNER JOIN p b ON a.base=b.base AND a.idx=b.idx \
          WHERE a.valor_norm IN ({}) AND b.valor_norm != a.valor_norm \
-           AND (a.idx=b.idx OR (a.tipo='mencao' AND b.tipo='mencao')) \
          GROUP BY pai, filho ORDER BY n DESC LIMIT 800 FORMAT JSONEachRow", in_list.join(",")),
         &[("coll", coll)], 25).unwrap_or_default();
     let mut co_map: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
@@ -708,9 +707,8 @@ pub fn node_json(url: &str, coll: &str, norm: &str, limit: usize) -> Result<Valu
         "WITH p AS (SELECT DISTINCT collection, valor_norm, valor, tipo, base, idx \
                     FROM nidhogg.no_valor FINAL{wc_p}) \
          SELECT b.valor_norm filho, any(b.valor) v, count() n, uniqExact(b.base) nb \
-         FROM p a INNER JOIN p b ON a.collection=b.collection AND a.base=b.base \
+         FROM p a INNER JOIN p b ON a.collection=b.collection AND a.base=b.base AND a.idx=b.idx \
          WHERE a.valor_norm={{norm:String}} AND b.valor_norm != a.valor_norm \
-           AND (a.idx=b.idx OR (a.tipo='mencao' AND b.tipo='mencao')) \
          GROUP BY filho ORDER BY n DESC LIMIT {limit} FORMAT JSONEachRow"),
         &params, 30)?;
     let co: Vec<Value> = co_body.lines().filter(|l| !l.trim().is_empty())

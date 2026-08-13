@@ -347,6 +347,11 @@ fn mencao_top(_n_chars: usize) -> usize { MENCAO_TOP_MAX }
 /// "de/da/do/G." — José de Arimateia, Ellen G. White), contadas no texto INTEIRO. Palavra única
 /// capitalizada só vale se a forma minúscula NÃO domina (mata o "The/O/A" de início de frase).
 fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
+    extract_mencoes_min(text, top, MENCAO_MIN_FREQ)
+}
+/// Variante com piso de frequência parametrizado — o censo POR CHUNK usa piso 1 no chunk
+/// (o piso global ≥3 aplica no acumulado da base).
+fn extract_mencoes_min(text: &str, top: usize, min_freq: u32) -> Vec<(String, u32)> {
     const CONECTORES: &[&str] = &["de", "da", "do", "dos", "das", "van", "von", "del", "la", "e"];
     let stop = |w: &str| matches!(w.to_lowercase().as_str(),
         "the" | "a" | "o" | "os" | "as" | "um" | "uma" | "and" | "but" | "he" | "she" | "it"
@@ -404,16 +409,16 @@ fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
             }
         } else { i += 1; }
     }
-    let mut v: Vec<(String, u32)> = counts.into_iter().filter(|(_, c)| *c >= MENCAO_MIN_FREQ).collect();
+    let mut v: Vec<(String, u32)> = counts.into_iter().filter(|(_, c)| *c >= min_freq).collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     v.truncate(top);
     v
 }
 
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
-    // v7: sem escassez artificial — tudo com freq≥3 entra (teto 800 = só proteção);
-    // miolo 5-95%; poda de ponto final; LLM fora do caminho crítico
-    let ecfg = hash_hex("mencao|v7|freq-gate|miolo");
+    // v8: censo POR CHUNK — grava as posições de cada menção (o eixo do tempo narrativo).
+    // Co-ocorrência de menção vira proximidade de CENA (mesmo chunk), não de arquivo.
+    let ecfg = hash_hex("mencao|v8|posicoes|freq-gate|miolo");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -424,24 +429,35 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
         let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
         let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
         if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
-        let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        // censo SÓ NO MIOLO (5%–95%): capa/licença Gutenberg é idêntica em centenas de
-        // ebooks e dominava a árvore (mesma lição das janelas LLM). Doc curto (<20k) varre inteiro.
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
-        let miolo: String = if n > 20_000 {
-            chars[n * 5 / 100..n * 95 / 100].iter().collect()
-        } else { text.clone() };
-        let mencoes = extract_mencoes(&miolo, mencao_top(n));
+        let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
+        // miolo POR ÍNDICE de chunk (5%–95% em docs com >10 chunks): capa/licença Gutenberg fora
+        let nch = chunks.len();
+        let (clo, chi) = if nch > 10 { (nch * 5 / 100, nch * 95 / 100) } else { (0, nch) };
+        // varre POR CHUNK e acumula (freq total, posições) por menção — a chave da cena
+        let mut acc: std::collections::BTreeMap<String, (String, u32, Vec<usize>)> = std::collections::BTreeMap::new();
+        for (cid, ctext) in &chunks[clo..chi.max(clo + 1).min(nch)] {
+            for (nome, f) in extract_mencoes_min(ctext, 200, 1) {
+                // dentro do chunk o piso é 1 (o piso global ≥3 aplica no total)
+                let key = norm_valor("mencao", &nome).unwrap_or_else(|| nome.to_lowercase());
+                let e = acc.entry(key).or_insert((nome, 0, vec![]));
+                e.1 += f;
+                if e.2.last() != Some(cid) && e.2.len() < 400 { e.2.push(*cid); }
+            }
+        }
+        let mut mencoes: Vec<(String, u32, Vec<usize>)> = acc.into_values()
+            .filter(|(_, f, _)| *f >= MENCAO_MIN_FREQ).collect();
+        mencoes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        mencoes.truncate(mencao_top(0));
         let version = chdb::now_version();
         let at = now_stamp();
-        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq))| {
+        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq, pos))| {
+            let pos_s: Vec<String> = pos.iter().map(|p| p.to_string()).collect();
             chdb::EntidadeRow {
                 collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
                 idx: idx as u32,
-                dado: json!({"mencao": nome, "freq": freq.to_string()}).to_string(),
+                dado: json!({"mencao": nome, "freq": freq.to_string(), "chunks": pos_s.join(",")}).to_string(),
                 modo: "mencao".to_string(), nqi: 1.0,
-                prov: json!({"via": "mencao-det", "freq": freq, "scan": "texto-inteiro"}).to_string(),
+                prov: json!({"via": "mencao-det", "freq": freq, "n_chunks": pos.len(), "scan": "por-chunk"}).to_string(),
                 state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
             }
         }).collect();
@@ -486,6 +502,24 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
     for r in &regs {
         let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
         let obj = match dado.as_object() { Some(o) => o, None => continue };
+        // [v8] MENÇÃO: um nó POR POSIÇÃO DE CHUNK (idx = chunk) — a co-ocorrência vira
+        // proximidade de CENA com a MESMA regra dos registros (mesmo base+idx).
+        if r["tipo"].as_str() == Some("mencao") {
+            let nome = obj.get("mencao").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if let Some(norm) = norm_valor("mencao", nome) {
+                let poss: Vec<u32> = obj.get("chunks").and_then(|v| v.as_str()).unwrap_or("")
+                    .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                for p in poss {
+                    rows.push(chdb::NoValorRow {
+                        collection: coll.to_string(), valor_norm: norm.clone(), valor: nome.to_string(),
+                        campo: "mencao".to_string(), tipo: "mencao".to_string(),
+                        base: r["base"].as_str().unwrap_or("").to_string(),
+                        idx: p, nqi: 1.0, version, linked_at: at.clone(),
+                    });
+                }
+            }
+            continue;
+        }
         for (campo, val) in obj {
             let vs = match val.as_str() { Some(s) => s, None => continue };
             if let Some(norm) = norm_valor(campo, vs) {
@@ -1489,6 +1523,19 @@ const BUILTIN_FICHA_PROMPT: &str = "Você lê um TRECHO de uma obra narrativa em
 (personagens, pessoas, organizações, lugares importantes) que aparecem NESTE trecho. Responda APENAS com um array JSON; \
 cada elemento: {\"nome\": \"...\", \"atributos\": [\"característica citada no trecho\", ...], \"relacoes\": [\"nome de outra entidade ligada a esta no trecho\", ...]}. \
 Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidades → [].";
+
+/// [v8] Chunks SEPARADOS de uma base (id + texto) — o censo de menções varre por chunk
+/// pra gravar as POSIÇÕES (a posição do chunk é o eixo do tempo narrativo).
+fn fetch_base_chunks(api: &str, coll: &str, name: &str) -> Option<Vec<(usize, String)>> {
+    let req = json!({"collection": coll, "base": name, "id": 0, "after": 999_999}).to_string();
+    let v: Value = serde_json::from_str(&http_post_t(&format!("{api}/chunk"), &req, 120)?).ok()?;
+    let chunks = v["chunks"].as_array()?;
+    Some(chunks.iter().filter_map(|c| {
+        let id = c["id"].as_u64()? as usize;
+        let t = c["text"].as_str()?.to_string();
+        if t.trim().is_empty() { None } else { Some((id, t)) }
+    }).collect())
+}
 
 /// Texto do chunk 0 de uma base (primeiros CLASSIFY_MAX_CHARS chars). Leve — não puxa a base
 /// inteira como o normalizador. None se a base não tem texto.
