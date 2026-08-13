@@ -766,6 +766,44 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 }
             }
         }
+        // [Diário de mastigação] cauda do llm-ledger pro ValHalla (?n=30, máx 200). Prompt e
+        // resposta vão TRUNCADOS (o inteiro teor fica no arquivo) com os tamanhos reais anotados.
+        (Method::Get, "/api/nidhogg/llm_ledger") => {
+            let n: usize = query_param(query, "n").and_then(|v| v.parse().ok()).unwrap_or(30).min(200);
+            let path = match LLM_LEDGER.get() { Some(p) => p.clone(), None => return (200, json!({"entries": []}).to_string()) };
+            const TAIL_BYTES: u64 = 12 * 1024 * 1024;   // entradas podem ter MB (documento no prompt)
+            let (texto, cortado) = (|| -> std::io::Result<(String, bool)> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&path)?;
+                let len = f.metadata()?.len();
+                let start = len.saturating_sub(TAIL_BYTES);
+                f.seek(SeekFrom::Start(start))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)?;
+                Ok((String::from_utf8_lossy(&buf).into_owned(), start > 0))
+            })().unwrap_or((String::new(), false));
+            let corta = |s: &str, max: usize| -> String {
+                if s.chars().count() <= max { s.to_string() }
+                else { format!("{}…", s.chars().take(max).collect::<String>()) }
+            };
+            let mut linhas: Vec<&str> = texto.lines().filter(|l| !l.trim().is_empty()).collect();
+            if cortado && !linhas.is_empty() { linhas.remove(0); }   // primeira pode ser parcial
+            let entries: Vec<Value> = linhas.iter().rev().take(n)
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .map(|e| {
+                    let sys = e["messages"][0]["content"].as_str().unwrap_or("");
+                    let user = e["messages"][1]["content"].as_str().unwrap_or("");
+                    let resp = e["resposta"].as_str().unwrap_or("");
+                    json!({
+                        "ts": e["ts"], "tag": e["tag"], "ctx": e["ctx"], "ms": e["ms"],
+                        "ok": e["ok"], "finish": e["finish"],
+                        "system": corta(sys, 2000), "system_len": sys.chars().count(),
+                        "user": corta(user, 4000), "user_len": user.chars().count(),
+                        "resposta": corta(resp, 6000), "resposta_len": resp.chars().count(),
+                    })
+                }).collect();
+            (200, json!({"file": path, "entries": entries}).to_string())
+        }
         // [Dimensões] cadastro (a ponte L2→L3): eixos declarados de navegação/exigência.
         (Method::Get, "/api/nidhogg/dimensoes") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };

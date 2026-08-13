@@ -6,7 +6,7 @@ import type {
   ConfigResponse, SetConfigResponse, IngestorsResponse,
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
-  TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap,
+  TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap, LlmLedgerResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -115,6 +115,8 @@ export const toggleNidhoggCollection = (collection: string, enabled: boolean) =>
 
 // ── tela Logs (guard admin.servicos no backend) ──
 export const getLogs = (n = 300) => ragd.get<{ file: string; log: string }>(`/logs?n=${n}`)
+// diário de mastigação do LLM (cauda do llm-ledger.jsonl; mais recente primeiro)
+export const getLlmLedger = (n = 30) => nidhogg.get<LlmLedgerResponse>(`/api/nidhogg/llm_ledger?n=${n}`)
 
 // ── tela Configuração (guard admin.config no backend) ──
 export const getConfig = () => ragd.get<ConfigResponse>('/config')

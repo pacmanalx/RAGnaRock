@@ -199,6 +199,20 @@ export interface DimValorItem {
 export interface DimValoresResponse { nome: string; count: number; valores: DimValorItem[] }
 export interface DimGap { nome: string; alvo: number; cobertos: number; gaps: string[]; nota: string }
 
+// ── Diário de mastigação do LLM (llm-ledger.jsonl do nidhoggd) ──
+export interface LlmLedgerEntry {
+  ts: string
+  tag: string        // classificador | modelador | extrator
+  ctx: string        // "molde-dirigido demo/base tipo=contrato"
+  ms: number
+  ok: boolean
+  finish: string     // stop | length (cortado no teto)
+  system: string; system_len: number
+  user: string; user_len: number
+  resposta: string; resposta_len: number
+}
+export interface LlmLedgerResponse { file: string; entries: LlmLedgerEntry[] }
+
 // ── Nidhogg L1: doctypes, prompts e moldes ──
 export interface NidhoggDoctypes { naturezas: string[]; tipos: string[] }
 export interface PromptTemplate { description: string; system: string; updated: string; max_tokens?: number }
