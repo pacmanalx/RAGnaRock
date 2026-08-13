@@ -15,9 +15,10 @@ import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
 export function NidhoggTree() {
   const st = useAsync(getNidhoggStatus, [])
   const cols = useAsync(getNidhoggCollections, [])
-  const habilitadas = (cols.data?.collections ?? []).filter((c) => c.enabled)
+  // a árvore é do ACUMULADO (sobrevive ao acesso do worm) — todas as coleções aparecem
+  const todas = cols.data?.collections ?? []
   const [coll, setColl] = useState<string | null>(null)
-  const ativa = coll ?? habilitadas[0]?.collection ?? null
+  const ativa = coll ?? todas[0]?.collection ?? null
   const [q, setQ] = useState('')
   const [qAplicado, setQAplicado] = useState('')
   const [inspect, setInspect] = useState<ChunkTarget | null>(null)
@@ -45,19 +46,20 @@ export function NidhoggTree() {
       )}
 
       {cols.loading && <Spinner />}
-      {habilitadas.length > 0 && (
+      {todas.length > 0 && (
         <div className="flex flex-wrap items-center gap-1 border-b border-[var(--color-border)]">
-          {habilitadas.map((c) => (
+          {todas.map((c) => (
             <button
               key={c.collection}
               onClick={() => setColl(c.collection)}
+              title={c.enabled ? undefined : 'acesso do worm bloqueado — a árvore mostra o já acumulado'}
               className={`border-b-2 px-4 py-2 text-[13px] ${
                 ativa === c.collection
                   ? 'border-[var(--color-accent)] font-semibold text-[var(--color-fg)]'
                   : 'border-transparent text-[var(--color-muted)] hover:text-[var(--color-fg)]'
               }`}
             >
-              {c.collection}
+              {c.collection}{!c.enabled && ' ⏸'}
             </button>
           ))}
           <div className="grow" />
@@ -94,8 +96,15 @@ function Arvore({ collection, q, onOpen }: { collection: string; q: string; onOp
   return (
     <Panel title={`${nodes.length} assunto(s)${q ? ` · filtro: "${q}"` : ''}`}>
       {nodes.length === 0 && (
-        <div className="text-[13px] text-[var(--color-muted)]">
-          {q ? 'nenhum assunto casa com a busca.' : 'nenhum nó ainda — a árvore nasce quando o L2 liga registros que compartilham valores (rode um ciclo no nível 2 com o dump populado).'}
+        <div className="space-y-1.5 text-[13px] text-[var(--color-muted)]">
+          {q ? <div>nenhum assunto casa com a busca.</div> : (
+            <>
+              <div>nenhum assunto nesta coleção — assunto nasce quando <b>≥2 registros do dump compartilham um valor</b>. Três causas possíveis:</div>
+              <div>· <b>dump vazio</b>: coleção narrativa (memorial, contratos…) não gera registro — a destilação de temas narrativos é a Camada 2 (LLM), a caminho;</div>
+              <div>· <b>valores todos únicos</b>: há registros, mas nada se repete entre eles (nada a ligar — ainda);</div>
+              <div>· <b>worm abaixo do L2</b> ou ciclo ainda não rodou após a extração.</div>
+            </>
+          )}
         </div>
       )}
       <div className="space-y-1">
