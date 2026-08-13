@@ -33,8 +33,28 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
   const [sugestoes, setSugestoes] = useState<{ valor: string; valor_norm: string }[]>([])
   const [sugVazio, setSugVazio] = useState(false)
   const [view, setView] = useState({ x: 0, y: 0, zoom: 1 })
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const animRef = useRef<number | null>(null)
   const drag = useRef<{ px: number; py: number; vx: number; vy: number } | null>(null)
   const svgRef = useRef<SVGSVGElement>(null)
+
+  // desliza o mapa até o nó clicado virar o CENTRO (ease-out cúbico, ~450ms)
+  function panPara(nx: number, ny: number) {
+    if (animRef.current) cancelAnimationFrame(animRef.current)
+    const from = { x: viewRef.current.x, y: viewRef.current.y }
+    const zoom = viewRef.current.zoom
+    const alvo = { x: -nx * zoom, y: -ny * zoom }
+    const t0 = performance.now()
+    const dur = 450
+    const step = (t: number) => {
+      const k = Math.min(1, (t - t0) / dur)
+      const e = 1 - Math.pow(1 - k, 3)
+      setView((v) => ({ ...v, x: from.x + (alvo.x - from.x) * e, y: from.y + (alvo.y - from.y) * e }))
+      if (k < 1) animRef.current = requestAnimationFrame(step)
+    }
+    animRef.current = requestAnimationFrame(step)
+  }
 
   const num = (v: number | string) => typeof v === 'number' ? v : parseInt(v || '0', 10) || 0
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -71,6 +91,7 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
       const es = new Set(curEdges ?? edges)
       const pai = ns.get(norm)
       if (!pai || !r.found) { setBusy(null); return }
+      panPara(pai.x, pai.y)   // o nó clicado vira o centro do pensamento
       pai.expanded = true
       pai.peso = Math.max(pai.peso, num(r.registros))
       const novos = r.co.slice(0, MAX_FILHOS)
@@ -104,6 +125,7 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
 
   // ── pan & zoom ──
   function onDown(e: React.MouseEvent) {
+    if (animRef.current) cancelAnimationFrame(animRef.current)   // arrasto interrompe o glide
     drag.current = { px: e.clientX, py: e.clientY, vx: view.x, vy: view.y }
   }
   function onMove(e: React.MouseEvent) {
@@ -119,6 +141,7 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
 
   return (
     <div className="space-y-3">
+      <style>{'@keyframes navpop { from { opacity: 0 } to { opacity: 1 } }'}</style>
       {/* tema central */}
       <div className="relative flex flex-wrap items-center gap-2">
         <Crosshair size={15} className="text-[var(--color-muted)]" />
@@ -178,13 +201,13 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
             const [a, b] = ek.split('|')
             const na = nodes.get(a); const nb = nodes.get(b)
             if (!na || !nb) return null
-            return <line key={ek} x1={na.x} y1={na.y} x2={nb.x} y2={nb.y} stroke="var(--color-border)" strokeWidth={1.4} />
+            return <line key={ek} x1={na.x} y1={na.y} x2={nb.x} y2={nb.y} stroke="var(--color-border)" strokeWidth={1.4} style={{ animation: 'navpop .5s ease-out' }} />
           })}
           {/* nós */}
           {lista.map((n) => {
             const r = raioDe(n)
             return (
-              <g key={n.norm} className="cursor-pointer" onClick={(e) => { e.stopPropagation(); expandir(n.norm) }}>
+              <g key={n.norm} className="cursor-pointer" style={{ animation: 'navpop .45s ease-out' }} onClick={(e) => { e.stopPropagation(); expandir(n.norm) }}>
                 <circle
                   cx={n.x} cy={n.y} r={r}
                   fill={n.expanded ? 'var(--color-accent)' : 'var(--color-panel)'}
