@@ -262,6 +262,30 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| kv.split_once('=').and_then(|(k, v)| (k == key).then(|| v.to_string())))
 }
 
+/// [FORMA] Assinatura ESTRUTURAL do documento (zero-IA): o esqueleto de rótulos.
+/// Extrai os rótulos "Nome:" no início de linha (ordem preservada, dedup) e hasheia.
+/// Documentos irmãos de forma (100 mil PIX do mesmo template) compartilham a assinatura;
+/// formas DIFERENTES do mesmo tipo ganham moldes separados — é o agrupador que faz o
+/// "1 IA por FORMA" escalar. "" = sem estrutura rotulada (narrativo/código não têm forma).
+fn form_signature(text: &str) -> String {
+    let mut labels: Vec<String> = vec![];
+    for line in text.lines().take(400) {
+        let t = line.trim_start();
+        if let Some(p) = t.find(':') {
+            if (2..=28).contains(&p) {
+                let lab = &t[..p];
+                if lab.chars().any(|c| c.is_alphabetic())
+                    && lab.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '/' | '-' | '.')) {
+                    let norm = lab.trim().to_uppercase();
+                    if !labels.contains(&norm) { labels.push(norm); }
+                }
+            }
+        }
+    }
+    if labels.len() < 2 { return String::new(); }   // 1 rótulo solto não é estrutura
+    hash_hex(&labels.join("|"))[..8].to_string()
+}
+
 /// Normalização Unicode NFC — mesmo fix do ragd: o macOS entrega nomes em NFD e o mesmo
 /// documento virava DUAS classes no doc_class (NFD picada + NFC limpa). Aplicar em TODO
 /// nome de base/coleção que entra (API própria e /bases do ragd).
@@ -467,12 +491,17 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 return (400, json!({"error": format!("tipo desconhecido: {tipo}"), "tipos": tipos}).to_string());
             }
             // csv DETERMINÍSTICO (tabular_spec no texto real); natureza deriva do tipo (ou 'tabela' se csv)
-            let csv = fetch_base_text(&api, &coll, &base).map(|t| tabular_spec(&t).is_some()).unwrap_or(false);
+            let texto = fetch_base_text(&api, &coll, &base);
+            let csv = texto.as_deref().map(|t| tabular_spec(t).is_some()).unwrap_or(false);
+            let forma = texto.as_deref().map(form_signature).unwrap_or_default();
             let natureza = if csv { "tabela".to_string() } else { natureza_do_tipo(&tipo).to_string() };
-            // extraível AGORA? csv (det) OU já existe molde pro tipo. Se não (documento sem molde ainda,
-            // ou narrativo/código que nunca gera registro), NÃO há re-extração — e uma extração ANTIGA
-            // desta base (se houver) PERMANECE no dump sob o tipo velho até um molde existir. Avisamos.
-            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| t.get(tipo.as_str()).is_some()).unwrap_or(false);
+            // extraível AGORA? csv (det) OU já existe molde pro tipo (puro ou tipo@forma). Se não
+            // (documento sem molde ainda, ou narrativo/código que nunca gera registro), NÃO há
+            // re-extração — e uma extração ANTIGA desta base (se houver) PERMANECE no dump sob o
+            // tipo velho até um molde existir. Avisamos.
+            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t|
+                t.get(tipo.as_str()).is_some()
+                || (!forma.is_empty() && t.get(&format!("{tipo}@{forma}")).is_some())).unwrap_or(false);
             let extraivel = csv || tem_molde;
             let nota = if extraivel { "re-extrai no próximo ciclo" }
                        else if natureza == "documento" { "sem molde — extração antiga purgada; dê um molde dirigido pra re-extrair" }
@@ -480,7 +509,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let (sh, ch) = chdb::get_class_hashes(&ch_url, &coll, &base).unwrap_or_default();
             let row = chdb::ClassRow {
                 collection: coll.clone(), name: base.clone(), state_hash: sh, cfg_hash: ch,
-                natureza: natureza.clone(), tipo: tipo.clone(), csv, origem: "humano".to_string(),
+                natureza: natureza.clone(), tipo: tipo.clone(), forma, csv, origem: "humano".to_string(),
                 confianca: 1.0, classified_at: now_stamp(), version: chdb::now_version(),
             };
             match chdb::insert_classes(&ch_url, &[row]) {
@@ -1078,25 +1107,53 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     let templates = chdb::get_templates(ch_url).unwrap_or_else(|_| json!({}));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
-    // tipos NÃO-CSV, sem molde ainda → escolhe o mais populoso (name = 1 amostra por tipo)
-    let mut por_tipo: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+    // [FORMA] clusters (tipo, forma) NÃO-CSV sem molde → escolhe o mais populoso (name = amostra).
+    // O molde nasce POR FORMA: 100 mil docs da mesma forma = 1 molde; formas distintas do mesmo
+    // tipo = moldes separados. Registry usa chave composta "tipo@forma" ('' de forma = tipo puro).
+    let mut por_cluster: std::collections::HashMap<(String, String), (usize, String)> = std::collections::HashMap::new();
     for b in &bases {
         let is_csv = b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1);
         let natureza = b["natureza"].as_str().unwrap_or("");
         let tipo = b["tipo"].as_str().unwrap_or("");
+        let forma = b["forma"].as_str().unwrap_or("");
         let name = b["name"].as_str().unwrap_or("");
         // SÓ natureza=documento (átomos da ponta ESTRUTURADOS: comprovante/nota/holerite/OC). Narrativo
         // (contrato, memorial) e código NÃO têm campos rotulados → molde regex não serve (viraria lixo).
         if is_csv || natureza != "documento" || tipo.is_empty() || tipo == "sem-texto" || name.is_empty() { continue; }
-        if templates.get(tipo).is_some() { continue; }   // já tem molde
-        let e = por_tipo.entry(tipo.to_string()).or_insert((0, name.to_string()));
+        let key = if forma.is_empty() { tipo.to_string() } else { format!("{tipo}@{forma}") };
+        if templates.get(&key).is_some() { continue; }               // já tem molde desta forma
+        if forma.is_empty() && templates.get(tipo).is_some() { continue; }
+        let e = por_cluster.entry((tipo.to_string(), forma.to_string())).or_insert((0, name.to_string()));
         e.0 += 1;
     }
-    let (tipo, count, aname) = match por_tipo.into_iter().max_by_key(|(_, (c, _))| *c) {
-        Some((t, (c, n))) => (t, c, n),
-        None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "tipos não-CSV já têm molde (ou não há)"}),
+    let ((tipo, forma), (count, aname)) = match por_cluster.into_iter().max_by_key(|(_, (c, _))| *c) {
+        Some((k, v)) => (k, v),
+        None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "clusters (tipo,forma) não-CSV já têm molde (ou não há)"}),
     };
     let amostra = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let reg_key = if forma.is_empty() { tipo.clone() } else { format!("{tipo}@{forma}") };
+    // HERANÇA: se o molde do TIPO puro já cobre esta forma (cobertura ≥ gate na amostra do
+    // cluster), materializa um alias — a decisão persiste e o cluster nunca mais entra na fila.
+    if !forma.is_empty() {
+        if let Some(t) = templates.get(&tipo) {
+            let compiled = compile_template(&t["regras"]);
+            let rec = apply_template(&amostra, &compiled);
+            let nc = compiled.len();
+            let n_ok = rec.as_object().map(|o| o.values().filter(|v| !v.as_str().unwrap_or("").is_empty()).count()).unwrap_or(0);
+            let cob = if nc > 0 { n_ok as f64 / nc as f64 } else { 0.0 };
+            if cob >= TEMPLATE_MIN_COVERAGE {
+                let row = chdb::TemplateRow {
+                    tipo: reg_key.clone(), schema: t["schema"].to_string(), regras: t["regras"].to_string(),
+                    cobertura: cob, origem: "herdado".into(), created_at: now_stamp(), version: chdb::now_version(),
+                };
+                if let Err(e) = chdb::upsert_template(ch_url, &row) {
+                    return json!({"ok": false, "collection": coll, "error": format!("alias herdado: {e}")});
+                }
+                nlog(&format!("template {coll}/{reg_key}: molde do tipo puro cobre a forma ({:.0}%) — herdado, sem LLM", cob * 100.0));
+                return json!({"ok": true, "collection": coll, "criados": 1, "tipo": reg_key, "origem": "herdado", "cobertura": cob});
+            }
+        }
+    }
     let (sys, _from) = template_system(lib);
     let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra, "") {
         Ok(x) => x,
@@ -1118,14 +1175,14 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
                       "cobertura": cobertura, "rejeitado": "cobertura baixa"});
     }
     let row = chdb::TemplateRow {
-        tipo: tipo.clone(), schema, regras, cobertura, origem: "llm".into(),
+        tipo: reg_key.clone(), schema, regras, cobertura, origem: "llm".into(),
         created_at: now_stamp(), version: chdb::now_version(),
     };
     if let Err(e) = chdb::upsert_template(ch_url, &row) {
-        return json!({"ok": false, "collection": coll, "tipo": tipo, "error": format!("upsert: {e}")});
+        return json!({"ok": false, "collection": coll, "tipo": reg_key, "error": format!("upsert: {e}")});
     }
-    nlog(&format!("molde criado: tipo={tipo} campos={n_campos} cobertura={:.0}% ({count} exemplares aguardando)", cobertura * 100.0));
-    json!({"ok": true, "collection": coll, "criados": 1, "tipo": tipo, "campos": n_campos, "cobertura": cobertura})
+    nlog(&format!("molde criado: {reg_key} campos={n_campos} cobertura={:.0}% ({count} exemplares aguardando)", cobertura * 100.0));
+    json!({"ok": true, "collection": coll, "criados": 1, "tipo": reg_key, "campos": n_campos, "cobertura": cobertura})
 }
 
 /// Garante que os templates "classificador" e "extrator" existem na biblioteca (pra aparecerem no
@@ -1292,10 +1349,15 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         let name = name.as_str();
         let sh = base_state_hash(b);
         let has_text = b["has_text"].as_bool().unwrap_or(true);
+        // [FORMA] assinatura estrutural carimbada junto com a classe (zero-IA, 1 fetch extra
+        // só pra base NOVA/mudada — é o agrupador do "1 molde por forma")
+        let forma = if has_text {
+            fetch_base_text(api, coll, name).map(|t| form_signature(&t)).unwrap_or_default()
+        } else { String::new() };
         let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
             collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
             cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
-            csv, origem: "llm".to_string(),
+            forma: forma.clone(), csv, origem: "llm".to_string(),
             confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
         };
         if !has_text {
@@ -1404,15 +1466,23 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let bases_class: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let is_csv = |b: &Value| b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1) || b["csv"].as_str() == Some("1");
-    let mut extraiveis: std::collections::HashMap<String, (String, bool, String)> = std::collections::HashMap::new();
+    // valor: (tipo, csv, ext_cfg, molde_key) — molde_key = "tipo@forma" quando há molde da
+    // forma, senão o tipo puro (fallback). O ecfg carrega a chave: molde novo → re-extrai.
+    let mut extraiveis: std::collections::HashMap<String, (String, bool, String, String)> = std::collections::HashMap::new();
     for b in &bases_class {
         let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n.to_string(), _ => continue };
         let tipo = b["tipo"].as_str().unwrap_or("registro").to_string();
+        let forma = b["forma"].as_str().unwrap_or("");
         if is_csv(b) {
-            extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone()));
-        } else if let Some(t) = templates.get(tipo.as_str()) {
-            let ecfg = hash_hex(&format!("template|v2nqi|{tipo}|{}", hash_hex(&t["regras"].to_string())));
-            extraiveis.insert(name, (tipo, false, ecfg));
+            extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone(), String::new()));
+        } else {
+            let composta = if forma.is_empty() { String::new() } else { format!("{tipo}@{forma}") };
+            let mkey = if !composta.is_empty() && templates.get(&composta).is_some() { composta }
+                       else if templates.get(tipo.as_str()).is_some() { tipo.clone() }
+                       else { continue };
+            let t = &templates[mkey.as_str()];
+            let ecfg = hash_hex(&format!("template|v2nqi|{mkey}|{}", hash_hex(&t["regras"].to_string())));
+            extraiveis.insert(name, (tipo, false, ecfg, mkey));
         }
     }
     // ponto cego: natureza=tabela sem csv E sem molde → ninguém extrai (VISÍVEL, não silencioso)
@@ -1446,7 +1516,7 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         let name = nfc(b["name"].as_str().unwrap_or(""));
         let name = name.as_str();
         let sh = base_state_hash(b);
-        let (tipo, _bcsv, ecfg) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
+        let (tipo, _bcsv, ecfg, mkey) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
         let spec = tabular_spec(&text);
         let rows_src = spec.map(|(_, n)| n);
@@ -1471,17 +1541,18 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
                 idx += 1;
             }
         } else {
-            // Fase 3: aplica o MOLDE do tipo (regex ancorado). 1 documento = 1 registro. Zero LLM.
+            // Fase 3: aplica o MOLDE da forma (ou do tipo puro, fallback). 1 doc = 1 registro. Zero LLM.
             modo = "template";
-            let molde_ver = templates[tipo.as_str()]["version"].as_u64().unwrap_or(0);
-            let compiled = compiled_cache.entry(tipo.clone())
-                .or_insert_with(|| compile_template(&templates[tipo.as_str()]["regras"]));
+            let molde_ver = templates[mkey.as_str()]["version"].as_u64().unwrap_or(0);
+            let compiled = compiled_cache.entry(mkey.clone())
+                .or_insert_with(|| compile_template(&templates[mkey.as_str()]["regras"]));
             // path-tree (Fase 5): cada campo veio de um REGEX ancorado no rótulo
             let origem: std::collections::HashMap<String, (String, String)> = compiled.iter()
                 .map(|(c, re, _)| (c.clone(), ("regex".to_string(), re.as_str().to_string()))).collect();
             let n_esperado = compiled.len();
             let rec = apply_template(&text, &compiled[..]);
-            let (nqi, prov) = qualidade_prov(coll, name, "template", Some((&tipo, molde_ver)), &origem, &rec, n_esperado);
+            // prov aponta o molde REAL aplicado (tipo@forma quando específico)
+            let (nqi, prov) = qualidade_prov(coll, name, "template", Some((&mkey, molde_ver)), &origem, &rec, n_esperado);
             ents.push(chdb::EntidadeRow {
                 collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
                 idx: 0, dado: rec.to_string(), modo: "template".to_string(), nqi, prov,

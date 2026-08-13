@@ -86,7 +86,15 @@ function ClassesDaColecao({ collection }: { collection: string }) {
                   <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 text-[11px]">{b.natureza}</span>
                   {b.csv === 1 && <span className="ml-1 rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 text-[10px] text-[var(--color-accent)]" title="tabular regular — parser CSV determinístico, zero LLM">csv</span>}
                 </td>
-                <td className="py-2 text-[12px]">{b.tipo}</td>
+                <td className="py-2 text-[12px]">
+                  {b.tipo}
+                  {b.forma && (
+                    <span className="ml-1.5 rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]"
+                      title={`forma ${b.forma} — assinatura estrutural (esqueleto de rótulos); documentos irmãos de forma compartilham o molde`}>
+                      ⌗{b.forma}
+                    </span>
+                  )}
+                </td>
                 <td className="py-2">
                   <span
                     title={b.origem === 'humano' ? 'decisão humana — STICKY: o LLM nunca sobrescreve' : 'classificado pela IA leve (Fase 1)'}
@@ -211,7 +219,7 @@ function Moldes() {
                 </span>
                 <span className="flex items-center gap-3 text-[11px] text-[var(--color-muted)]">
                   {t.cobertura != null && <span className="tabular-nums">cobertura {(t.cobertura * 100).toFixed(0)}%</span>}
-                  {t.origem && <span className={t.origem === 'humano' ? 'font-semibold text-[var(--color-warn)]' : ''}>{t.origem === 'humano' ? '👤 dirigido' : '🧠 llm'}</span>}
+                  {t.origem && <span className={t.origem === 'humano' ? 'font-semibold text-[var(--color-warn)]' : ''}>{t.origem === 'humano' ? '👤 dirigido' : t.origem === 'herdado' ? '♻ herdado' : '🧠 llm'}</span>}
                   {t.created_at && <span className="tabular-nums">{t.created_at}</span>}
                 </span>
               </button>

@@ -26,6 +26,7 @@ pub struct ClassRow {
     pub cfg_hash: String,
     pub natureza: String,
     pub tipo: String,
+    pub forma: String,    // [FORMA] assinatura estrutural (esqueleto de rótulos); '' = sem estrutura
     pub csv: bool,        // determinístico (tabular_spec): é um CSV regular → gate da Fase 2
     pub origem: String,   // "llm" (classificou) | "humano" (re-tipado no cockpit — o LLM NÃO sobrescreve)
     pub confianca: f64,
@@ -126,6 +127,8 @@ pub fn ensure_schema(url: &str) -> Result<(), String> {
     // migrações idempotentes: colunas que doc_class antigo não tinha
     ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS csv UInt8 DEFAULT 0", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS origem String DEFAULT 'llm'", 15)?;
+    // [FORMA] assinatura estrutural (esqueleto de rótulos, 8 hex; '' = sem estrutura rotulada)
+    ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS forma String DEFAULT ''", 15)?;
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doctype (version UInt64, naturezas String, tipos String) \
          ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
@@ -203,7 +206,7 @@ pub fn insert_classes(url: &str, rows: &[ClassRow]) -> Result<(), String> {
     for r in rows {
         let line = json!({
             "collection": r.collection, "name": r.name, "state_hash": r.state_hash,
-            "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo,
+            "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo, "forma": r.forma,
             "csv": if r.csv { 1 } else { 0 }, "origem": r.origem,
             "confianca": r.confianca, "classified_at": r.classified_at, "version": r.version,
         });
@@ -242,7 +245,7 @@ pub fn classes_summary(url: &str, collection: Option<&str>) -> Result<Value, Str
     let total: i64 = total_body.trim().parse().unwrap_or(0);
 
     let bases_sql = format!(
-        "SELECT collection, name, natureza, tipo, csv, origem, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
+        "SELECT collection, name, natureza, tipo, forma, csv, origem, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
          ORDER BY collection, name FORMAT JSON");
     let bases_body = ch_query_param(url, &bases_sql, &params, 20)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json bases: {e}"))?;
@@ -421,7 +424,7 @@ pub fn ensure_template_schema(url: &str) -> Result<(), String> {
 /// o L0 lê pra decidir se um tipo já tem molde e aplicá-lo.
 pub fn get_templates(url: &str) -> Result<Value, String> {
     let body = ch_exec(url,
-        "SELECT tipo, schema, regras, cobertura, version FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
+        "SELECT tipo, schema, regras, cobertura, origem, created_at, version FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
     let mut map = serde_json::Map::new();
     for line in body.lines() {
         if line.trim().is_empty() { continue; }
@@ -429,7 +432,8 @@ pub fn get_templates(url: &str) -> Result<Value, String> {
         let tipo = match v["tipo"].as_str() { Some(t) if !t.is_empty() => t.to_string(), _ => continue };
         let schema = serde_json::from_str::<Value>(v["schema"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
         let regras = serde_json::from_str::<Value>(v["regras"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
-        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"], "version": v["version"]}));
+        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"],
+                                "origem": v["origem"], "created_at": v["created_at"], "version": v["version"]}));
     }
     Ok(Value::Object(map))
 }
@@ -466,7 +470,7 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
     }
     // candidatos: documento OU (tabela com csv=0)
     let body = ch_exec(url,
-        "SELECT collection, name, natureza, tipo, csv FROM nidhogg.doc_class FINAL \
+        "SELECT collection, name, natureza, tipo, forma, csv FROM nidhogg.doc_class FINAL \
          WHERE natureza='documento' OR (natureza='tabela' AND csv=0) FORMAT JSONEachRow", 20)?;
     let mut lista: Vec<Value> = vec![];
     for l in body.lines() {
@@ -476,11 +480,15 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
         let name = v["name"].as_str().unwrap_or("");
         let natureza = v["natureza"].as_str().unwrap_or("");
         let tipo = v["tipo"].as_str().unwrap_or("");
+        let forma = v["forma"].as_str().unwrap_or("");
         if name.is_empty() { continue; }
         let nqi = nqi_map.get(&(coll.to_string(), name.to_string())).copied();
+        // [FORMA] molde cobre o doc se existe pro tipo puro OU pra (tipo@forma)
+        let tem_molde = templates.get(tipo).is_some()
+            || (!forma.is_empty() && templates.get(&format!("{tipo}@{forma}")).is_some());
         let motivo = if natureza == "tabela" {
             "tabela não-CSV"
-        } else if templates.get(tipo).is_none() {
+        } else if !tem_molde {
             "sem molde"
         } else {
             match nqi {

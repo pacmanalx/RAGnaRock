@@ -149,7 +149,7 @@ export interface NidhoggClassesSummary {
   count: number
   naturezas: Record<string, number>
   tipos: Record<string, number>
-  bases: { collection: string; name: string; natureza: string; tipo: string; csv: number; origem: string; confianca: number; classified_at: string }[]
+  bases: { collection: string; name: string; natureza: string; tipo: string; forma?: string; csv: number; origem: string; confianca: number; classified_at: string }[]
 }
 export interface NidhoggEntitiesSummary {
   count: number
