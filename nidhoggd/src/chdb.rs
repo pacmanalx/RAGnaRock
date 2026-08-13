@@ -534,7 +534,8 @@ pub fn ensure_no_schema(url: &str) -> Result<(), String> {
         "CREATE TABLE IF NOT EXISTS nidhogg.no_valor (collection String, valor_norm String, \
          valor String, campo String, tipo String, base String, idx UInt32, nqi Float64, \
          version UInt64, linked_at String) ENGINE = ReplacingMergeTree(version) \
-         ORDER BY (collection, valor_norm, base, idx, campo)", 20)
+         ORDER BY (collection, valor_norm, base, idx, campo)", 20)?;
+    Ok(())
 }
 
 /// Dump atual de UMA coleção (a matéria-prima da ligação).
