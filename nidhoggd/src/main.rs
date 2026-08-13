@@ -406,9 +406,9 @@ fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
 }
 
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
-    // v4: CENSO determinístico do texto inteiro (poda de ponto final; o LLM fica na
-    // biblioteca pro enriquecimento dirigido futuro)
-    let ecfg = hash_hex("mencao|v4|top40");
+    // v5: censo determinístico no MIOLO (5-95% em docs >20k chars — mata o boilerplate
+    // Gutenberg que dominava a árvore); poda de ponto final; LLM fora do caminho crítico
+    let ecfg = hash_hex("mencao|v5|top40|miolo");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -420,7 +420,14 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
         let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
         if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        let mencoes = extract_mencoes(&text, MENCAO_TOP);
+        // censo SÓ NO MIOLO (5%–95%): capa/licença Gutenberg é idêntica em centenas de
+        // ebooks e dominava a árvore (mesma lição das janelas LLM). Doc curto (<20k) varre inteiro.
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let miolo: String = if n > 20_000 {
+            chars[n * 5 / 100..n * 95 / 100].iter().collect()
+        } else { text.clone() };
+        let mencoes = extract_mencoes(&miolo, MENCAO_TOP);
         let version = chdb::now_version();
         let at = now_stamp();
         let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq))| {
