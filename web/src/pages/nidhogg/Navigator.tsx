@@ -135,8 +135,13 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
     drag.current = { px: e.clientX, py: e.clientY, vx: view.x, vy: view.y }
   }
   function onMove(e: React.MouseEvent) {
-    if (!drag.current) return
-    setView((v) => ({ ...v, x: drag.current!.vx + (e.clientX - drag.current!.px), y: drag.current!.vy + (e.clientY - drag.current!.py) }))
+    // captura ANTES do setView: o updater roda depois (batched) e o mouseup pode
+    // ter zerado o drag nesse meio-tempo — ler drag.current lá dentro explodia em null
+    const d = drag.current
+    if (!d) return
+    const nx = d.vx + (e.clientX - d.px)
+    const ny = d.vy + (e.clientY - d.py)
+    setView((v) => ({ ...v, x: nx, y: ny }))
   }
 
   // zoom na RODA, ancorado no CURSOR (o ponto sob o mouse fica parado — comportamento de
