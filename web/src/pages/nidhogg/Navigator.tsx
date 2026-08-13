@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Crosshair, RotateCcw } from 'lucide-react'
 import { getNavNode, getNavSuggest } from '@/api/ragnarock'
 import { messageFromError } from '@/api/client'
@@ -132,9 +132,30 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
     if (!drag.current) return
     setView((v) => ({ ...v, x: drag.current!.vx + (e.clientX - drag.current!.px), y: drag.current!.vy + (e.clientY - drag.current!.py) }))
   }
-  function onWheel(e: React.WheelEvent) {
-    setView((v) => ({ ...v, zoom: Math.min(2.5, Math.max(0.25, v.zoom * (e.deltaY < 0 ? 1.12 : 0.89))) }))
-  }
+
+  // zoom na RODA, ancorado no CURSOR (o ponto sob o mouse fica parado — comportamento de
+  // mapa). Listener manual com passive:false — o onWheel do React é passivo e a página
+  // rolava junto, brigando com o zoom.
+  useEffect(() => {
+    const svg = svgRef.current
+    if (!svg) return
+    const handler = (e: WheelEvent) => {
+      e.preventDefault()
+      if (animRef.current) cancelAnimationFrame(animRef.current)
+      const rect = svg.getBoundingClientRect()
+      const mx = e.clientX - rect.left - rect.width / 2   // mouse relativo ao centro do palco
+      const my = e.clientY - rect.top - rect.height / 2
+      setView((v) => {
+        const z2 = Math.min(3, Math.max(0.2, v.zoom * (e.deltaY < 0 ? 1.15 : 0.87)))
+        // mantém o ponto do mundo sob o cursor no mesmo lugar da tela
+        const wx = (mx - v.x) / v.zoom
+        const wy = (my - v.y) / v.zoom
+        return { zoom: z2, x: mx - wx * z2, y: my - wy * z2 }
+      })
+    }
+    svg.addEventListener('wheel', handler, { passive: false })
+    return () => svg.removeEventListener('wheel', handler)
+  }, [])
 
   const lista = [...nodes.values()]
   const raioDe = (n: NavMapNode) => Math.min(34, 14 + Math.sqrt(n.peso) * 1.4)
@@ -192,8 +213,7 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
       <svg
         ref={svgRef}
         onMouseDown={onDown} onMouseMove={onMove} onMouseUp={() => (drag.current = null)} onMouseLeave={() => (drag.current = null)}
-        onWheel={onWheel}
-        className="h-[calc(100vh-260px)] min-h-[420px] w-full cursor-grab rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] active:cursor-grabbing"
+        className="h-[calc(100vh-260px)] min-h-[420px] w-full cursor-grab touch-none rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] active:cursor-grabbing"
       >
         <g transform={`translate(${view.x + (svgRef.current?.clientWidth ?? 900) / 2}, ${view.y + (svgRef.current?.clientHeight ?? 500) / 2}) scale(${view.zoom})`}>
           {/* arestas */}
