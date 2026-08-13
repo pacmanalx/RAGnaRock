@@ -1519,11 +1519,19 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         match mine_level0(&api, coll) {
             Some((src, pillars, n_bases, total_chunks)) => {
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
+                // saturação = fração do corpus com a digestão da camada ATIVA em dia.
+                // L0 digere tudo num passe (1.0 ao minerar); L1 mede pelo `pending` da
+                // classificação (a porta da consciência — extração vem atrás dela).
+                let mut sat: Option<f64> = if level >= 1 { None } else { Some(1.0) };
                 if level >= 1 {
                     // Fase 1: classifica {natureza,tipo} das bases novas/mudadas (doc_class no ClickHouse).
                     let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
+                    }
+                    if cl["ok"].as_bool() == Some(true) && n_bases > 0 {
+                        let pending = cl["pending"].as_u64().unwrap_or(0) as f64;
+                        sat = Some(((n_bases as f64 - pending) / n_bases as f64).clamp(0.0, 1.0));
                     }
                     // Fase 3: o L1 cria/mantém os MOLDES dos tipos não-CSV (1 tipo por ciclo). Roda
                     // ANTES da extração pra o molde já estar no registry quando o L0 for aplicar.
@@ -1547,6 +1555,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     k["source_hash"] = json!(src);
                     k["updated"] = json!(now_stamp());
                     k["knowledge"] = json!(pillars);
+                    if let Some(s) = sat { k["saturation"] = json!(s); }
                     k["provenance"] = json!({
                         "digestion_id": format!("l0-{}", &src[..src.len().min(8)]),
                         "at": now_stamp(), "via": "level0/no-ai",
@@ -1555,6 +1564,15 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     write_knowledge(&dir, coll, &k);   // nível 0 (léxico) numa escrita atômica
                     if !l0_same || force { mined.push(coll.clone()); }
                 } else {
+                    // a saturação avança MESMO sem o L0 mudar (a fila da Fase 1 anda por ciclo):
+                    // escrita leve só quando o valor de fato mudou (>0.1%)
+                    if let Some(s) = sat {
+                        let mut cur = read_knowledge(&dir, coll);
+                        if (cur["saturation"].as_f64().unwrap_or(0.0) - s).abs() > 0.001 {
+                            cur["saturation"] = json!(s);
+                            write_knowledge(&dir, coll, &cur);
+                        }
+                    }
                     skipped.push(coll.clone());
                 }
             }

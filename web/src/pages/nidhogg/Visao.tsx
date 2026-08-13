@@ -115,6 +115,7 @@ export function NidhoggVisao() {
                 <th className="pb-2 font-medium">Coleção</th>
                 <th className="pb-2 text-right font-medium">Bases</th>
                 <th className="pb-2 font-medium">Acesso</th>
+                <th className="pb-2 font-medium" title="fração do corpus com a digestão da camada ativa em dia (L1 = classificação)">Saturação</th>
                 <th className="pb-2 font-medium">Conhecimento</th>
                 <th className="pb-2 font-medium">Última digestão</th>
                 <th className="pb-2 text-right font-medium"></th>
@@ -126,6 +127,16 @@ export function NidhoggVisao() {
                   <td className="py-2 font-semibold">{c.collection}</td>
                   <td className="py-2 text-right tabular-nums">{c.bases}</td>
                   <td className="py-2"><span className="flex items-center gap-1.5"><Dot on={c.enabled} /> {c.enabled ? 'liberado' : 'bloqueado'}</span></td>
+                  <td className="py-2">
+                    {c.has_knowledge ? (
+                      <span className="flex items-center gap-2">
+                        <span className="h-1.5 w-[64px] overflow-hidden rounded-full bg-[var(--color-panel-2)]">
+                          <span className="block h-full rounded-full" style={{ width: `${c.saturation * 100}%`, background: c.saturation >= 0.999 ? 'var(--color-ok)' : 'var(--color-accent)' }} />
+                        </span>
+                        <span className="text-[11px] tabular-nums text-[var(--color-muted)]">{(c.saturation * 100).toFixed(0)}%</span>
+                      </span>
+                    ) : <span className="text-[12px] text-[var(--color-muted)]">—</span>}
+                  </td>
                   <td className="py-2 text-[12px] text-[var(--color-muted)]">{c.has_knowledge ? 'minerado ✓' : '—'}</td>
                   <td className="py-2 text-[12px] tabular-nums text-[var(--color-muted)]">{c.updated || '—'}</td>
                   <td className="py-2 text-right">
