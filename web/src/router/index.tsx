@@ -30,6 +30,7 @@ import { Comando } from '@/pages/Comando'
 import { Ingestao } from '@/pages/Ingestao'
 import { Performance } from '@/pages/Performance'
 import { Placeholder } from '@/pages/Placeholder'
+import { NidhoggGaps } from '@/pages/nidhogg/Gaps'
 import { Perfis } from '@/pages/admin/Perfis'
 import { Usuarios } from '@/pages/admin/Usuarios'
 import { Servicos } from '@/pages/admin/Servicos'
@@ -58,7 +59,7 @@ export const router = createBrowserRouter([
       { path: 'nidhogg/miner', element: <NidhoggMiner /> },
       { path: 'nidhogg/summary', element: <NidhoggSummary /> },
       { path: 'nidhogg/tree', element: <NidhoggTree /> },
-      { path: 'nidhogg/gaps', element: <Placeholder title="L3 · Gaps & Propostas" note="Fila das perguntas não-perguntadas." /> },
+      { path: 'nidhogg/gaps', element: <NidhoggGaps /> },
       { path: 'admin/perfis', element: <Perfis /> },
       { path: 'admin/usuarios', element: <Usuarios /> },
       { path: 'admin/servicos', element: <Servicos /> },

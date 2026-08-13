@@ -85,6 +85,15 @@ export const getNavSuggest = (collection: string, q: string) =>
 // [Think Navigator] expande um nó do mindmap (relacionados por co-ocorrência)
 export const getNavNode = (collection: string, norm: string) =>
   nidhogg.get<NavNode>(`/api/nidhogg/node?collection=${encodeURIComponent(collection)}&norm=${encodeURIComponent(norm)}`)
+// ── L3 · cockpit de destrave: re-tipar (origem=humano, sticky) + molde dirigido ──
+export const postReclass = (collection: string, base: string, tipo: string) =>
+  nidhogg.post<{ ok: boolean; tipo: string; natureza: string; csv: boolean; extraivel: boolean; nota: string; purgadas: number }>(
+    '/api/nidhogg/reclass', { collection, base, tipo })
+// molde dirigido: o humano diz O QUE extrair; sem gate de cobertura; iterável (version). LENTO (~1-3min).
+export const postMoldeDirigido = (tipo: string, collection: string, base: string, instrucao: string) =>
+  nidhogg.post<{ ok: boolean; tipo: string; campos: number; cobertura: number; amostra: Record<string, string> }>(
+    '/api/nidhogg/molde', { tipo, collection, base, instrucao })
+
 // [L2 · Dimensões] eixos declarados: o humano diz o que importa, a navegação pivota por eles
 export const getDimensoes = () => nidhogg.get<{ dimensoes: Dimensao[] }>('/api/nidhogg/dimensoes')
 export const saveDimensoes = (dimensoes: Dimensao[]) =>
