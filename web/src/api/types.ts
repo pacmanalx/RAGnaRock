@@ -163,6 +163,19 @@ export interface NidhoggRejeitados {
   rejeitados: { collection: string; base: string; natureza: string; tipo: string; motivo: string; nqi: number | null }[]
 }
 
+// ── Nidhogg L1: doctypes, prompts e moldes ──
+export interface NidhoggDoctypes { naturezas: string[]; tipos: string[] }
+export interface PromptTemplate { description: string; system: string; updated: string; max_tokens?: number }
+export interface NidhoggPrompts { templates: Record<string, PromptTemplate> }
+export interface MoldeTemplate {
+  schema?: string[]
+  regras?: string
+  cobertura?: number
+  origem?: string
+  created_at?: string
+  version?: number
+}
+
 // ── Nidhogg L0: conhecimento minerado (knowledge.json por coleção) ──
 export interface SalientRoot { dim: number; syllable: string; uidf: number; df: number; freq: number }
 export interface KnowledgeItem {

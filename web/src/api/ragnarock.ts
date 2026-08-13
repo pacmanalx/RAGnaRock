@@ -5,7 +5,7 @@ import type {
   ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
   ConfigResponse, SetConfigResponse, IngestorsResponse,
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
-  KnowledgeResponse, CacheDigestResponse,
+  KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -73,7 +73,15 @@ export const getNidhoggCollections = () => nidhogg.get<{ collections: NidhoggCol
 export const getNidhoggClasses = (coll?: string) =>
   nidhogg.get<NidhoggClassesSummary>(`/api/nidhogg/classes${coll ? `?collection=${encodeURIComponent(coll)}` : ''}`)
 export const getNidhoggEntities = () => nidhogg.get<NidhoggEntitiesSummary>('/api/nidhogg/entities')
-export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string, unknown> }>('/api/nidhogg/templates')
+export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string, MoldeTemplate> }>('/api/nidhogg/templates')
+// vocabulário EDITÁVEL do classificador (Fase 1) — editar reclassifica no próximo ciclo
+export const getNidhoggDoctypes = () => nidhogg.get<NidhoggDoctypes>('/api/nidhogg/doctypes')
+export const setNidhoggDoctypes = (naturezas: string[], tipos: string[]) =>
+  nidhogg.post<{ ok: boolean }>('/api/nidhogg/doctypes', { naturezas, tipos })
+// biblioteca de prompts nomeados (o que/como cada nível extrai)
+export const getNidhoggPrompts = () => nidhogg.get<NidhoggPrompts>('/api/nidhogg/prompts')
+export const saveNidhoggPrompt = (name: string, system: string, description: string, max_tokens?: number) =>
+  nidhogg.post<{ ok: boolean }>('/api/nidhogg/prompts/template', { name, system, description, ...(max_tokens ? { max_tokens } : {}) })
 export const getNidhoggRejeitados = () => nidhogg.get<NidhoggRejeitados>('/api/nidhogg/rejeitados')
 // conhecimento minerado do L0 (RootIndex + CorpusDict) de UMA coleção
 export const getNidhoggKnowledge = (collection: string) =>
