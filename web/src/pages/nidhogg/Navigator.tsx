@@ -20,7 +20,11 @@ interface NavMapNode {
 const R_EXPAND = 190      // raio dos filhos ao expandir
 const MAX_FILHOS = 10     // legibilidade: os 10 relacionados mais fortes por expansão
 
-export function ThinkNavigator({ collection }: { collection: string }) {
+export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
+  // coleção é FILTRO, não jaula: default = TODAS ('*'). Com 2500 coleções o select
+  // vira autocomplete — a API já aceita qualquer nome.
+  const [escopo, setEscopo] = useState('*')
+  const collection = escopo
   const [nodes, setNodes] = useState<Map<string, NavMapNode>>(new Map())
   const [edges, setEdges] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState<string | null>(null)
@@ -121,9 +125,18 @@ export function ThinkNavigator({ collection }: { collection: string }) {
         <input
           value={tema}
           onChange={(e) => buscarTema(e.target.value)}
-          placeholder={`tema central em «${collection}» (ex.: Jesus, Gandalf)…`}
+          placeholder="tema central (ex.: Jesus, Gandalf, EssenciaViva)…"
           className="w-[300px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-[13px] outline-none focus:border-[var(--color-accent)]"
         />
+        <select
+          value={escopo}
+          onChange={(e) => { setEscopo(e.target.value); setSugestoes([]); setSugVazio(false) }}
+          title="escopo da navegação — coleção é filtro; o default pensa sobre TODO o acumulado"
+          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-2 text-[12px] outline-none focus:border-[var(--color-accent)]"
+        >
+          <option value="*">🌐 todas as coleções</option>
+          {colecoes.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
         {nodes.size > 0 && (
           <button onClick={() => { setNodes(new Map()); setEdges(new Set()); setTema('') }}
             className="flex items-center gap-1.5 rounded-md border border-[var(--color-border)] px-3 py-2 text-[12px] text-[var(--color-muted)] hover:text-[var(--color-fg)]">
@@ -143,7 +156,7 @@ export function ThinkNavigator({ collection }: { collection: string }) {
             ))}
             {sugestoes.length === 0 && (
               <div className="px-3 py-2 text-[12px] text-[var(--color-muted)]">
-                nenhum assunto casa com "{tema.trim()}" na coleção <b>{collection}</b> — troque a coleção nas abas acima (ex.: Jesus vive em «livros»).
+                nenhum assunto casa com "{tema.trim()}"{escopo === '*' ? ' em nenhuma coleção' : <> na coleção <b>{escopo}</b> — tente «🌐 todas»</>}.
               </div>
             )}
           </div>

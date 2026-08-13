@@ -59,7 +59,7 @@ export function NidhoggTree() {
       )}
 
       {cols.loading && <Spinner />}
-      {todas.length > 0 && (
+      {vista === 'arvore' && todas.length > 0 && (
         <div className="flex flex-wrap items-center gap-1 border-b border-[var(--color-border)]">
           {todas.map((c) => (
             <button
@@ -91,7 +91,7 @@ export function NidhoggTree() {
       )}
 
       {ativa && vista === 'arvore' && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} onJump={(v) => setQ(v)} />}
-      {ativa && vista === 'navigator' && <ThinkNavigator key={`nav-${ativa}`} collection={ativa} />}
+      {vista === 'navigator' && <ThinkNavigator colecoes={todas.map((c) => c.collection)} />}
       {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )

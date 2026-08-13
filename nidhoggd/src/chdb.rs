@@ -581,14 +581,20 @@ pub fn insert_nos(url: &str, rows: &[NoValorRow]) -> Result<(), String> {
 /// A ÁRVORE: assuntos (nós com ≥2 participações) → ramos por tipo → registros.
 /// `q` filtra por substring do valor (a busca de assunto da tela).
 /// [Think Navigator] Sugestões LEVES: só (valor, norm, contagens) casando o prefixo —
-/// sem ramos nem co-ocorrência (a árvore completa pesa MB; digitação pede ms).
+/// sem ramos nem co-ocorrência. coll="*" = TODAS as coleções (coleção é FILTRO, não jaula:
+/// o mesmo assunto em coleções diferentes agrega — o pensamento não respeita fronteira).
 pub fn suggest_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" {
+        ("", vec![("q", q)])
+    } else {
+        (" AND collection={coll:String}", vec![("q", q), ("coll", coll)])
+    };
     let body = ch_query_param(url, &format!(
         "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nb \
          FROM nidhogg.no_valor FINAL \
-         WHERE collection={{coll:String}} AND positionCaseInsensitive(valor, {{q:String}}) > 0 \
+         WHERE positionCaseInsensitive(valor, {{q:String}}) > 0{wc} \
          GROUP BY valor_norm ORDER BY nb DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"),
-        &[("coll", coll), ("q", q)], 15)?;
+        &params, 20)?;
     let nodes: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|t| json!({"valor": t["v"], "valor_norm": t["valor_norm"], "registros": t["regs"], "bases": t["nb"]}))
@@ -681,26 +687,32 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
 }
 
 /// [Think Navigator] Um NÓ e seus relacionados — a expansão infinita do mindmap.
-/// Mesmas regras de co-ocorrência da árvore: registro estruturado liga por (base,idx);
-/// menção liga por base (mesmo livro).
+/// Regras de co-ocorrência: registro estruturado liga por (base,idx); menção liga por base.
+/// coll="*" = TODAS as coleções (o JOIN inclui collection: base homônima entre coleções
+/// distintas NÃO se liga por engano).
 pub fn node_json(url: &str, coll: &str, norm: &str, limit: usize) -> Result<Value, String> {
-    let stats = ch_query_param(url,
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" {
+        ("", vec![("norm", norm)])
+    } else {
+        (" AND collection={coll:String}", vec![("norm", norm), ("coll", coll)])
+    };
+    let stats = ch_query_param(url, &format!(
         "SELECT any(valor) v, count() regs, uniqExact(base) nb FROM nidhogg.no_valor FINAL \
-         WHERE collection={coll:String} AND valor_norm={norm:String} FORMAT JSONEachRow",
-        &[("coll", coll), ("norm", norm)], 15)?;
+         WHERE valor_norm={{norm:String}}{wc} FORMAT JSONEachRow"), &params, 20)?;
     let st: Value = stats.lines().next().and_then(|l| serde_json::from_str(l).ok()).unwrap_or(json!({}));
     if st["regs"].as_str().map(|s| s == "0").unwrap_or(st["regs"].as_i64() == Some(0)) {
         return Ok(json!({"valor_norm": norm, "found": false, "co": []}));
     }
+    let wc_p = if coll == "*" { "" } else { " WHERE collection={coll:String}" };
     let co_body = ch_query_param(url, &format!(
-        "WITH p AS (SELECT DISTINCT valor_norm, valor, tipo, base, idx FROM nidhogg.no_valor FINAL \
-                    WHERE collection={{coll:String}}) \
+        "WITH p AS (SELECT DISTINCT collection, valor_norm, valor, tipo, base, idx \
+                    FROM nidhogg.no_valor FINAL{wc_p}) \
          SELECT b.valor_norm filho, any(b.valor) v, count() n, uniqExact(b.base) nb \
-         FROM p a INNER JOIN p b ON a.base=b.base \
+         FROM p a INNER JOIN p b ON a.collection=b.collection AND a.base=b.base \
          WHERE a.valor_norm={{norm:String}} AND b.valor_norm != a.valor_norm \
            AND (a.idx=b.idx OR (a.tipo='mencao' AND b.tipo='mencao')) \
          GROUP BY filho ORDER BY n DESC LIMIT {limit} FORMAT JSONEachRow"),
-        &[("coll", coll), ("norm", norm)], 25)?;
+        &params, 30)?;
     let co: Vec<Value> = co_body.lines().filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|v| json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"], "bases": v["nb"]}))
