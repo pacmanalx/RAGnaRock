@@ -27,6 +27,7 @@ export function ThinkNavigator({ collection }: { collection: string }) {
   const [error, setError] = useState<string | null>(null)
   const [tema, setTema] = useState('')
   const [sugestoes, setSugestoes] = useState<{ valor: string; valor_norm: string }[]>([])
+  const [sugVazio, setSugVazio] = useState(false)
   const [view, setView] = useState({ x: 0, y: 0, zoom: 1 })
   const drag = useRef<{ px: number; py: number; vx: number; vy: number } | null>(null)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -38,11 +39,12 @@ export function ThinkNavigator({ collection }: { collection: string }) {
   function buscarTema(q: string) {
     setTema(q)
     if (debounceRef.current) clearTimeout(debounceRef.current)
-    if (q.trim().length < 2) { setSugestoes([]); return }
+    if (q.trim().length < 2) { setSugestoes([]); setSugVazio(false); return }
     debounceRef.current = setTimeout(async () => {
       try {
         const r = await getNavSuggest(collection, q.trim())
         setSugestoes(r.nodes.map((n) => ({ valor: n.valor, valor_norm: n.valor_norm })))
+        setSugVazio(r.nodes.length === 0)
       } catch (e) { setError(messageFromError(e)); setSugestoes([]) }
     }, 300)
   }
@@ -119,8 +121,8 @@ export function ThinkNavigator({ collection }: { collection: string }) {
         <input
           value={tema}
           onChange={(e) => buscarTema(e.target.value)}
-          placeholder="tema central (ex.: Jesus, Gandalf, EssenciaViva)…"
-          className="w-[280px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-[13px] outline-none focus:border-[var(--color-accent)]"
+          placeholder={`tema central em «${collection}» (ex.: Jesus, Gandalf)…`}
+          className="w-[300px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-[13px] outline-none focus:border-[var(--color-accent)]"
         />
         {nodes.size > 0 && (
           <button onClick={() => { setNodes(new Map()); setEdges(new Set()); setTema('') }}
@@ -131,14 +133,19 @@ export function ThinkNavigator({ collection }: { collection: string }) {
         <span className="text-[11px] text-[var(--color-muted)]">
           {nodes.size > 0 ? `${nodes.size} nó(s) · ${edges.size} ligação(ões) · clique num nó pra expandir · arraste pra navegar · roda = zoom` : 'digite um tema e escolha na lista — o mapa nasce dele'}
         </span>
-        {sugestoes.length > 0 && (
-          <div className="absolute left-6 top-11 z-20 w-[300px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 shadow-xl">
+        {(sugestoes.length > 0 || (sugVazio && tema.trim().length >= 2)) && (
+          <div className="absolute left-6 top-11 z-20 w-[320px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 shadow-xl">
             {sugestoes.map((s) => (
               <button key={s.valor_norm} onClick={() => centrar(s.valor, s.valor_norm)}
                 className="block w-full px-3 py-1.5 text-left text-[13px] hover:bg-[var(--color-panel-2)]">
                 {s.valor}
               </button>
             ))}
+            {sugestoes.length === 0 && (
+              <div className="px-3 py-2 text-[12px] text-[var(--color-muted)]">
+                nenhum assunto casa com "{tema.trim()}" na coleção <b>{collection}</b> — troque a coleção nas abas acima (ex.: Jesus vive em «livros»).
+              </div>
+            )}
           </div>
         )}
       </div>
