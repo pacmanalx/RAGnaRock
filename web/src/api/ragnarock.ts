@@ -6,7 +6,7 @@ import type {
   ConfigResponse, SetConfigResponse, IngestorsResponse,
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
-  TreeResponse,
+  TreeResponse, NavNode,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -78,6 +78,9 @@ export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string,
 // [L2] a árvore de assuntos: nós de valor ligando registros do dump (?q= busca)
 export const getNidhoggTree = (collection: string, q = '') =>
   nidhogg.get<TreeResponse>(`/api/nidhogg/tree?collection=${encodeURIComponent(collection)}${q ? `&q=${encodeURIComponent(q)}` : ''}`)
+// [Think Navigator] expande um nó do mindmap (relacionados por co-ocorrência)
+export const getNavNode = (collection: string, norm: string) =>
+  nidhogg.get<NavNode>(`/api/nidhogg/node?collection=${encodeURIComponent(collection)}&norm=${encodeURIComponent(norm)}`)
 // vocabulário EDITÁVEL do classificador (Fase 1) — editar reclassifica no próximo ciclo
 export const getNidhoggDoctypes = () => nidhogg.get<NidhoggDoctypes>('/api/nidhogg/doctypes')
 export const setNidhoggDoctypes = (naturezas: string[], tipos: string[]) =>

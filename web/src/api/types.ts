@@ -176,6 +176,16 @@ export interface TreeNode {
 }
 export interface TreeResponse { collection: string; count: number; nodes: TreeNode[]; note?: string }
 
+// [Think Navigator] expansão de UM nó do mindmap
+export interface NavNode {
+  found: boolean
+  valor: string
+  valor_norm: string
+  registros: number | string
+  bases: number | string
+  co: { valor: string; valor_norm: string; n: number | string; bases: number | string }[]
+}
+
 // ── Nidhogg L1: doctypes, prompts e moldes ──
 export interface NidhoggDoctypes { naturezas: string[]; tipos: string[] }
 export interface PromptTemplate { description: string; system: string; updated: string; max_tokens?: number }

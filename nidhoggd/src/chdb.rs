@@ -663,3 +663,34 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
     }).collect();
     Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
 }
+
+/// [Think Navigator] Um NÓ e seus relacionados — a expansão infinita do mindmap.
+/// Mesmas regras de co-ocorrência da árvore: registro estruturado liga por (base,idx);
+/// menção liga por base (mesmo livro).
+pub fn node_json(url: &str, coll: &str, norm: &str, limit: usize) -> Result<Value, String> {
+    let stats = ch_query_param(url,
+        "SELECT any(valor) v, count() regs, uniqExact(base) nb FROM nidhogg.no_valor FINAL \
+         WHERE collection={coll:String} AND valor_norm={norm:String} FORMAT JSONEachRow",
+        &[("coll", coll), ("norm", norm)], 15)?;
+    let st: Value = stats.lines().next().and_then(|l| serde_json::from_str(l).ok()).unwrap_or(json!({}));
+    if st["regs"].as_str().map(|s| s == "0").unwrap_or(st["regs"].as_i64() == Some(0)) {
+        return Ok(json!({"valor_norm": norm, "found": false, "co": []}));
+    }
+    let co_body = ch_query_param(url, &format!(
+        "WITH p AS (SELECT DISTINCT valor_norm, valor, tipo, base, idx FROM nidhogg.no_valor FINAL \
+                    WHERE collection={{coll:String}}) \
+         SELECT b.valor_norm filho, any(b.valor) v, count() n, uniqExact(b.base) nb \
+         FROM p a INNER JOIN p b ON a.base=b.base \
+         WHERE a.valor_norm={{norm:String}} AND b.valor_norm != a.valor_norm \
+           AND (a.idx=b.idx OR (a.tipo='mencao' AND b.tipo='mencao')) \
+         GROUP BY filho ORDER BY n DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &[("coll", coll), ("norm", norm)], 25)?;
+    let co: Vec<Value> = co_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"], "bases": v["nb"]}))
+        .collect();
+    Ok(json!({
+        "found": true, "valor": st["v"], "valor_norm": norm,
+        "registros": st["regs"], "bases": st["nb"], "co": co,
+    }))
+}

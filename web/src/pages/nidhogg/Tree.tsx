@@ -6,6 +6,7 @@ import type { TreeNode } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
+import { ThinkNavigator } from './Navigator'
 
 // L2 · KnowledgeTree — a árvore de ASSUNTOS destilada do dump denso (zero IA).
 // Nó = valor-entidade (CNPJ, nome…) que aparece em ≥2 registros; ramos = tipos de
@@ -22,6 +23,7 @@ export function NidhoggTree() {
   const [q, setQ] = useState('')
   const [qAplicado, setQAplicado] = useState('')
   const [inspect, setInspect] = useState<ChunkTarget | null>(null)
+  const [vista, setVista] = useState<'arvore' | 'navigator'>('arvore')
 
   // debounce da busca (400ms)
   useEffect(() => {
@@ -36,6 +38,17 @@ export function NidhoggTree() {
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-lg font-semibold">L2 · KnowledgeTree</h1>
         <span className="text-[12px] text-[var(--color-muted)]">assuntos destilados do dump — quem compartilha valor está ligado (zero IA)</span>
+        <div className="grow" />
+        <div className="flex overflow-hidden rounded-md border border-[var(--color-border)]">
+          {(['arvore', 'navigator'] as const).map((v) => (
+            <button key={v} onClick={() => setVista(v)}
+              className={`px-3 py-1.5 text-[12px] font-medium transition-colors ${
+                vista === v ? 'bg-[var(--color-accent)] text-[var(--color-accent-fg)]' : 'bg-[var(--color-panel-2)] text-[var(--color-muted)] hover:text-[var(--color-fg)]'
+              }`}>
+              {v === 'arvore' ? '🌳 Árvore' : '🧠 Think Navigator'}
+            </button>
+          ))}
+        </div>
       </div>
 
       {nivelBaixo && (
@@ -63,19 +76,22 @@ export function NidhoggTree() {
             </button>
           ))}
           <div className="grow" />
-          <div className="relative pb-1.5">
-            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-[60%] text-[var(--color-muted)]" />
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="buscar assunto (nome, CNPJ…)…"
-              className="w-[240px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1.5 pl-8 pr-3 text-[12px] outline-none focus:border-[var(--color-accent)]"
-            />
-          </div>
+          {vista === 'arvore' && (
+            <div className="relative pb-1.5">
+              <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-[60%] text-[var(--color-muted)]" />
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="buscar assunto (nome, CNPJ…)…"
+                className="w-[240px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1.5 pl-8 pr-3 text-[12px] outline-none focus:border-[var(--color-accent)]"
+              />
+            </div>
+          )}
         </div>
       )}
 
-      {ativa && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} onJump={(v) => setQ(v)} />}
+      {ativa && vista === 'arvore' && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} onJump={(v) => setQ(v)} />}
+      {ativa && vista === 'navigator' && <ThinkNavigator key={`nav-${ativa}`} collection={ativa} />}
       {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )
