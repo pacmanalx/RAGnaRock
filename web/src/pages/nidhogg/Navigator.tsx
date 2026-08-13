@@ -275,17 +275,20 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
         </g>
       </svg>
 
-      {refs && <RefsModal valor={refs.valor} escopo={escopo} onClose={() => setRefs(null)}
-        onOpenDoc={(t) => { setRefs(null); setInspect(t) }} />}
+      {/* referências ficam VIVAS por baixo do documento — fechar o doc volta pra lista
+          (folhear referência a referência sem repetir o duplo clique) */}
+      {refs && <RefsModal valor={refs.valor} escopo={escopo} docAberto={!!inspect}
+        onClose={() => setRefs(null)} onOpenDoc={(t) => setInspect(t)} />}
       {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )
 }
 
 // ───────── modal de referências: o valor buscado no CORPUS (a camada RAGnaRock) ─────────
-function RefsModal({ valor, escopo, onClose, onOpenDoc }: {
+function RefsModal({ valor, escopo, docAberto, onClose, onOpenDoc }: {
   valor: string
   escopo: string
+  docAberto: boolean   // ChunkModal empilhado por cima — o Esc é dele, não desta
   onClose: () => void
   onOpenDoc: (t: ChunkTarget) => void
 }) {
@@ -301,13 +304,13 @@ function RefsModal({ valor, escopo, onClose, onOpenDoc }: {
   }, [valor, escopo])
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !docAberto) onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, docAberto])
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div onClick={(e) => e.stopPropagation()}
         className="flex max-h-[80vh] w-[720px] max-w-[92vw] flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]">
         <header className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
