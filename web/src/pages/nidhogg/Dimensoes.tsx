@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { Compass, Pencil, Plus, Search, Trash2 } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
-import { getDimensoes, saveDimensoes, getDimensaoValores, getDimensoesGaps } from '@/api/ragnarock'
+import { getDimensoes, saveDimensoes, getDimensaoValores, getDimensoesGaps, getNidhoggClasses } from '@/api/ragnarock'
 import type { Dimensao, DimValorItem, DimGap } from '@/api/types'
+import { ModalDirigido, type AcaoDirigido } from './Gaps'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 
@@ -19,6 +20,8 @@ export function DimensoesPanel({ colecoes, onNavegar }: {
   onNavegar: (valor: string, norm: string, escopo: string) => void
 }) {
   const dims = useAsync(getDimensoes, [])
+  const classes = useAsync(getNidhoggClasses, [])   // amostras candidatas pro molde dirigido dos gaps
+  const [dirigir, setDirigir] = useState<AcaoDirigido | null>(null)
   const [sel, setSel] = useState<string | null>(null)
   const [escopo, setEscopo] = useState('*')
   const [editando, setEditando] = useState<Dimensao | null>(null)
@@ -87,7 +90,11 @@ export function DimensoesPanel({ colecoes, onNavegar }: {
           {erro && <div className="mt-2 text-[12px] text-[var(--color-crit)]">{erro}</div>}
         </Panel>
 
-        <GapsPanel escopo={escopo} recarregarKey={dims.data ? JSON.stringify(lista) : ''} />
+        <GapsPanel escopo={escopo} recarregarKey={dims.data ? JSON.stringify(lista) : ''} onDirigir={setDirigir} />
+        {dirigir && (
+          <ModalDirigido acao={dirigir} bases={classes.data?.bases ?? []}
+            onClose={() => setDirigir(null)} onDone={() => setDirigir(null)} />
+        )}
       </div>
 
       {/* ── coluna de navegação (valores do eixo) ── */}
@@ -239,8 +246,11 @@ function ValoresDimensao({ dim, escopo, setEscopo, colecoes, onNavegar }: {
   )
 }
 
-// ── gaps: onde o eixo declarado NÃO alcança (a demanda de mastigação → L3) ──
-function GapsPanel({ escopo, recarregarKey }: { escopo: string; recarregarKey: string }) {
+// ── gaps: onde o eixo declarado NÃO alcança — é L2 (exigência determinística); o chip abre
+// o molde dirigido pré-preenchido (a alavanca que re-dirige a mastigação do L1) ──
+function GapsPanel({ escopo, recarregarKey, onDirigir }: {
+  escopo: string; recarregarKey: string; onDirigir: (a: AcaoDirigido) => void
+}) {
   const gaps = useAsync(() => getDimensoesGaps(escopo), [escopo, recarregarKey])
   const [aberto, setAberto] = useState<string | null>(null)
 
@@ -266,8 +276,9 @@ function GapsPanel({ escopo, recarregarKey }: { escopo: string; recarregarKey: s
               {aberto === g.nome && !ok && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {g.gaps.map((t) => (
-                    <span key={t} title={g.nota}
-                      className="rounded-full border border-[var(--color-warn)]/40 bg-[var(--color-warn)]/10 px-2 py-0.5 text-[10px]">{t}</span>
+                    <button key={t} title={`${g.nota} — clique pra abrir o molde dirigido pré-preenchido`}
+                      onClick={() => onDirigir({ tipo: t, instrucao: `extraia os campos do eixo "${g.nome}" deste tipo de documento` })}
+                      className="rounded-full border border-[var(--color-warn)]/40 bg-[var(--color-warn)]/10 px-2 py-0.5 text-[10px] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]">{t} 🔨</button>
                   ))}
                 </div>
               )}

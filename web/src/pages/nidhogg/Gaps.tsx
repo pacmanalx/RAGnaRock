@@ -1,21 +1,21 @@
 import { useMemo, useState } from 'react'
-import { Compass, Hammer, Lightbulb, Tag, X } from 'lucide-react'
+import { Hammer, Lightbulb, Tag, X } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
 import {
   getNidhoggRejeitados, getNidhoggTemplates, getNidhoggClasses, getNidhoggDoctypes,
-  getDimensoesGaps, postReclass, postMoldeDirigido,
+  postReclass, postMoldeDirigido,
 } from '@/api/ragnarock'
 import type { MoldeTemplate } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 
-// L3 · Gaps & Propostas — o cockpit de DESTRAVE. Três filas determinísticas de "onde o motor
-// não alcança" (rejeitados de classe, moldes reprovados, gaps de dimensão) com as duas ações
-// humanas que destravam: RE-TIPAR (origem=humano, sticky — o LLM nunca reverte) e MOLDE
-// DIRIGIDO (o humano diz o que extrair; sem gate; iterável). A camada propositiva por IA
-// ("perguntas não-perguntadas") nasce em cima destas filas.
+// L3 · Gaps & Propostas — a camada da MASTIGAÇÃO 100% COM IA. Aqui vive o que a IA não deu
+// conta sozinha (classificação rejeitada, molde reprovado) com as duas alavancas que a
+// re-dirigem — RE-TIPAR (origem=humano, sticky) e MOLDE DIRIGIDO (você diz o que extrair;
+// sem gate; iterável) — e, por vir, a camada propositiva (perguntas não-perguntadas).
+// Doutrina: gap de DIMENSÃO é navegação/exigência DETERMINÍSTICA → mora no L2 (📐 Dimensões).
 
-type AcaoDirigido = { tipo: string; collection?: string; base?: string; instrucao?: string }
+export type AcaoDirigido = { tipo: string; collection?: string; base?: string; instrucao?: string }
 type AcaoRetipar = { collection: string; base: string; tipoAtual: string }
 
 export function NidhoggGaps() {
@@ -23,7 +23,6 @@ export function NidhoggGaps() {
   const tpls = useAsync(getNidhoggTemplates, [])
   const cls = useAsync(getNidhoggClasses, [])
   const dts = useAsync(getNidhoggDoctypes, [])
-  const gaps = useAsync(() => getDimensoesGaps('*'), [])
 
   const [dirigido, setDirigido] = useState<AcaoDirigido | null>(null)
   const [retipar, setRetipar] = useState<AcaoRetipar | null>(null)
@@ -34,17 +33,16 @@ export function NidhoggGaps() {
     return Object.entries(t).filter(([, v]) => v.origem === 'reprovado')
   }, [tpls.data])
 
-  function recarregarTudo() { rej.reload(); tpls.reload(); cls.reload(); gaps.reload() }
+  function recarregarTudo() { rej.reload(); tpls.reload(); cls.reload() }
 
-  const nFilas = (rej.data?.count ?? 0) + reprovados.length +
-    (gaps.data?.gaps ?? []).reduce((s, g) => s + g.gaps.length, 0)
+  const nFilas = (rej.data?.count ?? 0) + reprovados.length
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-lg font-semibold">L3 · Gaps &amp; Propostas</h1>
         <span className="text-[12px] text-[var(--color-muted)]">
-          onde o motor não alcança — e as duas alavancas humanas que destravam: re-tipar e molde dirigido
+          a mastigação com IA — onde ela falhou, onde você a re-dirige, e o que ela vai propor
         </span>
         <div className="grow" />
         <span className="rounded-full border border-[var(--color-border)] px-3 py-1 text-[12px] tabular-nums text-[var(--color-muted)]">
@@ -117,56 +115,14 @@ export function NidhoggGaps() {
         </div>
       </Panel>
 
-      {/* ── fila 3: gaps de dimensão (eixos declarados sem entrega) ── */}
-      <Panel title="📐 Gaps de dimensão — eixos declarados que o corpus não entrega">
-        {gaps.loading && <Spinner />}
-        {gaps.error && <ErrorBox message={messageFromError(gaps.error)} onRetry={gaps.reload} />}
-        <div className="space-y-2">
-          {(gaps.data?.gaps ?? []).map((g) => (
-            <div key={g.nome} className="rounded-md border border-[var(--color-border)] px-3 py-2">
-              <div className="flex items-center gap-2">
-                <Compass size={13} className="text-[var(--color-accent)]" />
-                <span className="text-[13px] font-semibold">{g.nome}</span>
-                <span className="text-[11px] tabular-nums text-[var(--color-muted)]">{g.cobertos}/{g.alvo} tipo(s) cobertos</span>
-              </div>
-              {g.gaps.length === 0 ? (
-                <div className="mt-1 text-[11px] text-[var(--color-ok)]">eixo plenamente alimentado.</div>
-              ) : (
-                <div className="mt-1.5 flex flex-wrap gap-1.5">
-                  {g.gaps.map((tipo) => {
-                    const candidatas = bases.filter((b) => b.tipo === tipo)
-                    return (
-                      <button key={tipo}
-                        onClick={() => setDirigido({
-                          tipo,
-                          collection: candidatas[0]?.collection, base: candidatas[0]?.name,
-                          instrucao: `extraia os campos do eixo "${g.nome}" deste tipo de documento`,
-                        })}
-                        title={`o tipo "${tipo}" não entrega o eixo ${g.nome} — clique pra abrir um molde dirigido pré-preenchido`}
-                        className="rounded-full border border-[var(--color-warn)]/40 bg-[var(--color-warn)]/10 px-2.5 py-1 text-[11px] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]">
-                        {tipo} <Hammer size={10} className="ml-0.5 inline" />
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-        <div className="mt-2 text-[11px] text-[var(--color-muted)]">
-          os eixos são declarados no cadastro de Dimensões (L2 → 📐). O gap é a "mastigação forçada": você
-          exigiu o eixo, o tipo não entrega — o molde dirigido é a resposta.
-        </div>
-      </Panel>
-
       {/* ── a camada propositiva (por vir) ── */}
       <Panel title="💡 Perguntas não-perguntadas (propositivo)">
         <div className="flex items-start gap-2 text-[13px] text-[var(--color-muted)]">
           <Lightbulb size={15} className="mt-0.5 shrink-0 text-[var(--color-warn)]" />
           <div>
             A camada que PROPÕE — "o CNPJ X aparece em 40 comprovantes mas não tem contrato no corpus;
-            falta o contrato ou falta ingerir?" — nasce em cima destas três filas + do grafo do L2.
-            IA cara só nos pontos de decisão, como manda a doutrina. Em construção.
+            falta o contrato ou falta ingerir?" — nasce em cima destas filas, do grafo e dos gaps de
+            dimensão do L2 (📐). IA cara só nos pontos de decisão, como manda a doutrina. Em construção.
           </div>
         </div>
       </Panel>
@@ -231,7 +187,8 @@ function ModalRetipar({ acao, tipos, onClose, onDone }: {
 }
 
 // ── modal molde dirigido: instrução humana → L1 cria o molde SEM gate (iterável) ──
-function ModalDirigido({ acao, bases, onClose, onDone }: {
+// exportado: o L2 (gaps de dimensão em 📐 Dimensões) abre o mesmo modal pré-preenchido
+export function ModalDirigido({ acao, bases, onClose, onDone }: {
   acao: AcaoDirigido
   bases: { collection: string; name: string; tipo: string }[]
   onClose: () => void; onDone: () => void
