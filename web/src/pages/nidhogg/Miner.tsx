@@ -1,6 +1,9 @@
 import { useMemo, useState } from 'react'
 import { useAsync } from '@/hooks/useAsync'
-import { getNidhoggCollections, getNidhoggKnowledge, getNidhoggCacheDigest } from '@/api/ragnarock'
+import {
+  getNidhoggCollections, getNidhoggKnowledge, getNidhoggCacheDigest,
+  getNidhoggClasses, getNidhoggTemplates,
+} from '@/api/ragnarock'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 
 // L0 · Minerador — o nível determinístico (zero IA). Mostra o que o worm MINEROU:
@@ -48,6 +51,7 @@ export function NidhoggMiner() {
         <div className="text-[13px] text-[var(--color-muted)]">nenhuma coleção minerada — libere o acesso do worm na Visão geral e rode um ciclo.</div>
       )}
 
+      {ativa && <ClustersDeForma key={`f-${ativa}`} collection={ativa} />}
       {ativa && <ColecaoMinerada key={ativa} collection={ativa} />}
 
       {/* ── pilar GLOBAL: o que os humanos perguntam (digest do cache de expansão) ── */}
@@ -78,6 +82,83 @@ export function NidhoggMiner() {
         )}
       </Panel>
     </div>
+  )
+}
+
+// ───────────────────────── clusters de FORMA (o agrupador do "1 molde por forma") ─────────────────────────
+function ClustersDeForma({ collection }: { collection: string }) {
+  const cls = useAsync(() => getNidhoggClasses(collection), [collection])
+  const tpls = useAsync(getNidhoggTemplates, [])
+
+  // agrupa as bases classificadas por (tipo, forma) e casa com o registry de moldes
+  const clusters = useMemo(() => {
+    const map = new Map<string, { tipo: string; forma: string; natureza: string; csv: boolean; docs: number }>()
+    for (const b of cls.data?.bases ?? []) {
+      const forma = b.forma ?? ''
+      const key = `${b.tipo}|${forma}`
+      const e = map.get(key) ?? { tipo: b.tipo, forma, natureza: b.natureza, csv: b.csv === 1, docs: 0 }
+      e.docs += 1
+      map.set(key, e)
+    }
+    return [...map.values()].sort((a, b) => b.docs - a.docs)
+  }, [cls.data])
+
+  const templates = tpls.data?.templates ?? {}
+  const moldeDe = (c: { tipo: string; forma: string; natureza: string; csv: boolean }) => {
+    if (c.csv) return { label: 'CSV determinístico', cls: 'text-[var(--color-ok)]', hint: 'tabular regular — parser CSV, zero LLM, nem precisa de molde' }
+    if (c.natureza !== 'documento') return { label: 'não gera registro', cls: 'text-[var(--color-muted)]', hint: `natureza ${c.natureza} — narrativo/código não têm campos rotulados; não é refugo` }
+    const composta = c.forma ? `${c.tipo}@${c.forma}` : ''
+    const esp = composta ? templates[composta] : undefined
+    if (esp) {
+      const her = esp.origem === 'herdado'
+      return {
+        label: `molde da forma ${her ? '♻ herdado' : esp.origem === 'humano' ? '👤 dirigido' : '🧠 llm'}${esp.cobertura != null ? ` · ${(esp.cobertura * 100).toFixed(0)}%` : ''}`,
+        cls: 'text-[var(--color-ok)]',
+        hint: her ? 'o molde do tipo puro cobriu esta forma (≥70% na amostra) — alias materializado SEM LLM' : `molde específico ${composta}`,
+      }
+    }
+    if (templates[c.tipo]) return { label: 'molde do tipo (fallback)', cls: 'text-[var(--color-accent)]', hint: 'extrai com o molde do tipo puro; o próximo ciclo pode herdar ou criar um específico da forma' }
+    return { label: 'sem molde', cls: 'text-[var(--color-warn)]', hint: 'na fila do L1 (cria por cluster, 1 por ciclo) — ou dê um molde dirigido na L3' }
+  }
+
+  return (
+    <Panel title="Clusters de forma — o agrupador estrutural (1 molde por forma)">
+      <div className="mb-3 text-[11px] text-[var(--color-muted)]">
+        documentos irmãos de forma (mesmo esqueleto de rótulos ⌗) compartilham o molde — 100 mil PIX = 1 molde.
+        O LLM cria por cluster e se dispensa; formas cobertas pelo molde do tipo viram herança sem IA.
+      </div>
+      {cls.error && <ErrorBox message={cls.error} onRetry={cls.reload} />}
+      {(cls.loading || tpls.loading) ? <Spinner /> : (
+        <table className="w-full text-[13px]">
+          <thead>
+            <tr className="border-b border-[var(--color-border)] text-left text-[11px] uppercase tracking-wider text-[var(--color-muted)]">
+              <th className="pb-1.5 font-medium">Tipo</th>
+              <th className="pb-1.5 font-medium">Forma</th>
+              <th className="pb-1.5 text-right font-medium">Docs</th>
+              <th className="pb-1.5 font-medium">Extração</th>
+            </tr>
+          </thead>
+          <tbody>
+            {clusters.map((c) => {
+              const m = moldeDe(c)
+              return (
+                <tr key={`${c.tipo}|${c.forma}`} className="border-b border-[var(--color-border)]/40">
+                  <td className="py-1.5 font-semibold">{c.tipo}</td>
+                  <td className="py-1.5">
+                    {c.forma
+                      ? <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[11px]" title="assinatura estrutural (hash do esqueleto de rótulos)">⌗{c.forma}</span>
+                      : <span className="text-[11px] text-[var(--color-muted)]">— sem estrutura rotulada</span>}
+                  </td>
+                  <td className="py-1.5 text-right tabular-nums">{c.docs}</td>
+                  <td className="py-1.5 text-[12px]"><span className={m.cls} title={m.hint}>{m.label}</span></td>
+                </tr>
+              )
+            })}
+            {clusters.length === 0 && <tr><td colSpan={4} className="py-2 text-[12px] text-[var(--color-muted)]">nenhum documento classificado nesta coleção ainda (a forma nasce na Fase 1).</td></tr>}
+          </tbody>
+        </table>
+      )}
+    </Panel>
   )
 }
 
