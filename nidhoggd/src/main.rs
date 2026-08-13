@@ -335,7 +335,7 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
 // (nomes próprios por capitalização, CPU barata, cobertura 100%); o LLM vira enriquecedor
 // dirigido no futuro. Os registros {mencao, freq} entram no dump e o mine_links cruza.
 const MENCAO_BASES_PER_CYCLE: usize = 60;  // varredura é CPU — o corpus inteiro em poucos ciclos
-const MENCAO_TOP_MAX: usize = 800;         // proteção patológica, NÃO ranking por vaga
+const MENCAO_TOP_MAX: usize = 2500;        // proteção patológica, NÃO ranking por vaga
 const MENCAO_MIN_FREQ: u32 = 3;            // aparece ≥3× no livro = personagem/entidade, não acaso
 
 /// v7: SEM escassez artificial — entra TUDO que passa no piso de frequência. Raridade não é
@@ -347,11 +347,24 @@ fn mencao_top(_n_chars: usize) -> usize { MENCAO_TOP_MAX }
 /// "de/da/do/G." — José de Arimateia, Ellen G. White), contadas no texto INTEIRO. Palavra única
 /// capitalizada só vale se a forma minúscula NÃO domina (mata o "The/O/A" de início de frase).
 fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
-    extract_mencoes_min(text, top, MENCAO_MIN_FREQ)
+    extract_mencoes_lf(text, top, MENCAO_MIN_FREQ, None)
 }
-/// Variante com piso de frequência parametrizado — o censo POR CHUNK usa piso 1 no chunk
-/// (o piso global ≥3 aplica no acumulado da base).
-fn extract_mencoes_min(text: &str, top: usize, min_freq: u32) -> Vec<(String, u32)> {
+/// [v9] Conta as palavras de inicial MINÚSCULA de um texto — a estatística que desmascara
+/// "palavra comum capitalizada por posição". No censo por chunk ela é computada no LIVRO
+/// INTEIRO (por chunk era fraca demais: "Então" 1× no chunk passava e inflava o teto).
+fn lower_freq_de(text: &str) -> std::collections::HashMap<String, u32> {
+    let mut m = std::collections::HashMap::new();
+    for w in text.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '\'' || c == '-')) {
+        if w.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+            *m.entry(w.to_lowercase()).or_insert(0) += 1;
+        }
+    }
+    m
+}
+/// Variante com piso parametrizado e estatística de minúsculas EXTERNA (o censo por chunk
+/// passa a do livro inteiro; None = computa local, comportamento clássico).
+fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
+                      lf_ext: Option<&std::collections::HashMap<String, u32>>) -> Vec<(String, u32)> {
     const CONECTORES: &[&str] = &["de", "da", "do", "dos", "das", "van", "von", "del", "la", "e"];
     let stop = |w: &str| matches!(w.to_lowercase().as_str(),
         "the" | "a" | "o" | "os" | "as" | "um" | "uma" | "and" | "but" | "he" | "she" | "it"
@@ -366,15 +379,15 @@ fn extract_mencoes_min(text: &str, top: usize, min_freq: u32) -> Vec<(String, u3
             && w.chars().filter(|c| c.is_alphabetic()).count() >= 2
     };
     let inicial = |w: &str| w.len() <= 2 && w.ends_with('.') && w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-    // contagem de minúsculas (pra rejeitar palavra comum capitalizada por posição)
-    let mut lower_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // contagem de minúsculas (pra rejeitar palavra comum capitalizada por posição) —
+    // externa quando o chamador tem estatística melhor (o livro inteiro)
+    let local_lf;
+    let lower_freq: &std::collections::HashMap<String, u32> = match lf_ext {
+        Some(m) => m,
+        None => { local_lf = lower_freq_de(text); &local_lf }
+    };
     let words: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '\'' || c == '-'))
         .filter(|w| !w.is_empty()).collect();
-    for w in &words {
-        if w.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
-            *lower_freq.entry(w.to_lowercase()).or_insert(0) += 1;
-        }
-    }
     let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut i = 0;
     while i < words.len() {
@@ -416,9 +429,9 @@ fn extract_mencoes_min(text: &str, top: usize, min_freq: u32) -> Vec<(String, u3
 }
 
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
-    // v8: censo POR CHUNK — grava as posições de cada menção (o eixo do tempo narrativo).
-    // Co-ocorrência de menção vira proximidade de CENA (mesmo chunk), não de arquivo.
-    let ecfg = hash_hex("mencao|v8|posicoes|freq-gate|miolo");
+    // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
+    // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
+    let ecfg = hash_hex("mencao|v9|lf-global|posicoes|miolo");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -433,10 +446,16 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
         // miolo POR ÍNDICE de chunk (5%–95% em docs com >10 chunks): capa/licença Gutenberg fora
         let nch = chunks.len();
         let (clo, chi) = if nch > 10 { (nch * 5 / 100, nch * 95 / 100) } else { (0, nch) };
+        // anti-ruído GLOBAL: a estatística de minúsculas vem do miolo INTEIRO do livro
+        let miolo_lf = {
+            let todo: String = chunks[clo..chi.max(clo + 1).min(nch)].iter()
+                .map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" ");
+            lower_freq_de(&todo)
+        };
         // varre POR CHUNK e acumula (freq total, posições) por menção — a chave da cena
         let mut acc: std::collections::BTreeMap<String, (String, u32, Vec<usize>)> = std::collections::BTreeMap::new();
         for (cid, ctext) in &chunks[clo..chi.max(clo + 1).min(nch)] {
-            for (nome, f) in extract_mencoes_min(ctext, 200, 1) {
+            for (nome, f) in extract_mencoes_lf(ctext, 300, 1, Some(&miolo_lf)) {
                 // dentro do chunk o piso é 1 (o piso global ≥3 aplica no total)
                 let key = norm_valor("mencao", &nome).unwrap_or_else(|| nome.to_lowercase());
                 let e = acc.entry(key).or_insert((nome, 0, vec![]));
@@ -461,6 +480,15 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
                 state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
             }
         }).collect();
+        // base SEM menção grava sentinela (senão nunca checkpointa e fica eterna na fila)
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: 0, dado: json!({"mencao": ""}).to_string(), modo: "mencao".to_string(),
+                nqi: 1.0, prov: json!({"via": "mencao-det", "vazio": true, "n_chunks": 0, "scan": "por-chunk"}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
         // base SEM menções também grava (rows vazio ⇒ marca via linha sentinela? não: precisa
         // de ao menos 1 linha pro checkpoint — bases sem nome próprio ganham 1 registro vazio)
         let rows = if rows.is_empty() {
