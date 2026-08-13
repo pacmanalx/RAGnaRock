@@ -441,7 +441,7 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
         if b["natureza"].as_str() != Some("narrativo") { continue; }
         let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
         let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
-        if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
+        if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg, true).unwrap_or(true) { continue; }
         let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
         // miolo POR ÍNDICE de chunk (5%–95% em docs com >10 chunks): capa/licença Gutenberg fora
         let nch = chunks.len();
@@ -1862,7 +1862,7 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
         let name = nfc(b["name"].as_str().unwrap_or(""));
         match extraiveis.get(name.as_str()) {
-            Some((_, _, ecfg, _)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg).unwrap_or(true),
+            Some((_, _, ecfg, _)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg, false).unwrap_or(true),
             None => false,
         }
     }).collect();

@@ -289,19 +289,26 @@ pub fn ensure_entidade_schema(url: &str) -> Result<(), String> {
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS modo String DEFAULT 'llm'", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS nqi Float64 DEFAULT 0", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS prov String DEFAULT ''", 15)?;
-    // OR REPLACE: a view é SELECT * e precisa reincluir as colunas novas
+    // OR REPLACE: a view é SELECT * e precisa reincluir as colunas novas.
+    // Partição por TIPO: menções (censo) e extração (fichas) convivem na mesma base com
+    // versions próprios — sem o tipo no corte, o escritor mais recente esconderia o outro.
     ch_exec(url,
         "CREATE OR REPLACE VIEW nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
-         WHERE (collection, base, version) IN \
-         (SELECT collection, base, max(version) FROM nidhogg.entidade GROUP BY collection, base)", 15)?;
+         WHERE (collection, base, tipo, version) IN \
+         (SELECT collection, base, tipo, max(version) FROM nidhogg.entidade GROUP BY collection, base, tipo)", 15)?;
     Ok(())
 }
 
 /// Precisa extrair se não há entidades atuais OU state_hash/ext_cfg_hash divergem. Vazio = precisa.
-pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str) -> Result<bool, String> {
-    let body = ch_query_param(url,
+/// `so_mencao` delimita o escritor: o censo de menções e a extração de fichas dividem a tabela,
+/// e cada um só pode comparar hash com as PRÓPRIAS linhas — senão um invalida/pula o outro.
+pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str,
+                     so_mencao: bool) -> Result<bool, String> {
+    let tipo_c = if so_mencao { "AND tipo = 'mencao'" } else { "AND tipo != 'mencao'" };
+    let sql = format!(
         "SELECT state_hash, ext_cfg_hash FROM nidhogg.entidade_atual \
-         WHERE collection={coll:String} AND base={base:String} LIMIT 1 FORMAT TabSeparated",
+         WHERE collection={{coll:String}} AND base={{base:String}} {tipo_c} LIMIT 1 FORMAT TabSeparated");
+    let body = ch_query_param(url, &sql,
         &[("coll", collection), ("base", base)], 10)?;
     let line = body.lines().next().unwrap_or("");
     if line.is_empty() { return Ok(true); }
@@ -327,22 +334,24 @@ pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
     ch_insert(url, "nidhogg.entidade", &ndjson, 45)
 }
 
-/// Apaga TODAS as entidades de uma base (mutation SÍNCRONA — mutations_sync=1). Usado pelo re-tipar
-/// manual quando a base fica NÃO-extraível (narrativo/código, ou documento sem molde): o dump não pode
-/// guardar extração velha de um tipo que a base não tem mais. ALTER DELETE é raro (só no cockpit) e o
-/// volume por base é pequeno → custo aceitável. Params por binding (sem injeção via nome de base).
+/// Apaga as entidades de EXTRAÇÃO de uma base (mutation SÍNCRONA — mutations_sync=1). Usado pelo
+/// re-tipar manual quando a base fica NÃO-extraível (narrativo/código, ou documento sem molde): o dump
+/// não pode guardar extração velha de um tipo que a base não tem mais. As MENÇÕES sobrevivem à purga:
+/// narrativo é justamente onde o censo vive, e re-tipar não as invalida. ALTER DELETE é raro (só no
+/// cockpit) e o volume por base é pequeno → custo aceitável. Params por binding (sem injeção).
 pub fn delete_entities(url: &str, collection: &str, base: &str) -> Result<u64, String> {
     // conta antes (pra reportar quantas saíram) — a mutation em si não devolve contagem
     let cnt_body = ch_query_param(url,
         "SELECT count() FROM nidhogg.entidade_atual \
-         WHERE collection={coll:String} AND base={base:String} FORMAT TabSeparated",
+         WHERE collection={coll:String} AND base={base:String} AND tipo != 'mencao' FORMAT TabSeparated",
         &[("coll", collection), ("base", base)], 10)?;
     let n: u64 = cnt_body.trim().parse().unwrap_or(0);
     if n == 0 { return Ok(0); }   // nada a apagar
     // mutation via POST (GET é readonly no ClickHouse); mutations_sync=1 espera concluir
     let full = format!("{url}?mutations_sync=1&param_coll={}&param_base={}",
                        urlencode(collection), urlencode(base));
-    let sql = "ALTER TABLE nidhogg.entidade DELETE WHERE collection={coll:String} AND base={base:String}";
+    let sql = "ALTER TABLE nidhogg.entidade DELETE \
+               WHERE collection={coll:String} AND base={base:String} AND tipo != 'mencao'";
     let out = Command::new("curl")
         .args(["-s", "-m", "30", &full, "--data-binary", sql])
         .output()
