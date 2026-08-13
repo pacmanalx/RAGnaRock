@@ -316,6 +316,60 @@ pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, 
     Ok(it.next().unwrap_or("") != state_hash || it.next().unwrap_or("") != ext_cfg)
 }
 
+/// [L3] Checkpoint por TIPO exato (o destilador de relações compara hash só com as PRÓPRIAS
+/// linhas — mesma doutrina do so_mencao, mas parametrizada pro terceiro escritor da tabela).
+pub fn needs_extract_tipo(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str,
+                          tipo: &str) -> Result<bool, String> {
+    let body = ch_query_param(url,
+        "SELECT state_hash, ext_cfg_hash FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} AND tipo={t:String} LIMIT 1 FORMAT TabSeparated",
+        &[("coll", collection), ("base", base), ("t", tipo)], 10)?;
+    let line = body.lines().next().unwrap_or("");
+    if line.is_empty() { return Ok(true); }
+    let mut it = line.split('\t');
+    Ok(it.next().unwrap_or("") != state_hash || it.next().unwrap_or("") != ext_cfg)
+}
+
+/// [L3] Os `dado` das menções do censo de UMA base (JSON strings {mencao, freq, chunks}) —
+/// o material sobre o qual o destilador escolhe as cenas densas.
+pub fn mencoes_da_base(url: &str, collection: &str, base: &str) -> Result<Vec<Value>, String> {
+    let body = ch_query_param(url,
+        "SELECT dado FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} AND tipo='mencao' \
+         ORDER BY idx LIMIT 3000 FORMAT JSONEachRow",
+        &[("coll", collection), ("base", base)], 15)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| v["dado"].clone())
+        .collect())
+}
+
+/// [L3] Leitura das relações destiladas (tipo='relacao', sentinelas de vazio fora) pro cockpit.
+pub fn relacoes_json(url: &str, collection: Option<&str>, limit: usize) -> Result<Value, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = match collection {
+        Some(c) if c != "*" => (" AND collection={coll:String}", vec![("coll", c)]),
+        _ => ("", vec![]),
+    };
+    let body = ch_query_param(url, &format!(
+        "SELECT collection, base, idx, dado, nqi, prov, extracted_at FROM nidhogg.entidade_atual \
+         WHERE tipo='relacao' AND JSONExtractString(dado, 'a') != ''{wc} \
+         ORDER BY extracted_at DESC, base, idx LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
+    let mut relacoes: Vec<Value> = vec![];
+    let mut bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in body.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            let dado = v["dado"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null);
+            let prov = v["prov"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null);
+            bases.insert(format!("{}/{}", v["collection"].as_str().unwrap_or(""), v["base"].as_str().unwrap_or("")));
+            relacoes.push(json!({
+                "collection": v["collection"], "base": v["base"], "idx": v["idx"],
+                "dado": dado, "nqi": v["nqi"], "prov": prov, "extracted_at": v["extracted_at"],
+            }));
+        }
+    }
+    Ok(json!({"count": relacoes.len(), "bases": bases.len(), "relacoes": relacoes}))
+}
+
 /// INSERT em lote das entidades de UMA extração (mesmo version). All-or-nothing: o chamador só chega
 /// aqui se TODAS as janelas da base extraíram — janela falha ⇒ nada é gravado.
 pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {

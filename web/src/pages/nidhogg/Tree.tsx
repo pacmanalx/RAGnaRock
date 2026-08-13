@@ -177,7 +177,8 @@ function Arvore({ collection, q, onOpen, onJump }: { collection: string; q: stri
                           className="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-[var(--color-panel-2)]"
                         >
                           {rAberto ? <ChevronDown size={12} className="shrink-0 text-[var(--color-muted)]" /> : <ChevronRight size={12} className="shrink-0 text-[var(--color-muted)]" />}
-                          <span className="text-[13px]">{r.tipo}</span>
+                          {/* relação = ramo destilado pelo L3 (100% LLM) — selo de origem */}
+                          <span className="text-[13px]">{r.tipo === 'relacao' ? '🧠 relacao' : r.tipo}</span>
                           <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] tabular-nums text-[var(--color-muted)]">{r.n}</span>
                         </button>
                         {rAberto && (

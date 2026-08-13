@@ -9,10 +9,11 @@ import type { MoldeTemplate } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 
-// L3 · Gaps & Propostas — a camada da MASTIGAÇÃO 100% COM IA. Aqui vive o que a IA não deu
-// conta sozinha (classificação rejeitada, molde reprovado) com as duas alavancas que a
-// re-dirigem — RE-TIPAR (origem=humano, sticky) e MOLDE DIRIGIDO (você diz o que extrair;
-// sem gate; iterável) — e, por vir, a camada propositiva (perguntas não-perguntadas).
+// L4 · Gaps & Propostas — a casa da camada PROPOSITIVA (régua 13/ago: L3 = estrutural-LLM;
+// L4 = propõe sobre parâmetros do usuário, com recursão e pesquisa externa — o desenho dela
+// é discussão prévia com o Pacman, aqui vive só a semente). Enquanto ela não nasce, o
+// cockpit de destrave mora aqui: o que a IA não deu conta sozinha (classificação rejeitada,
+// molde reprovado) com as alavancas RE-TIPAR (origem=humano, sticky) e MOLDE DIRIGIDO.
 // Doutrina: gap de DIMENSÃO é navegação/exigência DETERMINÍSTICA → mora no L2 (📐 Dimensões).
 
 export type AcaoDirigido = { tipo: string; collection?: string; base?: string; instrucao?: string }
@@ -40,9 +41,9 @@ export function NidhoggGaps() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-lg font-semibold">L3 · Gaps &amp; Propostas</h1>
+        <h1 className="text-lg font-semibold">L4 · Gaps &amp; Propostas</h1>
         <span className="text-[12px] text-[var(--color-muted)]">
-          a mastigação com IA — onde ela falhou, onde você a re-dirige, e o que ela vai propor
+          a camada propositiva (por vir) + o cockpit de destrave — onde a IA falhou e onde você a re-dirige
         </span>
         <div className="grow" />
         <span className="rounded-full border border-[var(--color-border)] px-3 py-1 text-[12px] tabular-nums text-[var(--color-muted)]">
@@ -121,8 +122,9 @@ export function NidhoggGaps() {
           <Lightbulb size={15} className="mt-0.5 shrink-0 text-[var(--color-warn)]" />
           <div>
             A camada que PROPÕE — "o CNPJ X aparece em 40 comprovantes mas não tem contrato no corpus;
-            falta o contrato ou falta ingerir?" — nasce em cima destas filas, do grafo e dos gaps de
-            dimensão do L2 (📐). IA cara só nos pontos de decisão, como manda a doutrina. Em construção.
+            falta o contrato ou falta ingerir?" — trabalha sobre <b>parâmetros que você declara</b>, com
+            recursão e pesquisa externa, aumentando o knowledge existente. Nasce em cima destas filas,
+            do grafo (L2 determinístico + L3 🧠) e dos gaps de dimensão (📐). Em desenho.
           </div>
         </div>
       </Panel>

@@ -31,6 +31,7 @@ import { Ingestao } from '@/pages/Ingestao'
 import { Performance } from '@/pages/Performance'
 import { Placeholder } from '@/pages/Placeholder'
 import { NidhoggGaps } from '@/pages/nidhogg/Gaps'
+import { NidhoggEstruturalLlm } from '@/pages/nidhogg/EstruturalLlm'
 import { Perfis } from '@/pages/admin/Perfis'
 import { Usuarios } from '@/pages/admin/Usuarios'
 import { Servicos } from '@/pages/admin/Servicos'
@@ -59,6 +60,7 @@ export const router = createBrowserRouter([
       { path: 'nidhogg/miner', element: <NidhoggMiner /> },
       { path: 'nidhogg/summary', element: <NidhoggSummary /> },
       { path: 'nidhogg/tree', element: <NidhoggTree /> },
+      { path: 'nidhogg/llm', element: <NidhoggEstruturalLlm /> },
       { path: 'nidhogg/gaps', element: <NidhoggGaps /> },
       { path: 'admin/perfis', element: <Perfis /> },
       { path: 'admin/usuarios', element: <Usuarios /> },

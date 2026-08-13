@@ -118,7 +118,7 @@ export interface SetConfigResponse {
 }
 
 // GET /api/nidhogg — status completo + catálogo de níveis (tela Serviços controla via POST)
-export interface NidhoggLevel { n: number; name: string; ia: boolean; desc: string }
+export interface NidhoggLevel { n: number; name: string; ia: boolean; desc: string; future?: boolean }
 export interface NidhoggStatus {
   module: string
   version: string
@@ -198,6 +198,18 @@ export interface DimValorItem {
 }
 export interface DimValoresResponse { nome: string; count: number; valores: DimValorItem[] }
 export interface DimGap { nome: string; alvo: number; cobertos: number; gaps: string[]; nota: string }
+
+// ── Nidhogg L3: relações destiladas pelo LLM (tipo="relacao" no dump) ──
+export interface RelacaoItem {
+  collection: string
+  base: string
+  idx: number | string            // chunk da cena
+  dado: { a: string; rel: string; b: string; tema?: string }
+  nqi: number
+  prov: { via: string; chunk?: number; presentes?: number } | null
+  extracted_at: string
+}
+export interface NidhoggRelacoes { count: number; bases: number; relacoes: RelacaoItem[]; note?: string }
 
 // ── Diário de mastigação do LLM (llm-ledger.jsonl do nidhoggd) ──
 export interface LlmLedgerEntry {

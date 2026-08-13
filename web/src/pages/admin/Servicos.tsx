@@ -191,15 +191,15 @@ export function Servicos() {
               </button>
             </div>
 
-            {/* nível 0-3 — o coração do worm */}
+            {/* nível 0-4 — o coração do worm (L4 é FUTURO: aparece na régua, não seleciona) */}
             <div>
               <div className="mb-1.5 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">nível de inteligência</div>
-              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
                 {n.levels.map((lv) => (
                   <button
                     key={lv.n}
                     onClick={() => agir(() => setNidhogg({ level: lv.n }), `nível ${lv.n} · ${lv.name}`)}
-                    disabled={busy}
+                    disabled={busy || lv.future}
                     title={lv.desc}
                     className={`rounded-md border p-3 text-left transition-colors disabled:opacity-50 ${
                       n.level === lv.n
@@ -209,7 +209,10 @@ export function Servicos() {
                   >
                     <div className="flex items-center justify-between">
                       <span className="text-[13px] font-semibold">L{lv.n} · {lv.name}</span>
-                      {lv.ia && <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] text-[var(--color-accent)]">IA</span>}
+                      <span className="flex gap-1">
+                        {lv.ia && <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] text-[var(--color-accent)]">IA</span>}
+                        {lv.future && <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] text-[var(--color-muted)]">por vir</span>}
+                      </span>
                     </div>
                     <div className="mt-1 line-clamp-3 text-[11px] leading-snug text-[var(--color-muted)]">{lv.desc}</div>
                   </button>

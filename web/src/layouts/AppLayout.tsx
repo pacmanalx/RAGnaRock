@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import {
   PanelLeftClose, PanelLeftOpen, Eye, Search, Upload, Puzzle, Activity, ScrollText,
-  Brain, Boxes, ListTree, Network, Lightbulb, Users, ShieldCheck, ServerCog, SlidersHorizontal,
+  Brain, Boxes, ListTree, Network, Sparkles, Lightbulb, Users, ShieldCheck, ServerCog, SlidersHorizontal,
   ChevronDown, LogOut, Sun, Moon, KeyRound, type LucideIcon,
 } from 'lucide-react'
 import { changePassword } from '@/api/auth'
@@ -27,7 +27,8 @@ const NAV: { section: string; items: Item[] }[] = [
     { to: '/nidhogg/miner', label: 'L0 · Minerador', icon: Boxes },
     { to: '/nidhogg/summary', label: 'L1 · Summary', icon: ListTree },
     { to: '/nidhogg/tree', label: 'L2 · KnowledgeTree', icon: Network },
-    { to: '/nidhogg/gaps', label: 'L3 · Gaps & Propostas', icon: Lightbulb },
+    { to: '/nidhogg/llm', label: 'L3 · Estrutural LLM', icon: Sparkles },
+    { to: '/nidhogg/gaps', label: 'L4 · Gaps & Propostas', icon: Lightbulb },
   ]},
   { section: 'Admin', items: [
     { to: '/admin/servicos', label: 'Serviços', icon: ServerCog },

@@ -27,12 +27,17 @@ const DEFAULT_CADENCE: u64 = 300;   // s entre ciclos do worm (cadência = orça
 
 // ───────────────────────────── níveis de inteligência (slider) ─────────────────────────────
 // Cumulativos. 0 não usa IA; 1+ precisam de provider de IA configurado.
+// Régua RECRAVADA 13/ago/2026 (Pacman, textual): "L3 será o mesmo que a L2 só que 100% LLM
+// bound e teremos a L4 que é a camada propositiva". L2 grafa DETERMINÍSTICO; L3 grafa o que o
+// determinístico não alcança (100% LLM); L4 (propositiva: parâmetros do usuário + recursão +
+// pesquisa externa) NÃO se implementa sem discussão prévia — aqui é só o nome reservado.
 fn level_name(l: u8) -> &'static str {
-    match l { 0 => "minerador", 1 => "consciente", 2 => "estrutural", 3 => "propositivo", _ => "minerador" }
+    match l { 0 => "minerador", 1 => "consciente", 2 => "estrutural", 3 => "estrutural-llm", 4 => "propositivo", _ => "minerador" }
 }
 fn level_num(s: &str) -> u8 {
     match s.trim().to_lowercase().as_str() {
-        "consciente" | "1" => 1, "estrutural" | "2" => 2, "propositivo" | "3" => 3,
+        "consciente" | "1" => 1, "estrutural" | "2" => 2, "estrutural-llm" | "3" => 3,
+        "propositivo" | "4" => 4,
         // "burro" aceito como sinônimo retrocompatível de "minerador" (nome antigo do nível 0).
         "minerador" | "burro" | "0" | _ => 0,
     }
@@ -41,8 +46,9 @@ fn levels_json() -> Value {
     json!([
         {"n":0,"name":"minerador","ia":false,"desc":"Zero IA. Minera a estrutura do corpus — assinatura léxica (as raízes que só a coleção tem), dicionário e digest do cache. O material bruto sobre o qual todos os níveis de IA trabalham."},
         {"n":1,"name":"consciente","ia":true,"desc":"1º nível com IA. Classifica cada documento em {natureza, tipo} por IA leve (vocabulário editável) e normaliza o dado — a camada de significado que vive no ClickHouse, aponta pro corpus e sobrevive à deleção da coleção."},
-        {"n":2,"name":"estrutural","ia":true,"desc":"Grafa as relações sobre o dado já normalizado — entidades, dimensões e como uma coisa encaixa na outra entre coleções. O grafo navegável do conhecimento."},
-        {"n":3,"name":"propositivo","ia":true,"desc":"As perguntas que você não está fazendo. Acha lacunas, levanta hipóteses e aponta o que falta sobre o dado dos níveis anteriores — IA cara só nos pontos de decisão."}
+        {"n":2,"name":"estrutural","ia":false,"desc":"Grafa as relações DETERMINISTICAMENTE sobre o dado já normalizado — nós de valor, censo de menções, dimensões e co-ocorrência de cena. O grafo navegável do conhecimento, zero IA."},
+        {"n":3,"name":"estrutural-llm","ia":true,"desc":"O MESMO que o L2, só que 100% LLM-bound: destila as relações que o determinístico não alcança — quem é o quê de quem, temas de cena — e grava no MESMO grafo, com selo de origem."},
+        {"n":4,"name":"propositivo","ia":true,"future":true,"desc":"A camada PROPOSITIVA (por vir): trabalha sobre parâmetros do usuário, com recursão, pesquisa externa e aumento do knowledge. Em desenho — não roda ainda."}
     ])
 }
 
@@ -85,7 +91,9 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "port"     => if let Ok(p) = v.parse() { cfg.port = p },
             "ragd_api" => cfg.ragd_api = v.to_string(),
             "nidhogg" | "on" => cfg.on = matches!(v, "true" | "1" | "yes" | "on"),
-            "level"    => cfg.level = level_num(v),
+            // .min(3): cfg antigo com "propositivo" (o ex-nível 3) migra pro teto vigente —
+            // L4 só existe como nome até a discussão de desenho
+            "level"    => cfg.level = level_num(v).min(3),
             "dir"      => cfg.dir = v.to_string(),
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
@@ -544,6 +552,118 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
     json!({"ok": true, "collection": coll, "bases": feitas, "mencoes": mencoes_total})
 }
 
+// [L3] Estrutural-LLM — a MESMA grafação do L2, mas 100% LLM-bound (régua 13/ago). Pega as
+// CENAS mais densas do censo (chunks onde mais entidades co-ocorrem), manda o trecho + a lista
+// de presentes pro LLM local e destila relações {a, rel, b, tema}. Os registros entram no dump
+// (tipo="relacao", idx=chunk) e o mine_links os cola no MESMO grafo — o nó do LLM funde com o
+// nó do censo pela mesma normalização. LLM-bound = caro: 1 base/ciclo, poucas janelas.
+const RELACAO_BASES_PER_CYCLE: usize = 1;
+const RELACAO_JANELAS: usize = 4;          // cenas por base por passada
+const RELACAO_JANELA_MAX_CHARS: usize = 6_000;
+const RELACAO_TOP_MENCOES: usize = 40;     // entidades mais frequentes que definem "cena densa"
+
+fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+    let (sys, max_tokens) = relacao_system(lib);
+    // checkpoint ACOPLADO ao prompt: editar o template "relacoes" re-mastiga tudo
+    let ecfg = hash_hex(&format!("relacao|v1|{}", hash_hex(&sys)));
+    let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    let (mut feitas, mut rel_total) = (0usize, 0usize);
+    for b in &bases {
+        if feitas >= RELACAO_BASES_PER_CYCLE { break; }
+        if b["natureza"].as_str() != Some("narrativo") { continue; }
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
+        if !chdb::needs_extract_tipo(ch_url, coll, name, &sh, &ecfg, "relacao").unwrap_or(true) { continue; }
+        // pré-requisito: o censo do L2 (o L3 trabalha SOBRE o determinístico, nunca às cegas).
+        // Sem menções ainda → NÃO checkpointa (volta quando o censo passar).
+        let mencoes = chdb::mencoes_da_base(ch_url, coll, name).unwrap_or_default();
+        let mut top: Vec<(String, u32, Vec<u32>)> = mencoes.iter().filter_map(|m| {
+            let d: Value = serde_json::from_str(m.as_str()?).ok()?;
+            let nome = d["mencao"].as_str()?.trim().to_string();
+            if nome.is_empty() { return None; }
+            let freq: u32 = d["freq"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let poss: Vec<u32> = d["chunks"].as_str().unwrap_or("")
+                .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            Some((nome, freq, poss))
+        }).collect();
+        if top.is_empty() { continue; }
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.truncate(RELACAO_TOP_MENCOES);
+        // cena densa = chunk com MAIS entidades do topo presentes
+        let mut por_chunk: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (_, _, poss) in &top { for p in poss { *por_chunk.entry(*p).or_insert(0) += 1; } }
+        let mut cenas: Vec<(u32, u32)> = por_chunk.into_iter().filter(|(_, n)| *n >= 2).collect();
+        cenas.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        cenas.truncate(RELACAO_JANELAS);
+        if cenas.is_empty() { continue; }
+        let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
+        let (version, at) = (chdb::now_version(), now_stamp());
+        let mut rows: Vec<chdb::EntidadeRow> = vec![];
+        let mut falhou = false;
+        for (cid, _) in &cenas {
+            let texto = match chunks.iter().find(|(i, _)| *i == *cid as usize) {
+                Some((_, t)) => t.chars().take(RELACAO_JANELA_MAX_CHARS).collect::<String>(),
+                None => continue,
+            };
+            let presentes: Vec<&str> = top.iter().filter(|(_, _, p)| p.contains(cid))
+                .map(|(n, _, _)| n.as_str()).collect();
+            if presentes.len() < 2 { continue; }
+            let schema = json!({"type": "object", "properties": {"relacoes": {"type": "array", "items": {
+                "type": "object", "properties": {"a": {"type": "string"}, "rel": {"type": "string"},
+                "b": {"type": "string"}, "tema": {"type": "string"}}, "required": ["a", "rel", "b"]}}},
+                "required": ["relacoes"]});
+            let body = json!({
+                "messages": [{"role": "system", "content": sys},
+                             {"role": "user", "content": format!("ENTIDADES PRESENTES: {}\n\nTRECHO (chunk {cid}):\n{texto}", presentes.join(", "))}],
+                "temperature": 0, "max_tokens": max_tokens,
+                "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+            }).to_string();
+            let obj = llm_post("relacoes", &format!("L3 {coll}/{name} chunk {cid}"), llm_url, &body, 150)
+                .and_then(|resp| serde_json::from_str::<Value>(&resp).ok())
+                .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
+                .and_then(|c| extract_json_object(&c));
+            let arr = match obj.as_ref().and_then(|o| o["relacoes"].as_array()) {
+                Some(a) => a.clone(),
+                // janela sem resposta/JSON → base NÃO checkpointa (re-tenta no próximo ciclo)
+                None => { falhou = true; break; }
+            };
+            for r in &arr {
+                let (a, rel, bb) = (r["a"].as_str().unwrap_or("").trim(),
+                                    r["rel"].as_str().unwrap_or("").trim(),
+                                    r["b"].as_str().unwrap_or("").trim());
+                if a.is_empty() || rel.is_empty() || bb.is_empty() || a == bb { continue; }
+                let tema = r["tema"].as_str().unwrap_or("").trim();
+                let mut dado = json!({"a": a, "rel": rel, "b": bb});
+                if !tema.is_empty() { dado["tema"] = json!(tema); }
+                rows.push(chdb::EntidadeRow {
+                    collection: coll.to_string(), base: name.to_string(), tipo: "relacao".to_string(),
+                    idx: *cid, dado: dado.to_string(), modo: "llm".to_string(), nqi: 0.8,
+                    prov: json!({"via": "relacao-llm", "chunk": cid, "presentes": presentes.len()}).to_string(),
+                    state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+                });
+            }
+        }
+        if falhou { nlog(&format!("L3 {coll}/{name}: janela sem resposta — sem checkpoint, re-tenta")); continue; }
+        // sentinela: cenas mastigadas e nada destilado TAMBÉM checkpointa (senão fila eterna)
+        let n_novas = rows.len();
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "relacao".to_string(),
+                idx: 0, dado: json!({"a": ""}).to_string(), modo: "llm".to_string(), nqi: 1.0,
+                prov: json!({"via": "relacao-llm", "vazio": true}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
+        match chdb::insert_entities(ch_url, &rows) {
+            Ok(_) => { feitas += 1; rel_total += n_novas; }
+            Err(e) => nlog(&format!("L3 {coll}/{name}: insert falhou ({e})")),
+        }
+    }
+    if feitas > 0 { nlog(&format!("L3 {coll}: {feitas} base(s) mastigadas, {rel_total} relação(ões) destiladas")); }
+    json!({"ok": true, "collection": coll, "bases": feitas, "relacoes": rel_total})
+}
+
 /// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
 /// nidhogg.no_valor. Incremental por fingerprint (max version do dump) guardado no
 /// knowledge.json — religa SÓ quando a extração produziu algo novo. Zero IA.
@@ -581,6 +701,35 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
                         idx: p, nqi: 1.0, version, linked_at: at.clone(),
                     });
                 }
+            }
+            continue;
+        }
+        // [L3] RELAÇÃO destilada por LLM: nós pros DOIS lados (a, b) com idx = chunk da cena —
+        // a mesma regra (base,idx) da co-ocorrência liga a↔b e ambos às menções do censo na
+        // mesma cena. Normalização de "mencao" de propósito: o nó do LLM FUNDE com o do censo.
+        // O rótulo do laço (rel) NÃO vira nó (viraria hub de ruído: "serve", "trai"…) — ele
+        // vive no registro do dump (drill-down). Tema vira nó próprio (campo="tema").
+        if r["tipo"].as_str() == Some("relacao") {
+            let base = r["base"].as_str().unwrap_or("").to_string();
+            let cid = r["idx"].as_u64().unwrap_or(0) as u32;
+            let nqi = r["nqi"].as_f64().unwrap_or(0.0);
+            for lado in ["a", "b"] {
+                let nome = obj.get(lado).and_then(|v| v.as_str()).unwrap_or("").trim();
+                if let Some(norm) = norm_valor("mencao", nome) {
+                    rows.push(chdb::NoValorRow {
+                        collection: coll.to_string(), valor_norm: norm, valor: nome.to_string(),
+                        campo: "relacao".to_string(), tipo: "relacao".to_string(),
+                        base: base.clone(), idx: cid, nqi, version, linked_at: at.clone(),
+                    });
+                }
+            }
+            let tema = obj.get("tema").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if let Some(norm) = norm_valor("tema", tema) {
+                rows.push(chdb::NoValorRow {
+                    collection: coll.to_string(), valor_norm: norm, valor: tema.to_string(),
+                    campo: "tema".to_string(), tipo: "relacao".to_string(),
+                    base, idx: cid, nqi, version, linked_at: at.clone(),
+                });
             }
             continue;
         }
@@ -761,6 +910,20 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 (400, json!({"error": "falta ?collection="}).to_string())
             } else {
                 match chdb::tree_json(&ch_url, &coll, &q, 100) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [L3] relações destiladas pelo LLM (tipo="relacao" no dump) — a leitura do cockpit.
+        (Method::Get, "/api/nidhogg/relacoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)));
+            let n: usize = query_param(query, "n").and_then(|v| v.parse().ok()).unwrap_or(200).min(1000);
+            if store != "clickhouse" {
+                (200, json!({"count": 0, "relacoes": [], "note": "relações requerem clickhouse"}).to_string())
+            } else {
+                match chdb::relacoes_json(&ch_url, coll.as_deref(), n) {
                     Ok(v) => (200, v.to_string()),
                     Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
                 }
@@ -1100,6 +1263,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let mut s = st.lock().unwrap();
             if let Some(on) = v["on"].as_bool() { s.on = on; let p = s.cfg_path.clone(); set_cfg_key(&p, "nidhogg", if on {"true"} else {"false"}); }
             if let Some(lv) = v["level"].as_str().map(level_num).or_else(|| v["level"].as_u64().map(|n| n as u8)) {
+                // L4 (propositivo) é FUTURO — não selecionável até a discussão de desenho; teto no 3
                 let lv = lv.min(3); s.level = lv; let p = s.cfg_path.clone(); set_cfg_key(&p, "level", level_name(lv));
             }
             if let Some(c) = v["cadence"].as_u64() { s.cadence = c.max(10); let p = s.cfg_path.clone(); set_cfg_key(&p, "cadence", &s.cadence.to_string()); }
@@ -1764,6 +1928,12 @@ fn ensure_prompt_templates(dir: &str) {
             "system": BUILTIN_FICHA_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
         changed = true;
     }
+    if !lib["templates"]["relacoes"].is_object() {
+        lib["templates"]["relacoes"] = json!({
+            "description": "Relações estruturais (L3, 100% LLM): destila quem-é-o-quê-de-quem e o tema da cena nas janelas mais densas do censo. Editar re-mastiga (checkpoint por hash do prompt).",
+            "system": BUILTIN_RELACAO_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
+        changed = true;
+    }
     if changed { write_prompts(dir, &lib); }
 }
 
@@ -1771,6 +1941,26 @@ const BUILTIN_FICHA_PROMPT: &str = "Você lê um TRECHO de uma obra narrativa em
 (personagens, pessoas, organizações, lugares importantes) que aparecem NESTE trecho. Responda APENAS com um array JSON; \
 cada elemento: {\"nome\": \"...\", \"atributos\": [\"característica citada no trecho\", ...], \"relacoes\": [\"nome de outra entidade ligada a esta no trecho\", ...]}. \
 Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidades → [].";
+
+// [L3] O prompt do destilador de relações — a régua manda: MESMO objetivo do L2 (grafar
+// relações), mas 100% LLM. O trecho vem das cenas mais densas do censo (chunks onde mais
+// entidades co-ocorrem) e a lista de presentes ANCORA os nomes (o nó do LLM COLA no nó do
+// censo pela mesma normalização).
+const BUILTIN_RELACAO_PROMPT: &str = "Você lê um TRECHO de uma obra em português e a lista das ENTIDADES presentes nele. \
+Destile as RELAÇÕES que o texto AFIRMA entre essas entidades — o que uma contagem determinística não alcança: quem é o quê de quem, \
+quem fez o quê a quem, e o TEMA da cena. Responda APENAS JSON: {\"relacoes\":[{\"a\":\"entidade\",\"rel\":\"laço curto (1-4 palavras: \
+mentor de, viaja com, trai, serve…)\",\"b\":\"entidade\",\"tema\":\"tema da cena em 1-3 palavras (opcional)\"}]}. \
+Use os nomes EXATOS da lista de entidades; seja FIEL ao trecho (só o que ele afirma); sem relações → {\"relacoes\":[]}.";
+
+/// System do destilador de relações (L3): template "relacoes" editável ou o BUILTIN.
+fn relacao_system(lib: &Value) -> (String, u32) {
+    let sys = match lib["templates"]["relacoes"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_RELACAO_PROMPT.to_string(),
+    };
+    let max_tokens = lib["templates"]["relacoes"]["max_tokens"].as_u64().unwrap_or(1200) as u32;
+    (sys, max_tokens)
+}
 
 /// [v8] Chunks SEPARADOS de uma base (id + texto) — o censo de menções varre por chunk
 /// pra gravar as POSIÇÕES (a posição do chunk é o eixo do tempo narrativo).
@@ -2198,10 +2388,15 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     let ex = mine_entities(&api, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     det_total += ex["deterministicas"].as_u64().unwrap_or(0) + ex["templates"].as_u64().unwrap_or(0);
-                    // [L2] KnowledgeTree: fichas narrativas (LLM local, 1 base/ciclo) e depois
-                    // a ligação por valores-chave (zero IA, incremental por fingerprint).
+                    // [L2] KnowledgeTree: censo de menções (determinístico) e a ligação por
+                    // valores-chave (zero IA, incremental por fingerprint).
                     if level >= 2 && store == "clickhouse" {
                         let _f = mine_fichas(&api, &llm_url, &ch_url, &lib, coll);
+                        // [L3] estrutural-LLM: destila relações das cenas densas (100% LLM,
+                        // 1 base/ciclo) ANTES do link — o mesmo mine_links cola tudo no grafo.
+                        if level >= 3 {
+                            let _r = mine_relacoes(&api, &llm_url, &ch_url, &lib, coll);
+                        }
                         let _lk = mine_links(&ch_url, &dir, coll);
                     }
                     // Summary d00a009 REMOVIDO (10/ago): o normalizador aberto (1 LLM pesado/base,
@@ -2309,13 +2504,14 @@ fn help() {
 uso:
   nidhoggd [--config <arq>] [--port {DEFAULT_PORT}] [--ragd <url>]
   config: --config <arq>, senão ./nidhogg.cfg, senão defaults.
-          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|propositivo), dir, cadence, cors_origin
+          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|estrutural-llm), dir, cadence, cors_origin
   nasce DESLIGADO (precisa de IA). Liga pelo ValHalla ou pelo cfg.
 rotas:
   GET  /health
   GET  /api/nidhogg                 status (nível, cadência, keepalive do ragd, conhecimento)
   GET  /api/nidhogg/collections     coleções do ragd + estado de digestão (liga/desliga por coleção)
   GET  /api/nidhogg/knowledge       conhecimento destilado (?collection=&type=&level=) — só leitura
+  GET  /api/nidhogg/relacoes        relações destiladas pelo L3 (?collection=&n=) — só leitura
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
   POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)

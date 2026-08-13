@@ -7,6 +7,7 @@ import type {
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
   TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap, LlmLedgerResponse,
+  NidhoggRelacoes,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -85,7 +86,11 @@ export const getNavSuggest = (collection: string, q: string) =>
 // [Think Navigator] expande um nó do mindmap (relacionados por co-ocorrência)
 export const getNavNode = (collection: string, norm: string) =>
   nidhogg.get<NavNode>(`/api/nidhogg/node?collection=${encodeURIComponent(collection)}&norm=${encodeURIComponent(norm)}`)
-// ── L3 · cockpit de destrave: re-tipar (origem=humano, sticky) + molde dirigido ──
+// [L3 · Estrutural LLM] relações destiladas pelo LLM nas cenas densas (tipo="relacao" no dump)
+export const getNidhoggRelacoes = (collection?: string, n = 300) =>
+  nidhogg.get<NidhoggRelacoes>(
+    `/api/nidhogg/relacoes?n=${n}${collection && collection !== '*' ? `&collection=${encodeURIComponent(collection)}` : ''}`)
+// ── L4 · cockpit de destrave: re-tipar (origem=humano, sticky) + molde dirigido ──
 export const postReclass = (collection: string, base: string, tipo: string) =>
   nidhogg.post<{ ok: boolean; tipo: string; natureza: string; csv: boolean; extraivel: boolean; nota: string; purgadas: number }>(
     '/api/nidhogg/reclass', { collection, base, tipo })
