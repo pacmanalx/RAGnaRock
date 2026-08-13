@@ -1692,10 +1692,11 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
         req.as_reader().take(1024 * 1024 * 1024).read_to_end(&mut body).ok();
     }
 
-    // 1) /nidhogg/* → nidhoggd (mesma origem, sem CORS)
-    if path == "/nidhogg" || path.starts_with("/nidhogg/") {
+    // 1) /nidhogg-api/* → nidhoggd (mesma origem, sem CORS). O prefixo tem -api de
+    // propósito: /nidhogg/* são ROTAS SPA do React (F5 nelas tem que cair no index).
+    if path == "/nidhogg-api" || path.starts_with("/nidhogg-api/") {
         let url = { state.read().nidhogg_url.clone() };
-        let rest = &path["/nidhogg".len()..];
+        let rest = &path["/nidhogg-api".len()..];
         proxy_pass(req, &method, &format!("{url}{rest}"), &query, &body, auth_hdr.as_deref());
         return;
     }

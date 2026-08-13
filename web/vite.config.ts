@@ -18,7 +18,9 @@ export default defineConfig(({ mode }) => {
     server: {
       proxy: {
         '/api': { target: RAGD, changeOrigin: true, rewrite: (p) => p.replace(/^\/api/, '') },
-        '/nidhogg': { target: NIDHOGG, changeOrigin: true, rewrite: (p) => p.replace(/^\/nidhogg/, '') },
+        // prefixo -api pra NÃO colidir com as rotas SPA /nidhogg/* (F5 numa tela do grupo
+        // Nidhogg caía no proxy em vez do fallback do index)
+        '/nidhogg-api': { target: NIDHOGG, changeOrigin: true, rewrite: (p) => p.replace(/^\/nidhogg-api/, '') },
       },
     },
   }

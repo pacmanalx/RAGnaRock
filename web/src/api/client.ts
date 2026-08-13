@@ -85,7 +85,7 @@ function makeClient(baseUrl: string) {
 }
 
 const RAGD_URL = import.meta.env.VITE_RAGD_URL ?? '/api'
-const NIDHOGG_URL = import.meta.env.VITE_NIDHOGG_URL ?? '/nidhogg'
+const NIDHOGG_URL = import.meta.env.VITE_NIDHOGG_URL ?? '/nidhogg-api'
 
 export const ragd = makeClient(RAGD_URL)
 export const nidhogg = makeClient(NIDHOGG_URL)
