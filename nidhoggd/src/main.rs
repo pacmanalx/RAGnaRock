@@ -318,9 +318,10 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
     if t.contains('/') && digits.len() == 8 && t.chars().count() <= 10 { return None; }
     // numérico longo (CNPJ/CPF/conta/ticket): a chave são os dígitos crus
     if digits.len() >= 8 && digits.len() * 2 >= t.chars().count() { return Some(digits); }
-    // texto: precisa de corpo (≥5 chars, com letra) e ser NOME, não descrição — frase longa
-    // ("originator of the Project Gutenberg concept; produced…") não é identidade, é atributo
-    if t.chars().count() < 5 || t.chars().count() > 60 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
+    // texto: precisa de corpo e ser NOME, não descrição — frase longa não é identidade.
+    // Campos de nome próprio (mencao/personagem/nome) aceitam 3 chars: Sam, Eva, Rui existem.
+    let min = if c.contains("mencao") || c.contains("personagem") || c.contains("nome") { 3 } else { 5 };
+    if t.chars().count() < min || t.chars().count() > 60 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
     use unicode_normalization::UnicodeNormalization;
     let folded: String = t.nfd()
         .filter(|ch| !unicode_normalization::char::is_combining_mark(*ch))
@@ -328,88 +329,122 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
     Some(folded)
 }
 
-// [L2] Fichas narrativas: o LLM local lê JANELAS espalhadas da base narrativa e produz
-// fichas {nome, atributos, relações} que entram no MESMO dump — o mine_links liga os
-// personagens entre bases/registros como liga CNPJs entre comprovantes.
-const FICHA_BASES_PER_CYCLE: usize = 1;   // 1 base narrativa por ciclo (LLM é o caro)
-const FICHA_WINDOWS: usize = 4;           // janelas espalhadas pelo documento
-const FICHA_WIN_CHARS: usize = 2000;
+// [L2] Extrator narrativo = CENSO DETERMINÍSTICO de menções (zero IA, texto INTEIRO).
+// A v1/v2 usava LLM em 4 janelas de 2000 chars (0,3% de um livro) a 1 base/ciclo — Gandalf
+// não cruzava e Ellen White nem aparecia. Doutrina aplicada a si mesma: o L0 varre o volume
+// (nomes próprios por capitalização, CPU barata, cobertura 100%); o LLM vira enriquecedor
+// dirigido no futuro. Os registros {mencao, freq} entram no dump e o mine_links cruza.
+const MENCAO_BASES_PER_CYCLE: usize = 60;  // varredura é CPU — o corpus inteiro em poucos ciclos
+const MENCAO_TOP: usize = 40;              // menções mais frequentes por base
+const MENCAO_MIN_FREQ: u32 = 3;            // aparece ≥3× no livro = personagem/entidade, não acaso
 
-fn mine_fichas(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
-    let sys = lib["templates"]["fichas"]["system"].as_str().unwrap_or(BUILTIN_FICHA_PROMPT).to_string();
-    // v2: janelas no miolo + filtro de nome≤60 chars no ligador (re-extrai tudo da v1)
-    let ecfg = hash_hex(&format!("ficha|v2|{}", hash_hex(&sys)));
+/// Nomes próprios por heurística zero-IA: sequências de palavras Capitalizadas (com conectores
+/// "de/da/do/G." — José de Arimateia, Ellen G. White), contadas no texto INTEIRO. Palavra única
+/// capitalizada só vale se a forma minúscula NÃO domina (mata o "The/O/A" de início de frase).
+fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
+    const CONECTORES: &[&str] = &["de", "da", "do", "dos", "das", "van", "von", "del", "la", "e"];
+    let stop = |w: &str| matches!(w.to_lowercase().as_str(),
+        "the" | "a" | "o" | "os" | "as" | "um" | "uma" | "and" | "but" | "he" | "she" | "it"
+        | "in" | "on" | "at" | "of" | "to" | "is" | "was" | "for" | "with" | "that" | "this"
+        | "chapter" | "capitulo" | "capítulo" | "livro" | "book" | "parte" | "part"
+        | "i" | "ii" | "iii" | "iv" | "v" | "vi" | "não" | "nao" | "sim" | "mas" | "por"
+        | "quando" | "então" | "entao" | "depois" | "antes" | "agora" | "assim" | "como");
+    let cap = |w: &str| {
+        let mut ch = w.chars();
+        matches!(ch.next(), Some(c) if c.is_uppercase())
+            && w.chars().skip(1).all(|c| c.is_lowercase() || c == '.')
+            && w.chars().filter(|c| c.is_alphabetic()).count() >= 2
+    };
+    let inicial = |w: &str| w.len() <= 2 && w.ends_with('.') && w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+    // contagem de minúsculas (pra rejeitar palavra comum capitalizada por posição)
+    let mut lower_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let words: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '\'' || c == '-'))
+        .filter(|w| !w.is_empty()).collect();
+    for w in &words {
+        if w.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+            *lower_freq.entry(w.to_lowercase()).or_insert(0) += 1;
+        }
+    }
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].trim_matches(|c: char| c == '\'' || c == '-');
+        if (cap(w) || inicial(w)) && !stop(w) {
+            let mut seq: Vec<&str> = vec![w];
+            let mut j = i + 1;
+            while j < words.len() {
+                let nx = words[j].trim_matches(|c: char| c == '\'' || c == '-');
+                if cap(nx) || inicial(nx) { if !stop(nx) { seq.push(nx); j += 1; continue; } else { break; } }
+                // conector minúsculo NO MEIO (José de Arimateia) — só se o próximo for Cap
+                if seq.len() >= 1 && CONECTORES.contains(&nx.to_lowercase().as_str())
+                    && j + 1 < words.len() && cap(words[j + 1].trim_matches(|c: char| c == '\'' || c == '-')) {
+                    seq.push(nx); j += 1; continue;
+                }
+                break;
+            }
+            i = j;
+            // palavra única: rejeita se a forma minúscula domina (é palavra comum, não nome)
+            if seq.len() == 1 {
+                let lf = lower_freq.get(&seq[0].to_lowercase()).copied().unwrap_or(0);
+                if lf >= 2 { continue; }
+            }
+            let nome = seq.join(" ");
+            if nome.chars().filter(|c| c.is_alphabetic()).count() >= 3 && nome.chars().count() <= 50 {
+                *counts.entry(nome).or_insert(0) += 1;
+            }
+        } else { i += 1; }
+    }
+    let mut v: Vec<(String, u32)> = counts.into_iter().filter(|(_, c)| *c >= MENCAO_MIN_FREQ).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.truncate(top);
+    v
+}
+
+fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
+    // v3: CENSO determinístico do texto inteiro (o LLM sai do caminho crítico; o prompt
+    // "fichas" fica na biblioteca pro enriquecimento dirigido futuro)
+    let ecfg = hash_hex("mencao|v3|top40");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
-    let mut fichas_total = 0usize;
+    let mut mencoes_total = 0usize;
     for b in &bases {
-        if feitas >= FICHA_BASES_PER_CYCLE { break; }
+        if feitas >= MENCAO_BASES_PER_CYCLE { break; }
         if b["natureza"].as_str() != Some("narrativo") { continue; }
         let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
         let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
         if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
-        // janelas espalhadas SÓ NO MIOLO (8%–92%): início/fim de ebook é boilerplate
-        // (a licença Gutenberg virou o "protagonista" da biblioteca na v1 — lição aprendida)
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
-        let (lo, hi) = (n * 8 / 100, (n * 92 / 100).saturating_sub(FICHA_WIN_CHARS).max(n * 8 / 100));
-        let span = hi.saturating_sub(lo);
-        let wins: Vec<String> = (0..FICHA_WINDOWS).map(|i| {
-            let start = lo + if FICHA_WINDOWS == 1 { 0 } else { i * span / (FICHA_WINDOWS - 1) };
-            chars[start.min(n)..(start + FICHA_WIN_CHARS).min(n)].iter().collect()
-        }).collect();
-        // merge por nome folded: atributos acumulam (dedup), relações acumulam (dedup)
-        let mut fichas: std::collections::BTreeMap<String, (String, Vec<String>, Vec<String>)> = std::collections::BTreeMap::new();
-        let mut janelas_ok = 0usize;
-        for w in &wins {
-            if w.trim().len() < 200 { continue; }
-            match llm_extract_records(llm_url, &sys, "narrativa", w) {
-                Ok(regs) => {
-                    janelas_ok += 1;
-                    for r in regs {
-                        let nome = r["nome"].as_str().unwrap_or("").trim().to_string();
-                        if nome.chars().count() < 3 { continue; }
-                        let key = norm_valor("personagem", &nome).unwrap_or_else(|| nome.to_lowercase());
-                        let e = fichas.entry(key).or_insert((nome.clone(), vec![], vec![]));
-                        for a in r["atributos"].as_array().map(|x| x.as_slice()).unwrap_or(&[]) {
-                            if let Some(s) = a.as_str() { let s = s.trim().to_string();
-                                if !s.is_empty() && !e.1.contains(&s) && e.1.len() < 12 { e.1.push(s); } }
-                        }
-                        for rel in r["relacoes"].as_array().map(|x| x.as_slice()).unwrap_or(&[]) {
-                            if let Some(s) = rel.as_str() { let s = s.trim().to_string();
-                                if s.chars().count() >= 3 && !e.2.contains(&s) && e.2.len() < 8 { e.2.push(s); } }
-                        }
-                    }
-                }
-                Err(e) => nlog(&format!("ficha {coll}/{name}: janela falhou ({e})")),
-            }
-        }
-        if janelas_ok == 0 { continue; }   // LLM fora do ar — não grava checkpoint, tenta no próximo
+        let mencoes = extract_mencoes(&text, MENCAO_TOP);
         let version = chdb::now_version();
         let at = now_stamp();
-        let mut rows: Vec<chdb::EntidadeRow> = vec![];
-        for (idx, (_k, (nome, attrs, rels))) in fichas.iter().enumerate() {
-            let mut dado = serde_json::Map::new();
-            dado.insert("personagem".into(), json!(nome));
-            if !attrs.is_empty() { dado.insert("atributos".into(), json!(attrs.join("; "))); }
-            for (i, r) in rels.iter().enumerate() { dado.insert(format!("rel_{}", i + 1), json!(r)); }
-            let nqi = 0.5 + if attrs.is_empty() { 0.0 } else { 0.25 } + if rels.is_empty() { 0.0 } else { 0.25 };
-            rows.push(chdb::EntidadeRow {
-                collection: coll.to_string(), base: name.to_string(), tipo: "ficha".to_string(),
-                idx: idx as u32, dado: Value::Object(dado).to_string(), modo: "ficha".to_string(),
-                nqi, prov: json!({"via": "ficha-llm", "janelas": janelas_ok, "modelo": "local"}).to_string(),
+        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq))| {
+            chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: idx as u32,
+                dado: json!({"mencao": nome, "freq": freq.to_string()}).to_string(),
+                modo: "mencao".to_string(), nqi: 1.0,
+                prov: json!({"via": "mencao-det", "freq": freq, "scan": "texto-inteiro"}).to_string(),
                 state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
-            });
-        }
+            }
+        }).collect();
+        // base SEM menções também grava (rows vazio ⇒ marca via linha sentinela? não: precisa
+        // de ao menos 1 linha pro checkpoint — bases sem nome próprio ganham 1 registro vazio)
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: 0, dado: json!({"mencao": ""}).to_string(), modo: "mencao".to_string(),
+                nqi: 1.0, prov: json!({"via": "mencao-det", "vazio": true}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
         match chdb::insert_entities(ch_url, &rows) {
-            Ok(_) => { feitas += 1; fichas_total += rows.len();
-                       nlog(&format!("fichas {coll}/{name}: {} entidade(s) de {janelas_ok} janela(s)", rows.len())); }
-            Err(e) => nlog(&format!("fichas {coll}/{name}: insert falhou ({e})")),
+            Ok(_) => { feitas += 1; mencoes_total += mencoes.len(); }
+            Err(e) => nlog(&format!("mencoes {coll}/{name}: insert falhou ({e})")),
         }
     }
-    json!({"ok": true, "collection": coll, "bases": feitas, "fichas": fichas_total})
+    if feitas > 0 { nlog(&format!("mencões {coll}: {feitas} base(s) varridas, {mencoes_total} menção(ões)")); }
+    json!({"ok": true, "collection": coll, "bases": feitas, "mencoes": mencoes_total})
 }
 
 /// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
