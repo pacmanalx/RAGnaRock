@@ -327,6 +327,86 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
     Some(folded)
 }
 
+// [L2] Fichas narrativas: o LLM local lê JANELAS espalhadas da base narrativa e produz
+// fichas {nome, atributos, relações} que entram no MESMO dump — o mine_links liga os
+// personagens entre bases/registros como liga CNPJs entre comprovantes.
+const FICHA_BASES_PER_CYCLE: usize = 1;   // 1 base narrativa por ciclo (LLM é o caro)
+const FICHA_WINDOWS: usize = 4;           // janelas espalhadas pelo documento
+const FICHA_WIN_CHARS: usize = 2000;
+
+fn mine_fichas(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+    let sys = lib["templates"]["fichas"]["system"].as_str().unwrap_or(BUILTIN_FICHA_PROMPT).to_string();
+    let ecfg = hash_hex(&format!("ficha|v1|{}", hash_hex(&sys)));
+    let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    let mut feitas = 0usize;
+    let mut fichas_total = 0usize;
+    for b in &bases {
+        if feitas >= FICHA_BASES_PER_CYCLE { break; }
+        if b["natureza"].as_str() != Some("narrativo") { continue; }
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
+        if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg).unwrap_or(true) { continue; }
+        let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
+        // janelas espalhadas: início + pontos internos (um livro não cabe no LLM; amostramos)
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let wins: Vec<String> = (0..FICHA_WINDOWS).map(|i| {
+            let start = if FICHA_WINDOWS == 1 { 0 } else { i * n.saturating_sub(FICHA_WIN_CHARS) / (FICHA_WINDOWS - 1) };
+            chars[start.min(n)..(start + FICHA_WIN_CHARS).min(n)].iter().collect()
+        }).collect();
+        // merge por nome folded: atributos acumulam (dedup), relações acumulam (dedup)
+        let mut fichas: std::collections::BTreeMap<String, (String, Vec<String>, Vec<String>)> = std::collections::BTreeMap::new();
+        let mut janelas_ok = 0usize;
+        for w in &wins {
+            if w.trim().len() < 200 { continue; }
+            match llm_extract_records(llm_url, &sys, "narrativa", w) {
+                Ok(regs) => {
+                    janelas_ok += 1;
+                    for r in regs {
+                        let nome = r["nome"].as_str().unwrap_or("").trim().to_string();
+                        if nome.chars().count() < 3 { continue; }
+                        let key = norm_valor("personagem", &nome).unwrap_or_else(|| nome.to_lowercase());
+                        let e = fichas.entry(key).or_insert((nome.clone(), vec![], vec![]));
+                        for a in r["atributos"].as_array().map(|x| x.as_slice()).unwrap_or(&[]) {
+                            if let Some(s) = a.as_str() { let s = s.trim().to_string();
+                                if !s.is_empty() && !e.1.contains(&s) && e.1.len() < 12 { e.1.push(s); } }
+                        }
+                        for rel in r["relacoes"].as_array().map(|x| x.as_slice()).unwrap_or(&[]) {
+                            if let Some(s) = rel.as_str() { let s = s.trim().to_string();
+                                if s.chars().count() >= 3 && !e.2.contains(&s) && e.2.len() < 8 { e.2.push(s); } }
+                        }
+                    }
+                }
+                Err(e) => nlog(&format!("ficha {coll}/{name}: janela falhou ({e})")),
+            }
+        }
+        if janelas_ok == 0 { continue; }   // LLM fora do ar — não grava checkpoint, tenta no próximo
+        let version = chdb::now_version();
+        let at = now_stamp();
+        let mut rows: Vec<chdb::EntidadeRow> = vec![];
+        for (idx, (_k, (nome, attrs, rels))) in fichas.iter().enumerate() {
+            let mut dado = serde_json::Map::new();
+            dado.insert("personagem".into(), json!(nome));
+            if !attrs.is_empty() { dado.insert("atributos".into(), json!(attrs.join("; "))); }
+            for (i, r) in rels.iter().enumerate() { dado.insert(format!("rel_{}", i + 1), json!(r)); }
+            let nqi = 0.5 + if attrs.is_empty() { 0.0 } else { 0.25 } + if rels.is_empty() { 0.0 } else { 0.25 };
+            rows.push(chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "ficha".to_string(),
+                idx: idx as u32, dado: Value::Object(dado).to_string(), modo: "ficha".to_string(),
+                nqi, prov: json!({"via": "ficha-llm", "janelas": janelas_ok, "modelo": "local"}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            });
+        }
+        match chdb::insert_entities(ch_url, &rows) {
+            Ok(_) => { feitas += 1; fichas_total += rows.len();
+                       nlog(&format!("fichas {coll}/{name}: {} entidade(s) de {janelas_ok} janela(s)", rows.len())); }
+            Err(e) => nlog(&format!("fichas {coll}/{name}: insert falhou ({e})")),
+        }
+    }
+    json!({"ok": true, "collection": coll, "bases": feitas, "fichas": fichas_total})
+}
+
 /// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
 /// nidhogg.no_valor. Incremental por fingerprint (max version do dump) guardado no
 /// knowledge.json — religa SÓ quando a extração produziu algo novo. Zero IA.
@@ -1306,8 +1386,19 @@ fn ensure_prompt_templates(dir: &str) {
             "system": BUILTIN_EXTRACT_PROMPT, "updated": now_stamp() });
         changed = true;
     }
+    if !lib["templates"]["fichas"].is_object() {
+        lib["templates"]["fichas"] = json!({
+            "description": "Fichas narrativas (L2): personagens/entidades e características por janela de texto.",
+            "system": BUILTIN_FICHA_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
+        changed = true;
+    }
     if changed { write_prompts(dir, &lib); }
 }
+
+const BUILTIN_FICHA_PROMPT: &str = "Você lê um TRECHO de uma obra narrativa em português. Extraia as ENTIDADES NOMEADAS \
+(personagens, pessoas, organizações, lugares importantes) que aparecem NESTE trecho. Responda APENAS com um array JSON; \
+cada elemento: {\"nome\": \"...\", \"atributos\": [\"característica citada no trecho\", ...], \"relacoes\": [\"nome de outra entidade ligada a esta no trecho\", ...]}. \
+Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidades → [].";
 
 /// Texto do chunk 0 de uma base (primeiros CLASSIFY_MAX_CHARS chars). Leve — não puxa a base
 /// inteira como o normalizador. None se a base não tem texto.
@@ -1716,9 +1807,10 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     let ex = mine_entities(&api, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     det_total += ex["deterministicas"].as_u64().unwrap_or(0) + ex["templates"].as_u64().unwrap_or(0);
-                    // [L2] KnowledgeTree: liga o dump por valores-chave (zero IA, incremental
-                    // por fingerprint). Roda DEPOIS da extração — o dump é a matéria-prima.
+                    // [L2] KnowledgeTree: fichas narrativas (LLM local, 1 base/ciclo) e depois
+                    // a ligação por valores-chave (zero IA, incremental por fingerprint).
                     if level >= 2 && store == "clickhouse" {
+                        let _f = mine_fichas(&api, &llm_url, &ch_url, &lib, coll);
                         let _lk = mine_links(&ch_url, &dir, coll);
                     }
                     // Summary d00a009 REMOVIDO (10/ago): o normalizador aberto (1 LLM pesado/base,

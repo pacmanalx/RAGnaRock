@@ -75,13 +75,13 @@ export function NidhoggTree() {
         </div>
       )}
 
-      {ativa && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} />}
+      {ativa && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} onJump={(v) => setQ(v)} />}
       {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )
 }
 
-function Arvore({ collection, q, onOpen }: { collection: string; q: string; onOpen: (t: ChunkTarget) => void }) {
+function Arvore({ collection, q, onOpen, onJump }: { collection: string; q: string; onOpen: (t: ChunkTarget) => void; onJump: (valor: string) => void }) {
   const tree = useAsync(() => getNidhoggTree(collection, q), [collection, q])
   const [abertos, setAbertos] = useState<Set<string>>(new Set())
 
@@ -123,9 +123,25 @@ function Arvore({ collection, q, onOpen }: { collection: string; q: string; onOp
                   {n.registros} registro(s) · {n.bases} documento(s) · {n.ramos.length} tipo(s)
                 </span>
               </button>
-              {/* ramos por tipo */}
+              {/* ramos por tipo + co-assuntos */}
               {aberto && (
                 <div className="ml-[13px] border-l border-[var(--color-border)] pl-4">
+                  {/* profundidade: assuntos que co-ocorrem NO MESMO registro deste */}
+                  {(n.co?.length ?? 0) > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5 px-2 py-1">
+                      <span className="text-[11px] text-[var(--color-muted)]">🔗 ligado a:</span>
+                      {n.co.map((c) => (
+                        <button
+                          key={c.valor_norm}
+                          onClick={() => onJump(c.valor)}
+                          title={`co-ocorre em ${c.n} registro(s) — clique pra focar a árvore neste assunto`}
+                          className="rounded-full border border-[var(--color-border)] px-2 py-0.5 text-[11px] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
+                        >
+                          {c.valor} <span className="text-[var(--color-muted)]">×{c.n}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {n.ramos.map((r) => {
                     const rk = `${n.valor_norm}|${r.tipo}`
                     const rAberto = abertos.has(rk)

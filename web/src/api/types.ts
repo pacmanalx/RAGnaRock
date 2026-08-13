@@ -172,6 +172,7 @@ export interface TreeNode {
   registros: number
   bases: number
   ramos: TreeRamo[]
+  co: { valor: string; valor_norm: string; n: number }[] // co-assuntos (mesmo registro) — a profundidade
 }
 export interface TreeResponse { collection: string; count: number; nodes: TreeNode[]; note?: string }
 

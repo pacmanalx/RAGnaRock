@@ -603,6 +603,29 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
             }
         }
     }
+    // CO-OCORRÊNCIA: assuntos que aparecem NO MESMO registro dos assuntos do topo — é a
+    // profundidade da árvore (EssenciaViva → seus favorecidos; Frodo → Sam/Gandalf).
+    // O DISTINCT do WITH mata a inflação de contagem por versões do ReplacingMergeTree.
+    let co_body = ch_query_param(url, &format!(
+        "WITH p AS (SELECT DISTINCT valor_norm, valor, base, idx FROM nidhogg.no_valor FINAL \
+                    WHERE collection={{coll:String}}) \
+         SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) valor, count() n \
+         FROM p a INNER JOIN p b ON a.base=b.base AND a.idx=b.idx \
+         WHERE a.valor_norm IN ({}) AND b.valor_norm != a.valor_norm \
+         GROUP BY pai, filho ORDER BY n DESC LIMIT 800 FORMAT JSONEachRow", in_list.join(",")),
+        &[("coll", coll)], 25).unwrap_or_default();
+    let mut co_map: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for l in co_body.lines() {
+        if l.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            if let Some(p) = v["pai"].as_str() {
+                let e = co_map.entry(p.to_string()).or_default();
+                if e.len() < 10 {
+                    e.push(json!({"valor": v["valor"], "valor_norm": v["filho"], "n": v["n"]}));
+                }
+            }
+        }
+    }
     let nodes: Vec<Value> = tops.iter().map(|t| {
         let norm = t["valor_norm"].as_str().unwrap_or("");
         // ramos por TIPO (contrato / cadastro / comprovante…)
@@ -617,6 +640,7 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
             "valor": t["valor"], "valor_norm": norm,
             "registros": t["regs"], "bases": t["nbases"],
             "ramos": ramos.into_iter().map(|(tipo, itens)| json!({"tipo": tipo, "n": itens.len(), "itens": itens})).collect::<Vec<_>>(),
+            "co": co_map.get(norm).cloned().unwrap_or_default(),
         })
     }).collect();
     Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
