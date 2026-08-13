@@ -1023,9 +1023,11 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             // (documento sem molde ainda, ou narrativo/código que nunca gera registro), NÃO há
             // re-extração — e uma extração ANTIGA desta base (se houver) PERMANECE no dump sob o
             // tipo velho até um molde existir. Avisamos.
-            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t|
-                t.get(tipo.as_str()).is_some()
-                || (!forma.is_empty() && t.get(&format!("{tipo}@{forma}")).is_some())).unwrap_or(false);
+            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| {
+                let util = |k: &str| t.get(k).map(|m| m["origem"].as_str() != Some("reprovado")
+                    && m["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+                util(tipo.as_str()) || (!forma.is_empty() && util(&format!("{tipo}@{forma}")))
+            }).unwrap_or(false);
             let extraivel = csv || tem_molde;
             let nota = if extraivel { "re-extrai no próximo ciclo" }
                        else if natureza == "documento" { "sem molde — extração antiga purgada; dê um molde dirigido pra re-extrair" }
@@ -1070,7 +1072,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let (api, store, dir, llm_url, ch_url) = { let s = st.lock().unwrap(); (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.llm_url.clone(), s.ch_url.clone()) };
             if store != "clickhouse" { return (400, json!({"error":"registry requer clickhouse"}).to_string()); }
             if let Err(e) = chdb::ensure_template_schema(&ch_url) { return (500, json!({"error": format!("schema template: {e}")}).to_string()); }
-            let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => t, None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
+            let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => cap_amostra(&t), None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
             let lib = read_prompts(&dir);
             let (sys, _from) = template_system(&lib);
             let (schema, regras) = match llm_make_template(&llm_url, &format!("molde-dirigido {coll}/{base} tipo={tipo}"), &sys, &tipo, &amostra, &instrucao) {
@@ -1296,6 +1298,26 @@ const EXTRACT_INPUT_CHARS_PER_WINDOW: usize = 1500; // janela por ORÇAMENTO DE 
                                                     // densas pegam menos linhas → não satura o teto de saída
 const EXTRACT_MAX_TOKENS: u64 = 1500;
 const TEMPLATE_MIN_COVERAGE: f64 = 0.7;   // Fase 3: molde só é gravado se casa ≥70% dos campos na amostra
+// Molde se aprende com a CABEÇA do documento (os campos rotulados aparecem cedo). Sem teto, uma
+// base classificada errado (livro de 1,8M chars…) derruba o transporte antes de chegar no LLM.
+const TEMPLATE_SAMPLE_MAX_CHARS: usize = 12_000;
+fn cap_amostra(s: &str) -> String {
+    if s.chars().count() <= TEMPLATE_SAMPLE_MAX_CHARS { s.to_string() }
+    else { s.chars().take(TEMPLATE_SAMPLE_MAX_CHARS).collect() }
+}
+/// Marca uma tentativa de molde REPROVADA no registry (schema/regras vazios, origem="reprovado").
+/// A presença da chave tira o cluster da fila (fim do re-try a cada ciclo); a extração IGNORA
+/// moldes reprovados; o destrave é humano: molde dirigido (sobrescreve) ou re-tipagem.
+fn marca_reprovado(ch_url: &str, reg_key: &str, cobertura: f64, motivo: &str) {
+    let row = chdb::TemplateRow {
+        tipo: reg_key.to_string(), schema: "[]".into(), regras: "[]".into(),
+        cobertura, origem: "reprovado".into(), created_at: now_stamp(), version: chdb::now_version(),
+    };
+    match chdb::upsert_template(ch_url, &row) {
+        Ok(_) => nlog(&format!("molde {reg_key}: REPROVADO gravado ({motivo}) — sai da fila; destrave via molde dirigido ou re-tipagem")),
+        Err(e) => nlog(&format!("molde {reg_key}: falha ao gravar reprovação: {e}")),
+    }
+}
 /// Prompt do extrator (editável no ValHalla como o classificador). `{tipo}` é substituído pela classe.
 const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os REGISTROS como um array JSON — um objeto por linha/registro, com os campos relevantes (nomes de campo claros e minúsculos). Responda APENAS com o array JSON, nada além dele.";
 /// System prompt calibrado (89,5% no Qwen2.5-7B). Os TIPOS não entram aqui — vêm do `enum` do
@@ -1654,7 +1676,11 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
         Some((k, v)) => (k, v),
         None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "clusters (tipo,forma) não-CSV já têm molde (ou não há)"}),
     };
-    let amostra = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let amostra_full = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let amostra = cap_amostra(&amostra_full);
+    if amostra.len() < amostra_full.len() {
+        nlog(&format!("template {coll}/{tipo}: amostra {aname} capada em {TEMPLATE_SAMPLE_MAX_CHARS} chars (original {})", amostra_full.chars().count()));
+    }
     let reg_key = if forma.is_empty() { tipo.clone() } else { format!("{tipo}@{forma}") };
     // HERANÇA: se o molde do TIPO puro já cobre esta forma (cobertura ≥ gate na amostra do
     // cluster), materializa um alias — a decisão persiste e o cluster nunca mais entra na fila.
@@ -1681,7 +1707,12 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     let (sys, _from) = template_system(lib);
     let (schema, regras) = match llm_make_template(llm_url, &format!("mineração {coll} tipo={tipo}"), &sys, &tipo, &amostra, "") {
         Ok(x) => x,
-        Err(e) => { nlog(&format!("template {coll}/{tipo}: {e}")); return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e}); }
+        Err(e) => {
+            nlog(&format!("template {coll}/{tipo}: {e}"));
+            // sem memória disso, o cluster mais populoso re-tenta TODO ciclo e tranca a fila
+            marca_reprovado(ch_url, &reg_key, 0.0, &format!("LLM falhou: {e}"));
+            return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e});
+        }
     };
     // valida cobertura aplicando o molde na própria amostra (% de campos que casaram)
     let regras_v: Value = serde_json::from_str(&regras).unwrap_or_else(|_| json!([]));
@@ -1695,6 +1726,7 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     if cobertura < TEMPLATE_MIN_COVERAGE {
         nlog(&format!("molde REJEITADO: tipo={tipo} cobertura={:.0}% < {:.0}% (sem estrutura extraível)",
             cobertura * 100.0, TEMPLATE_MIN_COVERAGE * 100.0));
+        marca_reprovado(ch_url, &reg_key, cobertura, &format!("cobertura {:.0}% < gate", cobertura * 100.0));
         return json!({"ok": true, "collection": coll, "criados": 0, "tipo": tipo,
                       "cobertura": cobertura, "rejeitado": "cobertura baixa"});
     }
@@ -2024,9 +2056,13 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         if is_csv(b) {
             extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone(), String::new()));
         } else {
+            // molde ÚTIL = existe, tem regras e não é uma reprovação gravada (fila liberada ≠ extraível)
+            let util = |k: &str| templates.get(k).map(|t|
+                t["origem"].as_str() != Some("reprovado")
+                && t["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
             let composta = if forma.is_empty() { String::new() } else { format!("{tipo}@{forma}") };
-            let mkey = if !composta.is_empty() && templates.get(&composta).is_some() { composta }
-                       else if templates.get(tipo.as_str()).is_some() { tipo.clone() }
+            let mkey = if !composta.is_empty() && util(&composta) { composta }
+                       else if util(tipo.as_str()) { tipo.clone() }
                        else { continue };
             let t = &templates[mkey.as_str()];
             let ecfg = hash_hex(&format!("template|v2nqi|{mkey}|{}", hash_hex(&t["regras"].to_string())));
@@ -2036,7 +2072,9 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     // ponto cego: natureza=tabela sem csv E sem molde → ninguém extrai (VISÍVEL, não silencioso)
     let blind = bases_class.iter()
         .filter(|b| b["natureza"].as_str() == Some("tabela") && !is_csv(b)
-                && !templates.get(b["tipo"].as_str().unwrap_or("")).is_some()).count();
+                && !templates.get(b["tipo"].as_str().unwrap_or("")).map(|t|
+                    t["origem"].as_str() != Some("reprovado")
+                    && t["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false)).count();
     if blind > 0 { nlog(&format!("extract {coll}: {blind} base(s) natureza=tabela sem csv nem molde — não extraídas")); }
     if extraiveis.is_empty() {
         return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "nada extraível (sem CSV nem molde)"});

@@ -109,6 +109,14 @@ function ClustersDeForma({ collection }: { collection: string }) {
     if (c.natureza !== 'documento') return { label: 'não gera registro', cls: 'text-[var(--color-muted)]', hint: `natureza ${c.natureza} — narrativo/código não têm campos rotulados; não é refugo` }
     const composta = c.forma ? `${c.tipo}@${c.forma}` : ''
     const esp = composta ? templates[composta] : undefined
+    if (esp?.origem === 'reprovado' || (!esp && templates[c.tipo]?.origem === 'reprovado')) {
+      const cob = (esp ?? templates[c.tipo])?.cobertura
+      return {
+        label: `molde reprovado 🚫${cob != null ? ` · ${(cob * 100).toFixed(0)}%` : ''}`,
+        cls: 'text-[var(--color-crit)]',
+        hint: 'o L1 tentou e reprovou (sem estrutura extraível na amostra) — NÃO re-tenta; destrave com molde dirigido (L3) ou re-tipando a base',
+      }
+    }
     if (esp) {
       const her = esp.origem === 'herdado'
       return {
