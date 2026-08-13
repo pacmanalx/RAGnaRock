@@ -335,16 +335,13 @@ fn norm_valor(campo: &str, v: &str) -> Option<String> {
 // (nomes próprios por capitalização, CPU barata, cobertura 100%); o LLM vira enriquecedor
 // dirigido no futuro. Os registros {mencao, freq} entram no dump e o mine_links cruza.
 const MENCAO_BASES_PER_CYCLE: usize = 60;  // varredura é CPU — o corpus inteiro em poucos ciclos
-const MENCAO_TOP_BASE: usize = 40;         // piso de menções por base…
-const MENCAO_TOP_MAX: usize = 250;         // …teto absoluto
+const MENCAO_TOP_MAX: usize = 800;         // proteção patológica, NÃO ranking por vaga
 const MENCAO_MIN_FREQ: u32 = 3;            // aparece ≥3× no livro = personagem/entidade, não acaso
 
-/// Teto PROPORCIONAL ao texto: 40 + 1 vaga a cada 20k chars. Um conto usa 40; a trilogia
-/// inteira num arquivo (~2,7M chars) ganha ~175 — senão o top fixo só tem a corte principal
-/// e os locais secundários (Topo do Vento, Pônei Saltitante) ficam de fora.
-fn mencao_top(n_chars: usize) -> usize {
-    (MENCAO_TOP_BASE + n_chars / 20_000).min(MENCAO_TOP_MAX)
-}
+/// v7: SEM escassez artificial — entra TUDO que passa no piso de frequência. Raridade não é
+/// irrelevância: o Pônei Saltitante (freq 6 na trilogia) importa PORQUE é raro e específico;
+/// ranking por vaga só deixava a corte principal. O teto de 800 é rede contra texto patológico.
+fn mencao_top(_n_chars: usize) -> usize { MENCAO_TOP_MAX }
 
 /// Nomes próprios por heurística zero-IA: sequências de palavras Capitalizadas (com conectores
 /// "de/da/do/G." — José de Arimateia, Ellen G. White), contadas no texto INTEIRO. Palavra única
@@ -414,9 +411,9 @@ fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
 }
 
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
-    // v6: teto de menções PROPORCIONAL ao tamanho do texto (a trilogia-arquivo merece
-    // mais que 40 vagas); miolo 5-95%; poda de ponto final; LLM fora do caminho crítico
-    let ecfg = hash_hex("mencao|v6|top-proporcional|miolo");
+    // v7: sem escassez artificial — tudo com freq≥3 entra (teto 800 = só proteção);
+    // miolo 5-95%; poda de ponto final; LLM fora do caminho crítico
+    let ecfg = hash_hex("mencao|v7|freq-gate|miolo");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
