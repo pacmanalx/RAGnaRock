@@ -163,6 +163,50 @@ export interface NidhoggRejeitados {
   rejeitados: { collection: string; base: string; natureza: string; tipo: string; motivo: string; nqi: number | null }[]
 }
 
+// ── Nidhogg L0: conhecimento minerado (knowledge.json por coleção) ──
+export interface SalientRoot { dim: number; syllable: string; uidf: number; df: number; freq: number }
+export interface KnowledgeItem {
+  type: string // 'RootIndex' | 'CorpusDict' | …
+  level: number
+  content: {
+    // RootIndex
+    bases_count?: number
+    total_chunks?: number
+    unified_vocab_size?: number
+    salient_roots?: SalientRoot[]
+    // CorpusDict
+    shared_vocab?: number
+    unique_vocab?: number
+    bases?: { name: string; corpus: string; n_chunks: number; vocab_size: number }[]
+  }
+}
+export interface KnowledgeResponse {
+  collection: string
+  enabled: boolean
+  source_hash: string
+  saturation: number
+  updated: string
+  provenance?: {
+    digestion_id: string
+    at: string
+    via: string
+    inputs: { bases: number; total_chunks: number; source_hash: string }
+  }
+  knowledge: KnowledgeItem[]
+}
+export interface CacheDigestResponse {
+  type: string
+  level: number
+  scope: string
+  updated: string
+  content: {
+    n_queries: number
+    n_variants_total: number
+    avg_variants: number
+    entries: { query: string; variants: string[]; n_variants: number }[]
+  }
+}
+
 // POST /histogram — visualização do hit #1: matched filter + embedding × query (tela Performance)
 export interface MfTerm {
   term: string

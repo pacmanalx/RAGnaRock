@@ -5,6 +5,7 @@ import type {
   ThesaurusResponse, ChunkResponse, HistogramResponse, StatsResponse, NidhoggStatus,
   ConfigResponse, SetConfigResponse, IngestorsResponse,
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
+  KnowledgeResponse, CacheDigestResponse,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -74,6 +75,11 @@ export const getNidhoggClasses = (coll?: string) =>
 export const getNidhoggEntities = () => nidhogg.get<NidhoggEntitiesSummary>('/api/nidhogg/entities')
 export const getNidhoggTemplates = () => nidhogg.get<{ templates: Record<string, unknown> }>('/api/nidhogg/templates')
 export const getNidhoggRejeitados = () => nidhogg.get<NidhoggRejeitados>('/api/nidhogg/rejeitados')
+// conhecimento minerado do L0 (RootIndex + CorpusDict) de UMA coleção
+export const getNidhoggKnowledge = (collection: string) =>
+  nidhogg.get<KnowledgeResponse>(`/api/nidhogg/knowledge?collection=${encodeURIComponent(collection)}`)
+// digest GLOBAL do cache de expansão do ragd (pilar do L0)
+export const getNidhoggCacheDigest = () => nidhogg.get<CacheDigestResponse>('/api/nidhogg/cachedigest')
 // liga/desliga o ACESSO do worm a uma coleção (não re-mastiga a mesma N vezes)
 export const toggleNidhoggCollection = (collection: string, enabled: boolean) =>
   nidhogg.post<{ ok: boolean }>('/api/nidhogg/collection', { collection, enabled })
