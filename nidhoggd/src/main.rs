@@ -1502,7 +1502,7 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
         let name = nfc(b["name"].as_str().unwrap_or(""));
         match extraiveis.get(name.as_str()) {
-            Some((_, _, ecfg)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg).unwrap_or(true),
+            Some((_, _, ecfg, _)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg).unwrap_or(true),
             None => false,
         }
     }).collect();
