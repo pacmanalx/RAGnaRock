@@ -1,5 +1,6 @@
 # ── Segredos / config local (NUNCA commitar) ──
 ragnarock.cfg
+nidhogg.cfg
 .sources
 *.bak
 *.bak-*
