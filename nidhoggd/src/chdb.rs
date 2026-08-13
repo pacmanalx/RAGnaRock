@@ -510,3 +510,113 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
     }
     Ok(json!({"count": lista.len(), "por_motivo": por_motivo, "rejeitados": lista}))
 }
+
+// ───────────────────────────── L2: KnowledgeTree (nós de VALOR) ─────────────────────────────
+// Modelo LINEAR: cada valor-entidade normalizado (CNPJ, nome…) é um NÓ; cada registro do dump
+// que o contém é uma PARTICIPAÇÃO. A "aresta" contrato↔comprovante é implícita via o nó — sem
+// explosão combinatória (40 comprovantes do mesmo CNPJ = 40 linhas, não C(41,2) arestas).
+
+pub struct NoValorRow {
+    pub collection: String,
+    pub valor_norm: String,  // chave de ligação (dígitos p/ CNPJ/CPF/ids; texto folded p/ nomes)
+    pub valor: String,       // forma de exibição (como apareceu no documento)
+    pub campo: String,       // de qual campo do registro veio (prov da ligação)
+    pub tipo: String,
+    pub base: String,
+    pub idx: u32,
+    pub nqi: f64,
+    pub version: u64,
+    pub linked_at: String,
+}
+
+pub fn ensure_no_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.no_valor (collection String, valor_norm String, \
+         valor String, campo String, tipo String, base String, idx UInt32, nqi Float64, \
+         version UInt64, linked_at String) ENGINE = ReplacingMergeTree(version) \
+         ORDER BY (collection, valor_norm, base, idx, campo)", 20)
+}
+
+/// Dump atual de UMA coleção (a matéria-prima da ligação).
+pub fn entities_dump(url: &str, coll: &str) -> Result<Vec<Value>, String> {
+    let body = ch_query_param(url,
+        "SELECT base, tipo, idx, dado, nqi FROM nidhogg.entidade_atual WHERE collection={coll:String} FORMAT JSONEachRow",
+        &[("coll", coll)], 30)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+/// Fingerprint do dump (max version) — o checkpoint incremental do L2: religa só quando mudou.
+pub fn max_entity_version(url: &str, coll: &str) -> Result<u64, String> {
+    let body = ch_query_param(url,
+        "SELECT max(version) FROM nidhogg.entidade_atual WHERE collection={coll:String} FORMAT TabSeparated",
+        &[("coll", coll)], 15)?;
+    Ok(body.trim().parse().unwrap_or(0))
+}
+
+pub fn insert_nos(url: &str, rows: &[NoValorRow]) -> Result<(), String> {
+    if rows.is_empty() { return Ok(()); }
+    let mut ndjson = String::new();
+    for r in rows {
+        ndjson.push_str(&json!({
+            "collection": r.collection, "valor_norm": r.valor_norm, "valor": r.valor,
+            "campo": r.campo, "tipo": r.tipo, "base": r.base, "idx": r.idx,
+            "nqi": r.nqi, "version": r.version, "linked_at": r.linked_at,
+        }).to_string());
+        ndjson.push('\n');
+    }
+    ch_insert(url, "nidhogg.no_valor", &ndjson, 30)
+}
+
+/// A ÁRVORE: assuntos (nós com ≥2 participações) → ramos por tipo → registros.
+/// `q` filtra por substring do valor (a busca de assunto da tela).
+pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
+    let filter_q = if q.is_empty() { String::new() }
+                   else { " AND positionCaseInsensitive(valor, {q:String}) > 0".to_string() };
+    let mut params: Vec<(&str, &str)> = vec![("coll", coll)];
+    if !q.is_empty() { params.push(("q", q)); }
+    let tops_body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) valor, count() regs, uniqExact(base) nbases \
+         FROM nidhogg.no_valor FINAL WHERE collection={{coll:String}}{filter_q} \
+         GROUP BY valor_norm HAVING regs >= 2 \
+         ORDER BY nbases DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
+    let tops: Vec<Value> = tops_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if tops.is_empty() { return Ok(json!({"collection": coll, "nodes": []})); }
+
+    // participações dos nós do topo (IN com escape de aspas)
+    let in_list: Vec<String> = tops.iter()
+        .filter_map(|t| t["valor_norm"].as_str())
+        .map(|s| format!("'{}'", s.replace('\'', "''"))).collect();
+    let det_body = ch_query_param(url, &format!(
+        "SELECT valor_norm, campo, tipo, base, idx, nqi FROM nidhogg.no_valor FINAL \
+         WHERE collection={{coll:String}} AND valor_norm IN ({}) \
+         ORDER BY tipo, base, idx FORMAT JSONEachRow", in_list.join(",")),
+        &[("coll", coll)], 20)?;
+    let mut membros: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for l in det_body.lines() {
+        if l.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            if let Some(n) = v["valor_norm"].as_str() {
+                membros.entry(n.to_string()).or_default().push(v);
+            }
+        }
+    }
+    let nodes: Vec<Value> = tops.iter().map(|t| {
+        let norm = t["valor_norm"].as_str().unwrap_or("");
+        // ramos por TIPO (contrato / cadastro / comprovante…)
+        let mut ramos: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+        for m in membros.get(norm).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let tipo = m["tipo"].as_str().unwrap_or("?").to_string();
+            ramos.entry(tipo).or_default().push(json!({
+                "base": m["base"], "campo": m["campo"], "idx": m["idx"], "nqi": m["nqi"],
+            }));
+        }
+        json!({
+            "valor": t["valor"], "valor_norm": norm,
+            "registros": t["regs"], "bases": t["nbases"],
+            "ramos": ramos.into_iter().map(|(tipo, itens)| json!({"tipo": tipo, "n": itens.len(), "itens": itens})).collect::<Vec<_>>(),
+        })
+    }).collect();
+    Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
+}

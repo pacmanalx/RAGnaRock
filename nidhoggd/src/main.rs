@@ -262,6 +262,22 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| kv.split_once('=').and_then(|(k, v)| (k == key).then(|| v.to_string())))
 }
 
+/// percent-decode mínimo (pra parâmetros com texto livre, ex.: ?q= da busca da árvore).
+fn pdec(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) { out.push((h << 4) | l); i += 3; continue; }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// [FORMA] Assinatura ESTRUTURAL do documento (zero-IA): o esqueleto de rótulos.
 /// Extrai os rótulos "Nome:" no início de linha (ordem preservada, dedup) e hasheia.
 /// Documentos irmãos de forma (100 mil PIX do mesmo template) compartilham a assinatura;
@@ -284,6 +300,77 @@ fn form_signature(text: &str) -> String {
     }
     if labels.len() < 2 { return String::new(); }   // 1 rótulo solto não é estrutura
     hash_hex(&labels.join("|"))[..8].to_string()
+}
+
+/// [L2] Normaliza um valor de campo pra virar CHAVE DE LIGAÇÃO do KnowledgeTree.
+/// Dois registros que compartilham a chave estão LIGADOS (a aresta implícita).
+/// None = valor que não identifica nada (data, dinheiro, texto curto) — ligar por ele é ruído.
+fn norm_valor(campo: &str, v: &str) -> Option<String> {
+    let c = campo.to_lowercase();
+    // campos de medida/tempo não identificam entidades (mas "nome_*" sempre vale)
+    if !c.contains("nome") && ["data", "valor", "total", "preco", "qtd", "quant"].iter().any(|k| c.contains(k)) {
+        return None;
+    }
+    let t = v.trim();
+    if t.is_empty() || t.to_lowercase().starts_with("r$") { return None; }
+    let digits: String = t.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    // data dd/mm/aaaa (8 dígitos com separador) não é identidade
+    if t.contains('/') && digits.len() == 8 && t.chars().count() <= 10 { return None; }
+    // numérico longo (CNPJ/CPF/conta/ticket): a chave são os dígitos crus
+    if digits.len() >= 8 && digits.len() * 2 >= t.chars().count() { return Some(digits); }
+    // texto: precisa de corpo (≥5 chars, com letra) — chave = minúsculo sem acento
+    if t.chars().count() < 5 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String = t.nfd()
+        .filter(|ch| !unicode_normalization::char::is_combining_mark(*ch))
+        .collect::<String>().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(folded)
+}
+
+/// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
+/// nidhogg.no_valor. Incremental por fingerprint (max version do dump) guardado no
+/// knowledge.json — religa SÓ quando a extração produziu algo novo. Zero IA.
+fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
+    if let Err(e) = chdb::ensure_no_schema(ch_url) {
+        return json!({"ok": false, "collection": coll, "error": format!("schema no_valor: {e}")});
+    }
+    let fp = chdb::max_entity_version(ch_url, coll).unwrap_or(0);
+    let k = read_knowledge(dir, coll);
+    if fp == 0 { return json!({"ok": true, "collection": coll, "linked": 0, "note": "dump vazio"}); }
+    if k["link_src"].as_u64() == Some(fp) {
+        return json!({"ok": true, "collection": coll, "linked": 0, "note": "dump inalterado"});
+    }
+    let regs = match chdb::entities_dump(ch_url, coll) {
+        Ok(r) => r, Err(e) => return json!({"ok": false, "collection": coll, "error": e}),
+    };
+    let version = chdb::now_version();
+    let at = now_stamp();
+    let mut rows: Vec<chdb::NoValorRow> = vec![];
+    for r in &regs {
+        let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+        let obj = match dado.as_object() { Some(o) => o, None => continue };
+        for (campo, val) in obj {
+            let vs = match val.as_str() { Some(s) => s, None => continue };
+            if let Some(norm) = norm_valor(campo, vs) {
+                rows.push(chdb::NoValorRow {
+                    collection: coll.to_string(), valor_norm: norm, valor: vs.trim().to_string(),
+                    campo: campo.clone(), tipo: r["tipo"].as_str().unwrap_or("?").to_string(),
+                    base: r["base"].as_str().unwrap_or("").to_string(),
+                    idx: r["idx"].as_u64().unwrap_or(0) as u32,
+                    nqi: r["nqi"].as_f64().unwrap_or(0.0), version, linked_at: at.clone(),
+                });
+            }
+        }
+    }
+    if let Err(e) = chdb::insert_nos(ch_url, &rows) {
+        return json!({"ok": false, "collection": coll, "error": format!("insert nós: {e}")});
+    }
+    // persiste o fingerprint (escrita leve — mesmo padrão da saturação)
+    let mut cur = read_knowledge(dir, coll);
+    cur["link_src"] = json!(fp);
+    write_knowledge(dir, coll, &cur);
+    nlog(&format!("L2 {coll}: {} nó(s) de valor ligados de {} registro(s)", rows.len(), regs.len()));
+    json!({"ok": true, "collection": coll, "linked": rows.len(), "registros": regs.len()})
 }
 
 /// Normalização Unicode NFC — mesmo fix do ragd: o macOS entrega nomes em NFD e o mesmo
@@ -419,6 +506,23 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 (200, json!({"count": 0, "note": "extração requer clickhouse"}).to_string())
             } else {
                 match chdb::entities_summary(&ch_url, coll.as_deref(), base.as_deref()) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [L2] KnowledgeTree — a árvore de assuntos: nós de valor (≥2 participações) →
+        // ramos por tipo → registros. ?collection= obrigatório, ?q= busca por assunto.
+        (Method::Get, "/api/nidhogg/tree") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c))).unwrap_or_default();
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" {
+                (200, json!({"nodes": [], "note": "KnowledgeTree requer clickhouse"}).to_string())
+            } else if coll.is_empty() {
+                (400, json!({"error": "falta ?collection="}).to_string())
+            } else {
+                match chdb::tree_json(&ch_url, &coll, &q, 100) {
                     Ok(v) => (200, v.to_string()),
                     Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
                 }
@@ -1612,6 +1716,11 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     let ex = mine_entities(&api, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     det_total += ex["deterministicas"].as_u64().unwrap_or(0) + ex["templates"].as_u64().unwrap_or(0);
+                    // [L2] KnowledgeTree: liga o dump por valores-chave (zero IA, incremental
+                    // por fingerprint). Roda DEPOIS da extração — o dump é a matéria-prima.
+                    if level >= 2 && store == "clickhouse" {
+                        let _lk = mine_links(&ch_url, &dir, coll);
+                    }
                     // Summary d00a009 REMOVIDO (10/ago): o normalizador aberto (1 LLM pesado/base,
                     // extração às cegas + agregação) foi substituído pela Fase 1 (classifica) + Fase 2/4
                     // (extrai determinístico) + Fase 3 (moldes). Dead-code varrido — não há mais mine_summary.

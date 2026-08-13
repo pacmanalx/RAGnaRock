@@ -22,6 +22,7 @@ import { Logs } from '@/pages/admin/Logs'
 import { NidhoggVisao } from '@/pages/nidhogg/Visao'
 import { NidhoggMiner } from '@/pages/nidhogg/Miner'
 import { NidhoggSummary } from '@/pages/nidhogg/Summary'
+import { NidhoggTree } from '@/pages/nidhogg/Tree'
 
 // Router central único (molde Innova: rotas explícitas, não file-based).
 export const router = createBrowserRouter([
@@ -38,7 +39,7 @@ export const router = createBrowserRouter([
       { path: 'nidhogg', element: <NidhoggVisao /> },
       { path: 'nidhogg/miner', element: <NidhoggMiner /> },
       { path: 'nidhogg/summary', element: <NidhoggSummary /> },
-      { path: 'nidhogg/tree', element: <Placeholder title="L2 · KnowledgeTree" note="Grafo de relações sobre o dado normalizado." /> },
+      { path: 'nidhogg/tree', element: <NidhoggTree /> },
       { path: 'nidhogg/gaps', element: <Placeholder title="L3 · Gaps & Propostas" note="Fila das perguntas não-perguntadas." /> },
       { path: 'admin/perfis', element: <Perfis /> },
       { path: 'admin/usuarios', element: <Usuarios /> },

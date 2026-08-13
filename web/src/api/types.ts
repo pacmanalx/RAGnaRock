@@ -163,6 +163,18 @@ export interface NidhoggRejeitados {
   rejeitados: { collection: string; base: string; natureza: string; tipo: string; motivo: string; nqi: number | null }[]
 }
 
+// ── Nidhogg L2: KnowledgeTree (nós de valor → ramos por tipo → registros) ──
+export interface TreeItem { base: string; campo: string; idx: number; nqi: number }
+export interface TreeRamo { tipo: string; n: number; itens: TreeItem[] }
+export interface TreeNode {
+  valor: string
+  valor_norm: string
+  registros: number
+  bases: number
+  ramos: TreeRamo[]
+}
+export interface TreeResponse { collection: string; count: number; nodes: TreeNode[]; note?: string }
+
 // ── Nidhogg L1: doctypes, prompts e moldes ──
 export interface NidhoggDoctypes { naturezas: string[]; tipos: string[] }
 export interface PromptTemplate { description: string; system: string; updated: string; max_tokens?: number }
