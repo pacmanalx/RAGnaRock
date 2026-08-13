@@ -6,7 +6,7 @@ import type {
   ConfigResponse, SetConfigResponse, IngestorsResponse,
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
-  TreeResponse, NavNode,
+  TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -85,6 +85,16 @@ export const getNavSuggest = (collection: string, q: string) =>
 // [Think Navigator] expande um nó do mindmap (relacionados por co-ocorrência)
 export const getNavNode = (collection: string, norm: string) =>
   nidhogg.get<NavNode>(`/api/nidhogg/node?collection=${encodeURIComponent(collection)}&norm=${encodeURIComponent(norm)}`)
+// [L2 · Dimensões] eixos declarados: o humano diz o que importa, a navegação pivota por eles
+export const getDimensoes = () => nidhogg.get<{ dimensoes: Dimensao[] }>('/api/nidhogg/dimensoes')
+export const saveDimensoes = (dimensoes: Dimensao[]) =>
+  nidhogg.post<{ ok: boolean }>('/api/nidhogg/dimensoes', { dimensoes })
+export const getDimensaoValores = (nome: string, collection: string, q = '') =>
+  nidhogg.get<DimValoresResponse>(
+    `/api/nidhogg/dimensao/valores?nome=${encodeURIComponent(nome)}&collection=${encodeURIComponent(collection)}${q ? `&q=${encodeURIComponent(q)}` : ''}`)
+export const getDimensoesGaps = (collection: string) =>
+  nidhogg.get<{ collection: string; gaps: DimGap[] }>(
+    `/api/nidhogg/dimensoes/gaps?collection=${encodeURIComponent(collection)}`)
 // vocabulário EDITÁVEL do classificador (Fase 1) — editar reclassifica no próximo ciclo
 export const getNidhoggDoctypes = () => nidhogg.get<NidhoggDoctypes>('/api/nidhogg/doctypes')
 export const setNidhoggDoctypes = (naturezas: string[], tipos: string[]) =>

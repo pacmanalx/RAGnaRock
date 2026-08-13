@@ -730,6 +730,120 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 }
             }
         }
+        // [Dimensões] cadastro (a ponte L2→L3): eixos declarados de navegação/exigência.
+        (Method::Get, "/api/nidhogg/dimensoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (200, json!({"dimensoes": []}).to_string()); }
+            let mut dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            // seed na primeira visita: dois eixos que o corpus atual já alimenta
+            if dims.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                dims = json!([
+                    {"nome": "CNPJ/CPF", "descricao": "identidade fiscal — liga contratos, comprovantes e cadastros",
+                     "campos": ["*_cnpj", "*_cpf", "cnpj", "cpf"], "tipos": []},
+                    {"nome": "Pessoas & Entidades", "descricao": "nomes próprios — personagens, pessoas, organizações",
+                     "campos": ["mencao", "*_nome", "personagem"], "tipos": []},
+                ]);
+                let _ = chdb::write_dimensoes(&ch_url, &dims);
+            }
+            (200, json!({"dimensoes": dims}).to_string())
+        }
+        (Method::Post, "/api/nidhogg/dimensoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error": "requer clickhouse"}).to_string()); }
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()) };
+            let dims = &v["dimensoes"];
+            let arr = match dims.as_array() { Some(a) => a, None => return (400, json!({"error": "falta 'dimensoes' (array)"}).to_string()) };
+            for d in arr {
+                let nome = d["nome"].as_str().unwrap_or("");
+                if nome.trim().is_empty() { return (400, json!({"error": "dimensão sem 'nome'"}).to_string()); }
+                let campos = d["campos"].as_array().map(|a| a.len()).unwrap_or(0);
+                if campos == 0 { return (400, json!({"error": format!("dimensão '{nome}' sem 'campos'")}).to_string()); }
+                for c in d["campos"].as_array().unwrap() {
+                    let cs = c.as_str().unwrap_or("");
+                    if cs.is_empty() || !cs.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '*' | '.' | '-')) {
+                        return (400, json!({"error": format!("padrão de campo inválido em '{nome}': {cs:?} (use letras, dígitos, _ . - e *)")}).to_string());
+                    }
+                }
+            }
+            match chdb::write_dimensoes(&ch_url, dims) {
+                Ok(_) => { nlog(&format!("dimensões salvas: {} eixo(s)", arr.len())); (200, json!({"ok": true, "dimensoes": dims}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [Dimensões] valores de um eixo (o primeiro clique da corrente)
+        (Method::Get, "/api/nidhogg/dimensao/valores") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let nome = query_param(query, "nome").map(|v| pdec(&v)).unwrap_or_default();
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" || nome.is_empty() {
+                return (400, json!({"error": "requer clickhouse + ?nome="}).to_string());
+            }
+            let dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            let dim = dims.as_array().and_then(|a| a.iter().find(|d| d["nome"].as_str() == Some(nome.as_str()))).cloned();
+            let dim = match dim { Some(d) => d, None => return (404, json!({"error": format!("dimensão '{nome}' não existe")}).to_string()) };
+            let padroes: Vec<String> = dim["campos"].as_array().map(|a| a.iter()
+                .filter_map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default();
+            match chdb::dimensao_valores(&ch_url, &coll, &padroes, &q, 200) {
+                Ok(mut v) => { v["nome"] = json!(nome); (200, v.to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [Dimensões→L3] GAPS: onde o eixo declarado NÃO alcança — tipos do corpus sem nenhum
+        // campo que case os padrões. É a demanda de mastigação que o humano injetou.
+        (Method::Get, "/api/nidhogg/dimensoes/gaps") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            if store != "clickhouse" { return (200, json!({"gaps": []}).to_string()); }
+            let dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            let tc = chdb::tipos_campos(&ch_url, &coll).unwrap_or_default();
+            // tipos EXTRAÍVEIS do corpus (documento/tabela — narrativo não gera registro rotulado)
+            let classes = chdb::classes_summary(&ch_url, if coll == "*" { None } else { Some(&coll) })
+                .unwrap_or_else(|_| json!({}));
+            let mut tipos_corpus: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+            for b in classes["bases"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                let (nat, tip) = (b["natureza"].as_str().unwrap_or(""), b["tipo"].as_str().unwrap_or(""));
+                if matches!(nat, "documento" | "tabela") && !tip.is_empty() && tip != "sem-texto" {
+                    tipos_corpus.insert(tip.to_string(), nat.to_string());
+                }
+            }
+            let casa = |p: &str, campo: &str| -> bool {
+                // wildcard simples: '*' casa qualquer trecho
+                let partes: Vec<&str> = p.split('*').collect();
+                let mut resto = campo;
+                for (i, parte) in partes.iter().enumerate() {
+                    if parte.is_empty() { continue; }
+                    if i == 0 && !p.starts_with('*') {
+                        if !resto.starts_with(parte) { return false; }
+                        resto = &resto[parte.len()..];
+                    } else if i == partes.len() - 1 && !p.ends_with('*') {
+                        if !resto.ends_with(parte) { return false; }
+                    } else {
+                        match resto.find(parte) { Some(pos) => resto = &resto[pos + parte.len()..], None => return false }
+                    }
+                }
+                true
+            };
+            let gaps: Vec<Value> = dims.as_array().map(|a| a.iter().map(|d| {
+                let nome = d["nome"].as_str().unwrap_or("");
+                let padroes: Vec<&str> = d["campos"].as_array().map(|a| a.iter()
+                    .filter_map(|c| c.as_str()).collect()).unwrap_or_default();
+                let alvo: Vec<String> = d["tipos"].as_array()
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                    .unwrap_or_else(|| tipos_corpus.keys().cloned().collect());
+                let cobertos: std::collections::BTreeSet<&String> = alvo.iter().filter(|t| {
+                    tc.iter().any(|(tt, cc)| tt == *t && padroes.iter().any(|p| casa(p, cc)))
+                }).collect();
+                let faltando: Vec<&String> = alvo.iter().filter(|t| !cobertos.contains(t)).collect();
+                json!({"nome": nome, "alvo": alvo.len(), "cobertos": cobertos.len(),
+                       "gaps": faltando, "nota": if faltando.is_empty() { "eixo plenamente alimentado" }
+                               else { "tipos sem campo do eixo — candidatos a molde dirigido (L3)" }})
+            }).collect()).unwrap_or_default();
+            (200, json!({"collection": coll, "gaps": gaps}).to_string())
+        }
         // [Think Navigator] sugestões leves de tema. collection é FILTRO opcional (default: todas).
         (Method::Get, "/api/nidhogg/suggest") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };

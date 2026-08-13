@@ -184,7 +184,20 @@ export interface NavNode {
   registros: number | string
   bases: number | string
   co: { valor: string; valor_norm: string; n: number | string; bases: number | string }[]
+  facetas?: { tipo: string; campo: string; n: number | string; bases: number | string }[]
 }
+
+// ── Nidhogg L2: cadastro de Dimensões (eixos declarados de navegação/exigência) ──
+export interface Dimensao { nome: string; descricao?: string; campos: string[]; tipos: string[] }
+export interface DimValorItem {
+  valor: string
+  valor_norm: string
+  registros: number | string
+  bases: number | string
+  tipos: number | string
+}
+export interface DimValoresResponse { nome: string; count: number; valores: DimValorItem[] }
+export interface DimGap { nome: string; alvo: number; cobertos: number; gaps: string[]; nota: string }
 
 // ── Nidhogg L1: doctypes, prompts e moldes ──
 export interface NidhoggDoctypes { naturezas: string[]; tipos: string[] }

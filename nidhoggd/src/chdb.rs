@@ -724,8 +724,90 @@ pub fn node_json(url: &str, coll: &str, norm: &str, limit: usize) -> Result<Valu
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|v| json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"], "bases": v["nb"]}))
         .collect();
+    // facetas: em que TIPOS e por quais CAMPOS este valor vive no sistema — a cadeia
+    // "clicou no CNPJ → os tipos de relação que ele abre" do cadastro de dimensões
+    let fac_body = ch_query_param(url, &format!(
+        "SELECT tipo, campo, count() n, uniqExact(base) nb FROM nidhogg.no_valor FINAL \
+         WHERE valor_norm={{norm:String}}{wc} GROUP BY tipo, campo \
+         ORDER BY n DESC LIMIT 30 FORMAT JSONEachRow"), &params, 20).unwrap_or_default();
+    let facetas: Vec<Value> = fac_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| json!({"tipo": v["tipo"], "campo": v["campo"], "n": v["n"], "bases": v["nb"]}))
+        .collect();
     Ok(json!({
         "found": true, "valor": st["v"], "valor_norm": norm,
-        "registros": st["regs"], "bases": st["nb"], "co": co,
+        "registros": st["regs"], "bases": st["nb"], "co": co, "facetas": facetas,
     }))
+}
+
+// ───────────────────────── Dimensões (a ponte L2→L3) ─────────────────────────
+// Dimensão = EIXO DECLARADO de navegação/exigência: um conjunto de padrões de CAMPO
+// (*_cnpj, mencao…) e opcionalmente de TIPOS. O humano declara o que importa; a navegação
+// pivota por ela; e onde o corpus não a entrega vira GAP (demanda de mastigação → L3).
+// Blob versionado como o doctype: 1 linha = a lista inteira (falha de escrita nunca zera).
+
+pub fn ensure_dimensao_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.dimensao (version UInt64, dimensoes String) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
+    Ok(())
+}
+
+pub fn dimensoes(url: &str) -> Result<Value, String> {
+    ensure_dimensao_schema(url)?;
+    let body = ch_exec(url,
+        "SELECT dimensoes FROM nidhogg.dimensao FINAL ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow", 10)?;
+    let line = body.lines().next().unwrap_or("{}");
+    let v: Value = serde_json::from_str(line).unwrap_or_else(|_| json!({}));
+    Ok(serde_json::from_str(v["dimensoes"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([])))
+}
+
+pub fn write_dimensoes(url: &str, dims: &Value) -> Result<(), String> {
+    ensure_dimensao_schema(url)?;
+    let row = json!({"version": now_version(), "dimensoes": dims.to_string()});
+    ch_insert(url, "nidhogg.dimensao", &row.to_string(), 15)
+}
+
+/// Padrão de campo → SQL LIKE seguro: só [a-z0-9_*.-]; `*`→`%`; `_` literal escapado.
+/// ClickHouse escapa LIKE com backslash (sem cláusula ESCAPE); no literal SQL vai dobrado.
+fn padrao_like(p: &str) -> Option<String> {
+    if p.is_empty() || !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '*' | '.' | '-')) {
+        return None;
+    }
+    Some(p.replace('_', "\\\\_").replace('*', "%"))
+}
+
+/// Valores de uma dimensão: agrega no_valor pelos campos que casam os padrões.
+pub fn dimensao_valores(url: &str, coll: &str, padroes: &[String], q: &str, limit: usize) -> Result<Value, String> {
+    let likes: Vec<String> = padroes.iter().filter_map(|p| padrao_like(p))
+        .map(|l| format!("campo LIKE '{}'", l.replace('\'', ""))).collect();
+    if likes.is_empty() { return Ok(json!({"count": 0, "valores": []})); }
+    let mut conds = vec![format!("({})", likes.join(" OR "))];
+    let mut params: Vec<(&str, &str)> = vec![];
+    if coll != "*" { conds.push("collection={coll:String}".into()); params.push(("coll", coll)); }
+    if !q.is_empty() { conds.push("positionCaseInsensitive(valor, {q:String}) > 0".into()); params.push(("q", q)); }
+    let body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nb, uniqExact(tipo) nt \
+         FROM nidhogg.no_valor FINAL WHERE {} \
+         GROUP BY valor_norm ORDER BY nb DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow",
+        conds.join(" AND ")), &params, 25)?;
+    let valores: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|t| json!({"valor": t["v"], "valor_norm": t["valor_norm"],
+                        "registros": t["regs"], "bases": t["nb"], "tipos": t["nt"]}))
+        .collect();
+    Ok(json!({"count": valores.len(), "valores": valores}))
+}
+
+/// Pares (tipo, campo) presentes no grafo — matéria-prima do cálculo de GAPS (feito em Rust,
+/// onde os padrões casam sem risco de SQL).
+pub fn tipos_campos(url: &str, coll: &str) -> Result<Vec<(String, String)>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" WHERE collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT DISTINCT tipo, campo FROM nidhogg.no_valor FINAL{wc} FORMAT JSONEachRow"), &params, 20)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["tipo"].as_str()?.to_string(), v["campo"].as_str()?.to_string())))
+        .collect())
 }

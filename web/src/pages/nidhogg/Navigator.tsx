@@ -23,10 +23,14 @@ interface NavMapNode {
 const R_EXPAND = 190      // raio dos filhos ao expandir
 const MAX_FILHOS = 10     // legibilidade: os 10 relacionados mais fortes por expansão
 
-export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
+export function ThinkNavigator({ colecoes, inicial }: {
+  colecoes: string[]
+  // ponto de partida vindo de fora (ex.: clique num valor do painel Dimensões)
+  inicial?: { valor: string; norm: string; escopo?: string }
+}) {
   // coleção é FILTRO, não jaula: default = TODAS ('*'). Com 2500 coleções o select
   // vira autocomplete — a API já aceita qualquer nome.
-  const [escopo, setEscopo] = useState('*')
+  const [escopo, setEscopo] = useState(inicial?.escopo ?? '*')
   const collection = escopo
   const [nodes, setNodes] = useState<Map<string, NavMapNode>>(new Map())
   const [edges, setEdges] = useState<Set<string>>(new Set())
@@ -86,6 +90,16 @@ export function ThinkNavigator({ colecoes }: { colecoes: string[] }) {
     setNodes(m); setEdges(new Set()); setView({ x: 0, y: 0, zoom: 1 })
     await expandir(norm, m, new Set())
   }
+
+  // partida externa: monta já centrado (o clique veio do painel Dimensões)
+  const inicialFeito = useRef(false)
+  useEffect(() => {
+    if (inicial && !inicialFeito.current) {
+      inicialFeito.current = true
+      void centrar(inicial.valor, inicial.norm)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // ── expansão: os relacionados irradiam; nó existente só ganha aresta ──
   async function expandir(norm: string, curNodes?: Map<string, NavMapNode>, curEdges?: Set<string>) {

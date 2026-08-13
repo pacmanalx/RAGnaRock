@@ -7,6 +7,7 @@ import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
 import { ThinkNavigator } from './Navigator'
+import { DimensoesPanel } from './Dimensoes'
 
 // L2 · KnowledgeTree — a árvore de ASSUNTOS destilada do dump denso (zero IA).
 // Nó = valor-entidade (CNPJ, nome…) que aparece em ≥2 registros; ramos = tipos de
@@ -23,7 +24,9 @@ export function NidhoggTree() {
   const [q, setQ] = useState('')
   const [qAplicado, setQAplicado] = useState('')
   const [inspect, setInspect] = useState<ChunkTarget | null>(null)
-  const [vista, setVista] = useState<'arvore' | 'navigator'>('arvore')
+  const [vista, setVista] = useState<'arvore' | 'navigator' | 'dimensoes'>('arvore')
+  // partida do Navigator vinda das Dimensões (clique num valor → teia centrada nele)
+  const [navInicial, setNavInicial] = useState<{ valor: string; norm: string; escopo?: string } | null>(null)
 
   // debounce da busca (400ms)
   useEffect(() => {
@@ -40,12 +43,12 @@ export function NidhoggTree() {
         <span className="text-[12px] text-[var(--color-muted)]">assuntos destilados do dump — quem compartilha valor está ligado (zero IA)</span>
         <div className="grow" />
         <div className="flex overflow-hidden rounded-md border border-[var(--color-border)]">
-          {(['arvore', 'navigator'] as const).map((v) => (
-            <button key={v} onClick={() => setVista(v)}
+          {(['arvore', 'navigator', 'dimensoes'] as const).map((v) => (
+            <button key={v} onClick={() => { if (v === 'navigator') setNavInicial(null); setVista(v) }}
               className={`px-3 py-1.5 text-[12px] font-medium transition-colors ${
                 vista === v ? 'bg-[var(--color-accent)] text-[var(--color-accent-fg)]' : 'bg-[var(--color-panel-2)] text-[var(--color-muted)] hover:text-[var(--color-fg)]'
               }`}>
-              {v === 'arvore' ? '🌳 Árvore' : '🧠 Think Navigator'}
+              {v === 'arvore' ? '🌳 Árvore' : v === 'navigator' ? '🧠 Think Navigator' : '📐 Dimensões'}
             </button>
           ))}
         </div>
@@ -91,7 +94,13 @@ export function NidhoggTree() {
       )}
 
       {ativa && vista === 'arvore' && <Arvore key={ativa} collection={ativa} q={qAplicado} onOpen={setInspect} onJump={(v) => setQ(v)} />}
-      {vista === 'navigator' && <ThinkNavigator colecoes={todas.map((c) => c.collection)} />}
+      {vista === 'navigator' && (
+        <ThinkNavigator key={navInicial?.norm ?? 'livre'} colecoes={todas.map((c) => c.collection)} inicial={navInicial ?? undefined} />
+      )}
+      {vista === 'dimensoes' && (
+        <DimensoesPanel colecoes={todas.map((c) => c.collection)}
+          onNavegar={(valor, norm, escopo) => { setNavInicial({ valor, norm, escopo }); setVista('navigator') }} />
+      )}
       {inspect && <ChunkModal target={inspect} onClose={() => setInspect(null)} />}
     </div>
   )
