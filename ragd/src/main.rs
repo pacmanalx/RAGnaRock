@@ -2036,7 +2036,7 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
             }
         }
         (Method::Get, "/collections") => list_collections(&state.bases),
-        (Method::Get, "/profile") => profile(query, &state.bases),                  // [#1]
+        (Method::Get, "/profile") => profile(query, &state.bases, &state.collection_profiles),  // [#1]
         (Method::Get, "/expansions") => (200, expansions_json(state)),              // [#48] cache p/ CacheDigest
         (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
@@ -2063,6 +2063,13 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
 fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
          body_bytes: &[u8], state: &mut State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
+    // [leak-fix 13/ago] rota que MUTA bases invalida o cache de perfis unificados (antes só o
+    // DELETE de coleção invalidava — search/profile serviam perfil VELHO após ingest).
+    let muta_bases = matches!((method, path),
+        (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
+        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
+        || (matches!(method, Method::Delete) && (path.starts_with("/bases/") || path.starts_with("/collections/")));
+    if muta_bases { state.collection_profiles.write().clear(); }
     match (method, path) {
         // ── [#33 JWT] CRUD de perfis/usuários (guard: admin.usuarios) ──
         (Method::Post, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
@@ -2651,7 +2658,7 @@ fn expansions_json(st: &State) -> String {
     json!({"count": map.len(), "expansions": Value::Object(obj)}).to_string()
 }
 
-fn profile(query: &str, bases: &Bases) -> (u16, String) {
+fn profile(query: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::CollectionProfile>>) -> (u16, String) {
     let coll = match query_param(query, "collection") {
         Some(c) => c, None => return (400, json!({"error": "falta 'collection'"}).to_string()),
     };
@@ -2689,7 +2696,24 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
         Some(m) if !m.is_empty() => m,
         _ => return (404, json!({"error": format!("coleção '{coll}' vazia ou não encontrada")}).to_string()),
     };
-    let prof = rag::build_collection_profile(inner);
+    // [leak-fix 13/ago] USA O CACHE unificado (mesmo padrão do search). Recomputar a cada
+    // chamada custava 6,2s + ~1,5GB de transientes na `livros` — o nidhoggd chama /profile
+    // todo ciclo e o glibc não devolve as arenas pro SO: o RSS só subia até derrubar a Aron.
+    {
+        let p = profiles.read();
+        if !p.contains_key(&coll) {
+            drop(p);
+            let mut w = profiles.write();
+            if !w.contains_key(&coll) {
+                w.insert(coll.clone(), rag::build_collection_profile(inner));
+            }
+        }
+    }
+    let profiles_guard = profiles.read();
+    let prof = match profiles_guard.get(&coll) {
+        Some(p) => p,
+        None => return (500, json!({"error": "perfil evaporou do cache (corrida?)"}).to_string()),
+    };
     let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
     for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
 
