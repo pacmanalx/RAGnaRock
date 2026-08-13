@@ -585,8 +585,10 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
                    else { " AND positionCaseInsensitive(valor, {q:String}) > 0".to_string() };
     let mut params: Vec<(&str, &str)> = vec![("coll", coll)];
     if !q.is_empty() { params.push(("q", q)); }
+    // alias v (NÃO "valor"): o CH resolveria o filtro do WHERE pro agregado any() e
+    // explodiria com ILLEGAL_AGGREGATION quando ?q= entra
     let tops_body = ch_query_param(url, &format!(
-        "SELECT valor_norm, any(valor) valor, count() regs, uniqExact(base) nbases \
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nbases \
          FROM nidhogg.no_valor FINAL WHERE collection={{coll:String}}{filter_q} \
          GROUP BY valor_norm HAVING regs >= 2 \
          ORDER BY nbases DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
@@ -618,7 +620,7 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
     let co_body = ch_query_param(url, &format!(
         "WITH p AS (SELECT DISTINCT valor_norm, valor, base, idx FROM nidhogg.no_valor FINAL \
                     WHERE collection={{coll:String}}) \
-         SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) valor, count() n \
+         SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) v, count() n \
          FROM p a INNER JOIN p b ON a.base=b.base AND a.idx=b.idx \
          WHERE a.valor_norm IN ({}) AND b.valor_norm != a.valor_norm \
          GROUP BY pai, filho ORDER BY n DESC LIMIT 800 FORMAT JSONEachRow", in_list.join(",")),
@@ -630,7 +632,7 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
             if let Some(p) = v["pai"].as_str() {
                 let e = co_map.entry(p.to_string()).or_default();
                 if e.len() < 10 {
-                    e.push(json!({"valor": v["valor"], "valor_norm": v["filho"], "n": v["n"]}));
+                    e.push(json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"]}));
                 }
             }
         }
@@ -646,7 +648,7 @@ pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, 
             }));
         }
         json!({
-            "valor": t["valor"], "valor_norm": norm,
+            "valor": t["v"], "valor_norm": norm,
             "registros": t["regs"], "bases": t["nbases"],
             "ramos": ramos.into_iter().map(|(tipo, itens)| json!({"tipo": tipo, "n": itens.len(), "itens": itens})).collect::<Vec<_>>(),
             "co": co_map.get(norm).cloned().unwrap_or_default(),
