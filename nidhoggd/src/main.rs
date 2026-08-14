@@ -717,8 +717,28 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
     // 3) as RELAÇÕES destiladas pelo L3 — o conhecimento que o determinístico não alcançou.
     // É a camada de cima alimentando a de baixo: sem isso o analista responde "quem é X" sem
     // enxergar justamente o que o worm entendeu sobre X.
-    if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 120) {
-        let arr = rels["relacoes"].as_array().cloned().unwrap_or_default();
+    if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 200) {
+        // ÂNCORA também aqui: o L4 lê relação como CONHECIMENTO, então só entra a que tem as
+        // duas pontas confirmadas pelo censo NA BASE. Foi o furo do caso "Amplificar" — o
+        // grafo já filtrava, mas o contexto do analista lia o dump cru e afirmava a pista.
+        // Regra: a ponta que SE APRESENTA COMO NOME PRÓPRIO (inicial maiúscula) precisa estar
+        // ancorada — é ela que afirma identidade ("é CFO de Amplificar"). Ponta em frase
+        // descritiva ("falta de Capex/payback/ROI") não afirma entidade e passa: derrubá-la
+        // custaria relações verdadeiras.
+        let ancora = chdb::mencoes_ancora(ch_url, coll).unwrap_or_default();
+        let arr: Vec<Value> = rels["relacoes"].as_array().cloned().unwrap_or_default()
+            .into_iter().filter(|r| {
+                let base = r["base"].as_str().unwrap_or("").to_string();
+                ["a", "b"].iter().all(|lado| {
+                    let txt = r["dado"][*lado].as_str().unwrap_or("").trim();
+                    let parece_nome = txt.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                    if !parece_nome { return true; }
+                    match norm_valor("mencao", txt) {
+                        Some(n) => ancora.contains(&(base.clone(), n)),
+                        None => true,   // não normaliza como identidade (número, frase longa)
+                    }
+                })
+            }).collect();
         if !arr.is_empty() {
             // o rótulo carrega a hierarquia de confiança no PRÓPRIO contexto (não só no
             // prompt): pista automática pode estar errada; o texto abaixo é que é prova.

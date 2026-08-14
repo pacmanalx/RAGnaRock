@@ -951,6 +951,21 @@ pub fn registros_escopo(url: &str, coll: &str, limit: usize) -> Result<Vec<Value
         .filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect())
 }
 
+/// Os pares (base, valor_norm) que o CENSO determinístico confirmou como menção — a ÂNCORA.
+/// Quem lê relação como CONHECIMENTO (o grafo e o L4) filtra por aqui; quem lê como registro
+/// bruto (a tela do L3) vê tudo.
+pub fn mencoes_ancora(url: &str, coll: &str) -> Result<std::collections::HashSet<(String, String)>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" AND collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT DISTINCT base, valor_norm FROM nidhogg.no_valor FINAL \
+         WHERE campo='mencao'{wc} FORMAT JSONEachRow"), &params, 25)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["base"].as_str()?.to_string(), v["valor_norm"].as_str()?.to_string())))
+        .collect())
+}
+
 /// Fingerprint do conhecimento no escopo — muda quando entrou dado novo (dump ou grafo).
 /// É o `ctx_hash` que carimba cada etapa: dá pra ver se a resposta mudou por dado novo
 /// ou por variação do próprio modelo sobre o MESMO material.
