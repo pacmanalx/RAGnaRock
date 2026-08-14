@@ -570,10 +570,25 @@ const RELACAO_JANELAS: usize = 4;          // cenas por base por passada
 const RELACAO_JANELA_MAX_CHARS: usize = 6_000;
 const RELACAO_TOP_MENCOES: usize = 40;     // entidades mais frequentes que definem "cena densa"
 
+/// Normaliza um nome para o casamento contra a lista de entidades (NFC + minúsculas +
+/// espaços colapsados). É a chave do veto determinístico do L3.
+fn norm_ent(s: &str) -> String {
+    nfc(s).to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Verbos de ligação PUROS. "X é Y" quase nunca é relação — é atributo disfarçado de aresta
+/// ("OMS API com paginação é armadilha clássica"). O caso legítimo carrega complemento e não
+/// cai aqui: "é CFO de", "é fornecedor de", "é mentor de".
+const REL_LIGACAO: &[&str] = &[
+    "é", "e", "são", "sao", "era", "eram", "foi", "foram", "ser", "sendo",
+    "tem", "têm", "ter", "possui", "possuem", "está", "esta", "estão", "estao",
+    "não é", "nao e", "não são", "nao sao", "não tem", "nao tem", "existe", "existem",
+];
+
 fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let (sys, max_tokens) = relacao_system(lib);
-    // checkpoint ACOPLADO ao prompt: editar o template "relacoes" re-mastiga tudo
-    let ecfg = hash_hex(&format!("relacao|v1|{}", hash_hex(&sys)));
+    // checkpoint ACOPLADO ao prompt E ao filtro: mudar qualquer um dos dois re-mastiga tudo
+    let ecfg = hash_hex(&format!("relacao|v2-ancora|{}", hash_hex(&sys)));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let (mut feitas, mut rel_total) = (0usize, 0usize);
@@ -609,6 +624,8 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
         let (version, at) = (chdb::now_version(), now_stamp());
         let mut rows: Vec<chdb::EntidadeRow> = vec![];
         let mut falhou = false;
+        // contadores do veto — vão pro log: sem eles o filtro é uma caixa-preta que "some" com relação
+        let (mut vet_ent, mut vet_lig, mut propostas) = (0usize, 0usize, 0usize);
         for (cid, _) in &cenas {
             let texto = match chunks.iter().find(|(i, _)| *i == *cid as usize) {
                 Some((_, t)) => t.chars().take(RELACAO_JANELA_MAX_CHARS).collect::<String>(),
@@ -636,11 +653,24 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                 // janela sem resposta/JSON → base NÃO checkpointa (re-tenta no próximo ciclo)
                 None => { falhou = true; break; }
             };
+            // ÂNCORA DETERMINÍSTICA DO L3 (14/ago) — a mesma doutrina do censo no caso
+            // "Amplificar": o LLM PROPÕE, o determinístico VETA. Só passa relação cujas DUAS
+            // pontas estão na lista de entidades que o próprio modelo recebeu. É o que mata o
+            // "b" fabricado a partir de pedaço de frase ("armadilha clássica", "melhorar busca
+            // com IA", "nomeado desde o dia 1") — instrução em prompt não segura isso num 7B.
+            let presentes_norm: Vec<String> = presentes.iter().map(|p| norm_ent(p)).collect();
             for r in &arr {
                 let (a, rel, bb) = (r["a"].as_str().unwrap_or("").trim(),
                                     r["rel"].as_str().unwrap_or("").trim(),
                                     r["b"].as_str().unwrap_or("").trim());
                 if a.is_empty() || rel.is_empty() || bb.is_empty() || a == bb { continue; }
+                propostas += 1;
+                let (na, nb) = (norm_ent(a), norm_ent(bb));
+                if !presentes_norm.iter().any(|p| *p == na) || !presentes_norm.iter().any(|p| *p == nb) {
+                    vet_ent += 1; continue;
+                }
+                // verbo de ligação puro = atributo, não laço
+                if REL_LIGACAO.contains(&norm_ent(rel).as_str()) { vet_lig += 1; continue; }
                 let tema = r["tema"].as_str().unwrap_or("").trim();
                 let mut dado = json!({"a": a, "rel": rel, "b": bb});
                 if !tema.is_empty() { dado["tema"] = json!(tema); }
@@ -653,6 +683,10 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
             }
         }
         if falhou { nlog(&format!("L3 {coll}/{name}: janela sem resposta — sem checkpoint, re-tenta")); continue; }
+        if vet_ent + vet_lig > 0 {
+            nlog(&format!("L3 {coll}/{name}: âncora vetou {}/{} propostas ({} ponta fora do censo, {} verbo de ligação)",
+                          vet_ent + vet_lig, propostas, vet_ent, vet_lig));
+        }
         // sentinela: cenas mastigadas e nada destilado TAMBÉM checkpointa (senão fila eterna)
         let n_novas = rows.len();
         let rows = if rows.is_empty() {
