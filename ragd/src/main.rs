@@ -31,7 +31,6 @@ static LOG_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::
 /// Caminhos onde procuramos ragnarock.cfg se --config não for passado.
 const CONFIG_PATHS: [&str; 2] = ["/etc/ragnarock/ragnarock.cfg", "ragnarock.cfg"];
 /// Página do dashboard embutida no binário (servida na porta de controle).
-const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const DEFAULT_COLLECTION: &str = "default";
 
 /// Saneia o nome da base p/ virar arquivo seguro. Tira ponto(s) inicial(is): senão o
@@ -1673,8 +1672,10 @@ fn respond_json(req: Request, code: u16, payload: String, set_cookie: Option<&st
 
 /// [#33] Console ValHalla = frontend React (dist/) + reverse-proxy pros backends, igual ao
 /// proxy do Vite em dev: `/api/*` → API pública (127.0.0.1:api_port), `/nidhogg/*` → nidhoggd,
-/// e todo o resto → estáticos do `web_dir` com SPA-fallback pro index.html. O dashboard.html
-/// legado fica preservado em `handle_dashboard_legacy` (molde de referência; NÃO servido).
+/// e todo o resto → estáticos do `web_dir` com SPA-fallback pro index.html.
+/// O dashboard.html legado (121 KB embutidos no binário) foi REMOVIDO em 14/ago/2026: as 9 abas
+/// dele estão todas absorvidas — e superadas — pelo React. Quem precisar consultar, o git tem:
+/// `git show fb8b872^:ragd/src/dashboard.html`.
 fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
     let method = req.method().clone();
     let full = req.url().to_string();
@@ -1793,174 +1794,6 @@ fn mime_by_ext(p: &Path) -> &'static str {
         "ttf" => "font/ttf",
         _ => "application/octet-stream",
     }
-}
-
-/// Servidor da porta de controle (ValHalla): serve o shell HTML (público — sem segredos)
-/// + endpoints /api/* atrás de SESSÃO POR COOKIE (login/logout reais). Reusa o motor da API.
-/// [#33] LEGADO — preservado como molde de referência; NÃO é mais servido (a nova
-/// handle_dashboard entrega o React). Mantido pra reaproveitar recursos das telas.
-#[allow(dead_code)]
-fn handle_dashboard_legacy(mut req: Request, state: &Arc<RwLock<State>>) {
-    let method = req.method().clone();
-    let full = req.url().to_string();
-    let (path, query) = match full.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (full, String::new()),
-    };
-    let ip = req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "?".into());
-    let headers: Vec<(String, String)> = req.headers().iter()
-        .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
-        .collect();
-    let t0 = Instant::now();
-
-    // shell HTML é público (não tem dado; os /api é que exigem sessão)
-    if method == Method::Get && (path == "/" || path == "/index.html") {
-        let resp = Response::from_string(DASHBOARD_HTML)
-            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap())
-            .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap());
-        let _ = req.respond(resp);
-        return;
-    }
-
-    // ping público (loader do restart usa pra saber quando o daemon voltou)
-    if method == Method::Get && path == "/api/ping" {
-        respond_json(req, 200, json!({"ok": true, "version": VERSION}).to_string(), None);
-        return;
-    }
-
-    // corpo (POST)
-    let mut body = Vec::new();
-    if method == Method::Post { req.as_reader().take(8 * 1024 * 1024).read_to_end(&mut body).ok(); }
-    let body_str = std::str::from_utf8(&body).unwrap_or("").to_string();
-
-    // login: valida credenciais -> cria sessão -> Set-Cookie
-    if method == Method::Post && path == "/api/login" {
-        let v: Value = serde_json::from_str(&body_str).unwrap_or(json!({}));
-        let (u, p) = (v["user"].as_str().unwrap_or(""), v["pass"].as_str().unwrap_or(""));
-        let mut st = state.write();
-        if is_default_creds(&st.admin_user, &st.admin_pass) && !st.dev {
-            println!("[{}] [valhalla] {ip} login RECUSADO — credenciais padrão fora do --dev (user={u})", now_stamp());
-            respond_json(req, 403, json!({"error": "credenciais padrão não permitidas fora do modo dev. Altere admin_user/admin_pass no ragnarock.cfg ou inicie com --dev."}).to_string(), None);
-        } else if u == st.admin_user && p == st.admin_pass {
-            let tok = gen_token();
-            let ttl = st.session_ttl;
-            st.sessions.retain(|_, t| t.elapsed().as_secs() < ttl);   // limpa expiradas
-            st.sessions.insert(tok.clone(), Instant::now());
-            let cookie = format!("vh_session={tok}; HttpOnly; Path=/; Max-Age={ttl}; SameSite=Strict");
-            println!("[{}] [valhalla] {ip} login OK (user={u})", now_stamp());
-            respond_json(req, 200, json!({"ok": true, "user": u}).to_string(), Some(&cookie));
-        } else {
-            println!("[{}] [valhalla] {ip} login FALHOU (user={u})", now_stamp());
-            respond_json(req, 401, json!({"error": "credenciais inválidas"}).to_string(), None);
-        }
-        return;
-    }
-
-    // logout: descarta a sessão + limpa o cookie
-    if method == Method::Post && path == "/api/logout" {
-        if let Some(t) = cookie_val(&headers, "vh_session") { state.write().sessions.remove(&t); }
-        let cookie = "vh_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict";
-        println!("[{}] [valhalla] {ip} logout", now_stamp());
-        respond_json(req, 200, json!({"ok": true}).to_string(), Some(cookie));
-        return;
-    }
-
-    // demais /api/* exigem sessão válida
-    let authed = { let st = state.read(); session_ok(&headers, &st.sessions, st.session_ttl) };
-    if !authed {
-        println!("[{}] [valhalla] {ip} {method:?} {path} -> 401 (sem sessão)", now_stamp());
-        respond_json(req, 401, json!({"error": "sessão necessária", "login": true}).to_string(), None);
-        return;
-    }
-
-    // restart/aplicar: responde, dá um tempo pro browser receber, e re-exec o daemon
-    if method == Method::Post && path == "/api/restart" {
-        println!("[{}] [valhalla] {ip} RESTART solicitado — re-exec em 400ms", now_stamp());
-        respond_json(req, 200, json!({"ok": true, "restarting": true}).to_string(), None);
-        thread::spawn(|| { thread::sleep(std::time::Duration::from_millis(400)); restart_self(); });
-        return;
-    }
-
-    // MÓDULOS externos (Nidhogg etc.): o console agrega via proxy HTTP. CRÍTICO: fazer FORA
-    // do lock do State — o módulo chama a API do ragd de volta e deadlockaria no mesmo Mutex.
-    if path.starts_with("/api/nidhogg") {
-        let url = { state.read().nidhogg_url.clone() };
-        let q = if query.is_empty() { String::new() } else { format!("?{query}") };
-        let target = format!("{url}{path}{q}");
-        let post = if method == Method::Post { Some(body_str.clone()) } else { None };
-        // /molde aciona o LLM do módulo (cria o molde regex de uma amostra) — pode levar ~1min. Roda
-        // numa THREAD própria pra NÃO travar o loop single-thread do console durante a criação (mesma
-        // razão do /run async no nidhoggd). Os demais são leituras/gravações rápidas e ficam inline.
-        if path == "/api/nidhogg/molde" {
-            let (ip2, method2, path2, body2) = (ip.clone(), method.clone(), path.clone(), body.clone());
-            thread::spawn(move || {
-                let (code, payload) = module_proxy(&target, post.as_deref(), 200);
-                log_line("valhalla", &ip2, &method2, &path2, "", code, t0.elapsed().as_secs_f64() * 1000.0, &req_extra(&path2, &body2, &payload));
-                respond_json(req, code, payload, None);
-            });
-            return;
-        }
-        let (code, payload) = module_proxy(&target, post.as_deref(), 5);
-        log_line("valhalla", &ip, &method, &path, &query, code, t0.elapsed().as_secs_f64() * 1000.0, &req_extra(&path, &body, &payload));
-        respond_json(req, code, payload, None);
-        return;
-    }
-
-    // [#6] write apenas pras rotas que mutam o State (config POST, thesaurus_toggle, ingest_upload);
-    // o resto roda sob read() — N polls de stats/logs/search do ValHalla em paralelo com a API.
-    let is_w = matches!((&method, path.as_str()),
-        (Method::Post, "/api/config") | (Method::Post, "/api/thesaurus_toggle")
-        | (Method::Post, "/api/ingest_upload") | (Method::Post, "/api/ingest_any"));
-    let (code, payload) = if is_w {
-        let mut st = state.write();
-        match (&method, path.as_str()) {
-            (Method::Post, "/api/config")           => set_config(&body_str, &mut *st),
-            (Method::Post, "/api/thesaurus_toggle") => dict_toggle(&body_str, &mut *st),
-            (Method::Post, "/api/ingest_upload")    => ingest_upload(&query, &headers, &body, &mut *st, false),
-            // [#9] mesma rota do console, mas COM os drivers de ingestão (pdf/docx/xlsx/...):
-            // espelha a distinção da API pública /ingest_upload (sem driver) vs /ingest_any (com).
-            (Method::Post, "/api/ingest_any")       => ingest_upload(&query, &headers, &body, &mut *st, true),
-            _ => unreachable!(),
-        }
-    } else {
-        let st = state.read();
-        match (&method, path.as_str()) {
-            (Method::Get, "/api/stats")       => (200, stats_json(&st)),
-            (Method::Get, "/api/config")      => (200, config_json(&st)),
-            (Method::Post, "/api/test_key")   => {
-                let pv: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
-                let prov = pv["provider"].as_str().unwrap_or("");
-                let key = if prov == "anthropic" { &st.anthropic_key } else if prov == "openai" { &st.openai_key } else { "" };
-                let (ok, msg) = test_provider_key(prov, key);
-                (if ok { 200 } else { 400 }, json!({"ok": ok, "provider": prov, "message": msg}).to_string())
-            }
-            (Method::Get, "/api/logs")        => {
-                let n = query_param(&query, "n").and_then(|s| s.parse().ok()).unwrap_or(300usize);
-                (200, json!({"file": st.log_file, "log": tail_lines(&st.log_file, n)}).to_string())
-            }
-            (Method::Get, "/api/collections") => list_collections(&st.bases),
-            (Method::Get, "/api/bases")       => list_bases(&query, &st.bases),
-            (Method::Get, "/api/drivers")     => list_drivers(&query, &st.drivers_dir),
-            (Method::Get, "/api/drivers_out") => {
-                let out = format!("{}.out", st.drivers_dir);
-                if Path::new(&out).is_dir() { list_drivers(&query, &out) }
-                else { (200, json!({"drivers_dir": out, "match": "*", "count": 0, "drivers": []}).to_string()) }
-            }
-            (Method::Post, "/api/driver_move")   => driver_move(&body_str, &st.drivers_dir),
-            (Method::Get,  "/api/thesaurus")     => list_dicts(&query, &st.thesaurus_dir),
-            (Method::Post, "/api/search")        => search(&body_str, &st.bases, &st.collection_profiles),
-            (Method::Post, "/api/search_expand") => search_expand(&body_str, &*st),
-            (Method::Post, "/api/histogram")     => histogram(&body_str, &st.bases),
-            (Method::Post, "/api/chunk")         => fetch_chunk(&body_str, &st.bases),
-            _ => (404, json!({"error": "rota dashboard não encontrada", "path": path}).to_string()),
-        }
-    };
-    // loga ações no dashboard (menos os pollers stats/logs, pra não poluir)
-    if path != "/api/stats" && path != "/api/logs" {
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        log_line("valhalla", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body, &payload));
-    }
-    respond_json(req, code, payload, None);
 }
 
 /// [#6] Decide o lock antes do dispatch: rotas que mutam o State pedem write(); o resto read().

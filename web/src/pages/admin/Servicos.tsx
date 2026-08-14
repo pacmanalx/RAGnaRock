@@ -37,6 +37,10 @@ export function Servicos() {
   const s = stats.data
   const n = nid.data
   const ramPct = s ? Math.min(100, (s.mem.rss_mb / s.mem.sys_total_mb) * 100) : 0
+  // semáforo de pressão (herdado do dashboard legado, que morreu aqui): abaixo de 60% a
+  // máquina respira; a partir de 85% o thrash é questão de tempo — foi o que precedeu o
+  // freeze de 13/ago. A cor é o aviso que uma barra monocromática não dá.
+  const ramCor = ramPct < 60 ? 'bg-[var(--color-ok)]' : ramPct < 85 ? 'bg-[var(--color-warn)]' : 'bg-[var(--color-crit)]'
 
   const tile = (label: string, v: string | number, hint?: string) => (
     <div title={hint} className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-4 py-3">
@@ -96,7 +100,7 @@ export function Servicos() {
                 </span>
               </div>
               <div className="h-2 overflow-hidden rounded-full bg-[var(--color-panel-2)]">
-                <div className="h-full rounded-full bg-[var(--color-accent)]" style={{ width: `${ramPct}%` }} />
+                <div className={`h-full rounded-full ${ramCor}`} style={{ width: `${ramPct}%` }} />
               </div>
               {(s.mem.est_text_mb != null || s.mem.est_vec_mb != null) && (
                 <div className="mt-1 text-[11px] text-[var(--color-muted)]">
