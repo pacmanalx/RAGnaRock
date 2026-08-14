@@ -704,7 +704,25 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
                 r["base"].as_str().unwrap_or(""), r["dado"].as_str().unwrap_or("{}")));
         }
     }
-    // 3) trechos do CORPUS pela busca do RAGnaRock — a ponte entre as duas metades do produto
+    // 3) as RELAÇÕES destiladas pelo L3 — o conhecimento que o determinístico não alcançou.
+    // É a camada de cima alimentando a de baixo: sem isso o analista responde "quem é X" sem
+    // enxergar justamente o que o worm entendeu sobre X.
+    if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 120) {
+        let arr = rels["relacoes"].as_array().cloned().unwrap_or_default();
+        if !arr.is_empty() {
+            ctx.push_str("\n== RELAÇÕES DESTILADAS (o que o sistema entendeu das cenas) ==\n");
+            for r in &arr {
+                if ctx.len() > L4_CTX_MAX_CHARS * 5 / 6 { break; }
+                let d = &r["dado"];
+                ctx.push_str(&format!("- {} —[{}]→ {}{}  ({})\n",
+                    d["a"].as_str().unwrap_or(""), d["rel"].as_str().unwrap_or(""),
+                    d["b"].as_str().unwrap_or(""),
+                    d["tema"].as_str().map(|t| format!(" [tema: {t}]")).unwrap_or_default(),
+                    r["base"].as_str().unwrap_or("")));
+            }
+        }
+    }
+    // 4) trechos do CORPUS pela busca do RAGnaRock — a ponte entre as duas metades do produto
     let req = json!({"query": pergunta, "base": "*",
                      "collection": if coll == "*" { Value::Null } else { json!(coll) },
                      "k": L4_TRECHOS}).to_string();
@@ -713,10 +731,14 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
             ctx.push_str("\n== TRECHOS DO CORPUS (busca do RAGnaRock pela pergunta) ==\n");
             for h in v["hits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
                 if ctx.len() > L4_CTX_MAX_CHARS { break; }
+                // o snippet vem com os marcadores «» em volta de CADA sílaba casada
+                // ("d«o»cum«e»nt«o»") — texto assim chega picado no modelo e ele não lê a
+                // frase. Limpar é obrigatório: o realce é pra tela, não pro LLM.
+                let limpo: String = h["snippet"].as_str().unwrap_or("")
+                    .chars().filter(|c| *c != '«' && *c != '»').take(900).collect();
                 ctx.push_str(&format!("[{}/{} chunk {}] {}\n",
                     h["base"].as_str().unwrap_or(""), h["collection"].as_str().unwrap_or(""),
-                    h["chunk"].as_u64().unwrap_or(0),
-                    h["snippet"].as_str().unwrap_or("").chars().take(700).collect::<String>()));
+                    h["chunk"].as_u64().unwrap_or(0), limpo));
             }
         }
     }
