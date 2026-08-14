@@ -897,7 +897,10 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
     let row = chdb::RespostaRow {
         pergunta: nome.clone(), seq: seq_ant + 1, tipo: tipo.clone(),
         resposta: resposta_s, mudou: mudou.clone(),
-        fontes: obj["fontes"].to_string(), proximas: obj["proximas"].to_string(),
+        // o modelo pode omitir fontes/proximas (são opcionais no schema) — grava array vazio,
+        // nunca "null": a UI itera esses campos
+        fontes: if obj["fontes"].is_array() { obj["fontes"].to_string() } else { "[]".into() },
+        proximas: if obj["proximas"].is_array() { obj["proximas"].to_string() } else { "[]".into() },
         ctx_hash: fp, ms, at: now_stamp(),
     };
     if let Err(e) = chdb::insert_resposta(ch_url, &row) {

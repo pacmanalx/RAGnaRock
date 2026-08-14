@@ -930,7 +930,13 @@ pub fn timeline(url: &str, pergunta: &str, limit: usize) -> Result<Value, String
     let mut etapas: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|v| {
-            let parse = |k: &str| v[k].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!([]));
+            // fontes/proximas são opcionais no structured output: quando o modelo omite, o
+            // campo vira "null" no disco. A UI itera esses arrays — devolver null derruba a
+            // tela. Normaliza SEMPRE para array (vale também pras linhas já gravadas).
+            let parse = |k: &str| {
+                let p = v[k].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+                match p { Some(x) if x.is_array() => x, _ => json!([]) }
+            };
             json!({"seq": v["seq"], "tipo": v["tipo"], "resposta": v["resposta"], "mudou": v["mudou"],
                    "fontes": parse("fontes"), "proximas": parse("proximas"), "ms": v["ms"], "at": v["at"]})
         }).collect();
