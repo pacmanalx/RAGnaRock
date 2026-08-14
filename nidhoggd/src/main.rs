@@ -576,6 +576,26 @@ fn norm_ent(s: &str) -> String {
     nfc(s).to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// O candidato do LLM casa com alguma entidade do censo?
+///
+/// Match exato normalizado derrubava 95% das propostas (medido 14/ago: 47/49 e 39/43) — o
+/// modelo escreve "Hinode" onde o censo tem "Grupo Hinode" e a relação legítima morria junto.
+/// Então aceitamos também o candidato que é SUBCONJUNTO de tokens de uma entidade, e **só
+/// nessa direção**: "Hinode" ⊂ "Grupo Hinode" passa; o inverso, não. É o que mantém a porta
+/// fechada pro lixo que motivou a âncora — "melhorar busca com IA" NÃO é subconjunto de "IA",
+/// é superconjunto, e continua caindo.
+fn casa_entidade(cand: &str, entidades: &[String]) -> bool {
+    let c = norm_ent(cand);
+    if c.is_empty() { return false; }
+    if entidades.iter().any(|e| *e == c) { return true; }
+    let ct: Vec<&str> = c.split(' ').collect();
+    entidades.iter().any(|e| {
+        let et: Vec<&str> = e.split(' ').collect();
+        // subconjunto próprio: todo token do candidato está na entidade, e a entidade tem mais
+        ct.len() < et.len() && ct.iter().all(|t| et.contains(t))
+    })
+}
+
 /// Verbos de ligação PUROS. "X é Y" quase nunca é relação — é atributo disfarçado de aresta
 /// ("OMS API com paginação é armadilha clássica"). O caso legítimo carrega complemento e não
 /// cai aqui: "é CFO de", "é fornecedor de", "é mentor de".
@@ -588,7 +608,7 @@ const REL_LIGACAO: &[&str] = &[
 fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let (sys, max_tokens) = relacao_system(lib);
     // checkpoint ACOPLADO ao prompt E ao filtro: mudar qualquer um dos dois re-mastiga tudo
-    let ecfg = hash_hex(&format!("relacao|v2-ancora|{}", hash_hex(&sys)));
+    let ecfg = hash_hex(&format!("relacao|v3-subset|{}", hash_hex(&sys)));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let (mut feitas, mut rel_total) = (0usize, 0usize);
@@ -623,7 +643,12 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
         let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
         let (version, at) = (chdb::now_version(), now_stamp());
         let mut rows: Vec<chdb::EntidadeRow> = vec![];
-        let mut falhou = false;
+        // uma janela que falha NÃO derruba mais a base inteira. Antes, resposta cortada por
+        // max_tokens (determinística: a mesma janela corta sempre) impedia o checkpoint e a base
+        // voltava a cada ciclo queimando 39s de Qwen — ANALISE_PROPOSTA_SKYONE fez isso 3× em
+        // 15 minutos. Agora a janela ruim é pulada e as outras rendem; só não checkpointa se
+        // NENHUMA janela responder.
+        let (mut jan_ok, mut jan_falha) = (0usize, 0usize);
         // contadores do veto — vão pro log: sem eles o filtro é uma caixa-preta que "some" com relação
         let (mut vet_ent, mut vet_lig, mut propostas) = (0usize, 0usize, 0usize);
         for (cid, _) in &cenas {
@@ -650,9 +675,10 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                 .and_then(|c| extract_json_object(&c));
             let arr = match obj.as_ref().and_then(|o| o["relacoes"].as_array()) {
                 Some(a) => a.clone(),
-                // janela sem resposta/JSON → base NÃO checkpointa (re-tenta no próximo ciclo)
-                None => { falhou = true; break; }
+                // janela sem resposta/JSON → pula ESTA janela (a base segue com as outras)
+                None => { jan_falha += 1; continue; }
             };
+            jan_ok += 1;
             // ÂNCORA DETERMINÍSTICA DO L3 (14/ago) — a mesma doutrina do censo no caso
             // "Amplificar": o LLM PROPÕE, o determinístico VETA. Só passa relação cujas DUAS
             // pontas estão na lista de entidades que o próprio modelo recebeu. É o que mata o
@@ -665,8 +691,7 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                                     r["b"].as_str().unwrap_or("").trim());
                 if a.is_empty() || rel.is_empty() || bb.is_empty() || a == bb { continue; }
                 propostas += 1;
-                let (na, nb) = (norm_ent(a), norm_ent(bb));
-                if !presentes_norm.iter().any(|p| *p == na) || !presentes_norm.iter().any(|p| *p == nb) {
+                if !casa_entidade(a, &presentes_norm) || !casa_entidade(bb, &presentes_norm) {
                     vet_ent += 1; continue;
                 }
                 // verbo de ligação puro = atributo, não laço
@@ -682,7 +707,13 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                 });
             }
         }
-        if falhou { nlog(&format!("L3 {coll}/{name}: janela sem resposta — sem checkpoint, re-tenta")); continue; }
+        if jan_ok == 0 {
+            nlog(&format!("L3 {coll}/{name}: {jan_falha} janela(s) sem resposta e nenhuma OK — sem checkpoint, re-tenta"));
+            continue;
+        }
+        if jan_falha > 0 {
+            nlog(&format!("L3 {coll}/{name}: {jan_falha} janela(s) sem resposta puladas, {jan_ok} OK — checkpointa mesmo assim"));
+        }
         if vet_ent + vet_lig > 0 {
             nlog(&format!("L3 {coll}/{name}: âncora vetou {}/{} propostas ({} ponta fora do censo, {} verbo de ligação)",
                           vet_ent + vet_lig, propostas, vet_ent, vet_lig));
