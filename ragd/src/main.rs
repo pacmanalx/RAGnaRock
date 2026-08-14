@@ -12,7 +12,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
-use ragd::{vocab, rag, ingestor, multipart, tokenizer};
+use ragd::{vocab, rag, ingestor, multipart, tokenizer, auth};
 use ragd::rag::RagBase;
 use ragd::ingestor::DriverPick;
 
@@ -20,6 +20,7 @@ const DEFAULT_PORT: u16 = 11499;            // API
 const DEFAULT_DASH_PORT: u16 = 11498;       // dashboard / supervisório
 const DEFAULT_DRIVERS_DIR: &str = "drivers";
 const DEFAULT_INGESTORS_DIR: &str = "ingestors";   // [#9] drivers de ingestão (scripts shell, pinagem stdin→stdout)
+const DEFAULT_WEB_DIR: &str = "web/dist";          // [#33] dist/ do frontend React servido na porta dash
 const INGESTOR_TIMEOUT_S: u32 = 120;               // teto por driver de ingestão (via `timeout` coreutil)
 const DEFAULT_THESAURUS_DIR: &str = "thesaurus";
 const DEFAULT_RAGFILES_DIR: &str = "ragfiles";
@@ -37,8 +38,16 @@ const DEFAULT_COLLECTION: &str = "default";
 /// `<name>-tokenized.json` vira dotfile e SOME do glob de preload `*/*-tokenized.json`
 /// (foi o caso dos `.vscode/` na ingestão do Eduxe_Microservices).
 fn safe_name(n: &str) -> String {
-    let s = n.trim_start_matches('.').trim();
-    if s.is_empty() { "base".to_string() } else { s.to_string() }
+    let s = nfc(n.trim_start_matches('.').trim());
+    if s.is_empty() { "base".to_string() } else { s }
+}
+
+/// [#33] Normaliza pra NFC (Unicode canonical composition). O macOS grava/entrega nomes de
+/// arquivo em NFD (decomposto: "ç" = c + cedilha combinante); sem isto, a forma NFD e a NFC
+/// do mesmo nome viram CHAVES diferentes no HashMap de bases — duas bases pro mesmo documento.
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
 }
 
 /// Mapa de bases agrupadas por coleção: collection -> name -> RagBase.
@@ -61,6 +70,8 @@ struct State {
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão (scripts via shell)
     ragfiles_dir: String,
+    web_dir: String,         // [#33] dist/ do frontend React (servido na porta dash)
+    api_port: u16,           // [#33] porta da API pública (pra o dash proxiar /api/* → 127.0.0.1:api_port)
     max_upload: usize,
     started: Instant,
     admin_user: String,
@@ -82,6 +93,7 @@ struct State {
     max_bases: usize,                     // teto de bases (0 = sem limite); OOM guard no ingest
     max_chunks_per_base: usize,           // teto de chunks por base (0 = sem limite); OOM guard no ingest
     collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
+    auth: auth::Auth,                     // [#33 JWT] usuários/perfis + secret (persistido em auth_file)
 }
 
 /// Configuração do daemon. Vem de ragnarock.cfg (chave = valor) e/ou CLI (CLI vence).
@@ -91,6 +103,7 @@ struct Config {
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão
     ragfiles_dir: String,
+    web_dir: String,   // [#33] dist/ do frontend React servido na porta dash (11498)
     max_upload: usize,
     workers: usize,    // nº de workers do pool da API (0 = auto: nCPUs, clamp 2..16)
     autoload: bool,
@@ -110,6 +123,7 @@ struct Config {
     max_bases: usize,  // teto de bases carregadas (0 = sem limite); recusa ingest de base NOVA além disso
     max_chunks_per_base: usize, // teto de chunks por base (0 = sem limite); recusa ingest acima disso
     dev: bool,         // --dev: aceita credenciais padrão admin/admin (só pra desenvolvimento)
+    auth_file: String, // [#33 JWT] JSON de usuários/perfis/secret (default ragnarock-auth.json)
 }
 impl Default for Config {
     fn default() -> Self {
@@ -118,6 +132,7 @@ impl Default for Config {
             drivers_dir: DEFAULT_DRIVERS_DIR.to_string(),
             ingestors_dir: DEFAULT_INGESTORS_DIR.to_string(),
             ragfiles_dir: DEFAULT_RAGFILES_DIR.to_string(),
+            web_dir: DEFAULT_WEB_DIR.to_string(),
             max_upload: DEFAULT_MAX_UPLOAD, workers: 0, autoload: true,
             admin_user: "admin".to_string(), admin_pass: "admin".to_string(),
             log_file: "/tmp/ragd-all.log".to_string(),
@@ -134,6 +149,7 @@ impl Default for Config {
             max_bases: 0,
             max_chunks_per_base: 0,
             dev: false,
+            auth_file: "ragnarock-auth.json".to_string(),
         }
     }
 }
@@ -159,6 +175,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "dash_port"   => if let Ok(p) = v.parse() { cfg.dash_port = p },
             "drivers_dir" => cfg.drivers_dir = v.to_string(),
             "ingestors_dir" => cfg.ingestors_dir = v.to_string(),
+            "web_dir"     => cfg.web_dir = v.to_string(),
             "ragfiles_dir"=> cfg.ragfiles_dir = v.to_string(),
             "max_upload"  => if let Ok(n) = v.parse() { cfg.max_upload = n },
             "workers"     => if let Ok(n) = v.parse() { cfg.workers = n },
@@ -176,6 +193,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "thesaurus_dir" => cfg.thesaurus_dir = v.to_string(),
             "nidhogg_url" => cfg.nidhogg_url = v.to_string(),
             "session_ttl" => if let Ok(n) = v.parse() { cfg.session_ttl = n },
+            "auth_file" => cfg.auth_file = v.to_string(),
             "max_bases"   => if let Ok(n) = v.parse() { cfg.max_bases = n },
             "max_chunks_per_base" => if let Ok(n) = v.parse() { cfg.max_chunks_per_base = n },
             other => eprintln!("config:{}: chave desconhecida {other:?}", lineno + 1),
@@ -444,18 +462,18 @@ fn tail_lines(path: &str, n: usize) -> String {
 fn total_bases(b: &Bases) -> usize { b.values().map(|m| m.len()).sum() }
 
 fn get_base<'a>(b: &'a Bases, coll: &str, name: &str) -> Option<&'a RagBase> {
-    b.get(coll)?.get(name)
+    b.get(coll)?.get(&nfc(name))
 }
 
 fn insert_base(b: &mut Bases, coll: &str, name: String, base: RagBase) {
-    b.entry(coll.to_string()).or_default().insert(name, base);
+    b.entry(coll.to_string()).or_default().insert(nfc(&name), base);
 }
 
 /// [#13] OOM guard: recusa um ingest que criaria uma base NOVA além do teto `max_bases`
 /// (0 = sem limite). Sobrescrever/append de base já existente não conta como nova.
 fn base_count_cap_ok(b: &Bases, coll: &str, name: &str, max_bases: usize) -> Result<(), String> {
     if max_bases == 0 { return Ok(()); }
-    let exists = b.get(coll).map(|m| m.contains_key(name)).unwrap_or(false);
+    let exists = b.get(coll).map(|m| m.contains_key(&nfc(name))).unwrap_or(false);
     if !exists && total_bases(b) >= max_bases {
         return Err(format!("limite de {max_bases} bases atingido (max_bases no cfg) — \
                             remova bases ou aumente o teto"));
@@ -533,7 +551,7 @@ fn autoload_ragfiles(dir: &str, bases: &mut Bases) {
 }
 
 fn remove_base(b: &mut Bases, coll: &str, name: &str) -> bool {
-    let removed = b.get_mut(coll).and_then(|m| m.remove(name)).is_some();
+    let removed = b.get_mut(coll).and_then(|m| m.remove(&nfc(name))).is_some();
     // se a coleção ficou vazia, descarta a entrada também (sem coleções fantasmas)
     if removed {
         if let Some(m) = b.get(coll) {
@@ -548,18 +566,24 @@ fn remove_base(b: &mut Bases, coll: &str, name: &str) -> bool {
 /// - `base_pat = "sda"` exata; `"sd*"` prefixo; `"*"` todas
 /// Devolve lista de (coll, name) ordenada por (coll, name).
 fn resolve_scope(b: &Bases, coll_pat: Option<&str>, base_pat: &str) -> Vec<(String, String)> {
+    // Casamento CASE-INSENSITIVE + NFC: nome de base/coleção é identificador humano
+    // (vem de nome de arquivo, é digitado de memória) — "contrato*" tem que achar
+    // "Contrato de Locação…". A chave armazenada preserva a caixa; só a COMPARAÇÃO dobra.
+    let fold = |s: &str| nfc(s).to_lowercase();
     let mut out = vec![];
     let colls: Vec<&String> = match coll_pat {
         None | Some("*") => b.keys().collect(),
-        Some(exact) => b.keys().filter(|k| k.as_str() == exact).collect(),
+        Some(pat) => { let fp = fold(pat); b.keys().filter(|k| fold(k) == fp).collect() }
     };
-    let base_prefix = base_pat.strip_suffix('*');
+    let bp = fold(base_pat);
+    let base_prefix = bp.strip_suffix('*').map(|p| p.to_string());
     for c in colls {
         if let Some(inner) = b.get(c) {
             for n in inner.keys() {
-                let ok = base_pat == "*"
-                    || base_prefix.map(|p| n.starts_with(p)).unwrap_or(false)
-                    || n == base_pat;
+                let nf = fold(n);
+                let ok = bp == "*"
+                    || base_prefix.as_deref().map(|p| nf.starts_with(p)).unwrap_or(false)
+                    || nf == bp;
                 if ok { out.push((c.clone(), n.clone())); }
             }
         }
@@ -590,6 +614,7 @@ fn main() {
             "--dash-port" => cfg.dash_port = it.next().expect("--dash-port N").parse().expect("porta inválida"),
             "--drivers-dir" => cfg.drivers_dir = it.next().expect("--drivers-dir <path>").clone(),
             "--ingestors-dir" => cfg.ingestors_dir = it.next().expect("--ingestors-dir <path>").clone(),
+            "--web-dir" => cfg.web_dir = it.next().expect("--web-dir <path>").clone(),
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
             "--workers" => cfg.workers = it.next().expect("--workers N").parse().expect("--workers N"),
@@ -632,6 +657,7 @@ fn main() {
     let state = Arc::new(RwLock::new(State {
         bases, drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
         ragfiles_dir: cfg.ragfiles_dir.clone(),
+        web_dir: cfg.web_dir.clone(), api_port: cfg.api_port,
         max_upload, started: Instant::now(),
         admin_user: cfg.admin_user.clone(), admin_pass: cfg.admin_pass.clone(),
         dev: cfg.dev,
@@ -661,6 +687,7 @@ fn main() {
         session_ttl: cfg.session_ttl,
         max_bases: cfg.max_bases,
         max_chunks_per_base: cfg.max_chunks_per_base,
+        auth: auth::Auth::load(&cfg.auth_file),
     }));
 
     // 4) dashboard / supervisório numa thread separada (porta de controle)
@@ -748,7 +775,10 @@ fn handle_api(mut req: Request, state: &Arc<RwLock<State>>, max_upload: usize) {
         route_ro(&method, &path, &query, &headers, &body_bytes, &*st)
     };
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
+    // /logs fica fora do log: a tela de Logs faz poll e viraria feedback-loop de si mesma
+    if path != "/logs" {
+        log_line("api", &ip, &method, &path, &query, code, ms, &req_extra(&path, &body_bytes, &payload));
+    }
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap();
     let _ = req.respond(Response::from_string(payload).with_status_code(code).with_header(header));
 }
@@ -1482,7 +1512,8 @@ fn module_proxy(url: &str, post_body: Option<&str>, timeout_secs: u32) -> (u16, 
     }
 }
 
-/// GET /api/config — estado da configuração (chaves mascaradas, nunca o valor cru).
+/// GET /config — estado da configuração. Chaves SEMPRE mascaradas via mask_key (o valor cru nunca
+/// sai do daemon — o legado devolvia cru atrás do cookie; corrigido na promoção pra 11499).
 fn config_json(st: &State) -> String {
     let hybrid = !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed);
     json!({
@@ -1490,12 +1521,14 @@ fn config_json(st: &State) -> String {
         "config_path": st.config_path,
         "drivers_dir": st.drivers_dir, "ingestors_dir": st.ingestors_dir, "ragfiles_dir": st.ragfiles_dir,
         "max_upload_mb": st.max_upload / (1024 * 1024),
-        "admin_user": st.admin_user,
-        "admin_is_default": is_default_creds(&st.admin_user, &st.admin_pass),
+        "max_bases": st.max_bases, "max_chunks_per_base": st.max_chunks_per_base,
+        "session_ttl": st.session_ttl,
         "dev_mode": st.dev,
-        "anthropic_key_set": !st.anthropic_key.is_empty(), "anthropic_key": st.anthropic_key,
-        "openai_key_set": !st.openai_key.is_empty(), "openai_key": st.openai_key,
+        "anthropic_key_set": !st.anthropic_key.is_empty(), "anthropic_key_masked": mask_key(&st.anthropic_key),
+        "openai_key_set": !st.openai_key.is_empty(), "openai_key_masked": mask_key(&st.openai_key),
         "active_provider": st.active_provider,
+        "local_url": st.local_url,
+        "nidhogg_url": st.nidhogg_url,
         "cache_dir": st.cache_dir,
         "expansions_entries": st.expansions.read().len(),
         "thesaurus_dir": st.thesaurus_dir,
@@ -1590,7 +1623,15 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
         if st.active_provider == "openai" { st.active_provider = "none".into(); set_cfg_key(&st.config_path, "active_provider", "none"); }
         notes.push("openai_key removida".into());
     }
-    // SÓ UM provider ativo por vez: ativar um desativa o outro
+    if let Some(u) = v["local_url"].as_str() { let u = u.trim(); if !u.is_empty() {
+        st.local_url = u.to_string(); set_cfg_key(&st.config_path, "local_url", u);
+        notes.push(format!("local_url → {u}"));
+    }}
+    if let Some(t) = v["session_ttl"].as_u64() { if t >= 60 {
+        st.session_ttl = t; set_cfg_key(&st.config_path, "session_ttl", &t.to_string());
+        notes.push(format!("session_ttl → {t}s (vale pros próximos logins)"));
+    } else { return (400, json!({"error": "session_ttl mínimo: 60s"}).to_string()); }}
+    // SÓ UM provider ativo por vez: ativar um desativa os outros
     if let Some(p) = v["active_provider"].as_str() {
         let p = p.to_lowercase();
         match p.as_str() {
@@ -1599,9 +1640,15 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
                 let has = if p == "anthropic" { !st.anthropic_key.is_empty() } else { !st.openai_key.is_empty() };
                 if !has { return (400, json!({"error": format!("não dá pra ativar '{p}': chave não cadastrada")}).to_string()); }
                 st.active_provider = p.clone(); set_cfg_key(&st.config_path, "active_provider", &p);
-                notes.push(format!("provider ativo → {p} (o outro fica inativo)"));
+                notes.push(format!("provider ativo → {p} (os outros ficam inativos)"));
             }
-            _ => return (400, json!({"error": "active_provider deve ser none|anthropic|openai"}).to_string()),
+            // "local" = llama-server OpenAI-compat (sem chave); só exige local_url configurada
+            "local" => {
+                if st.local_url.trim().is_empty() { return (400, json!({"error": "não dá pra ativar 'local': local_url vazia"}).to_string()); }
+                st.active_provider = "local".into(); set_cfg_key(&st.config_path, "active_provider", "local");
+                notes.push(format!("provider ativo → local ({})", st.local_url));
+            }
+            _ => return (400, json!({"error": "active_provider deve ser none|anthropic|openai|local"}).to_string()),
         }
     }
     if reload {
@@ -1612,19 +1659,148 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
     (200, json!({"ok": true, "notes": notes, "reloaded": reload, "config": serde_json::from_str::<Value>(&config_json(st)).unwrap_or(Value::Null)}).to_string())
 }
 
-/// Responde JSON com status e (opcional) um Set-Cookie.
+/// Responde JSON com status e (opcional) um Set-Cookie. Respostas de API são dinâmicas —
+/// `no-store` impede o browser de servir dado velho (ex.: baixar um .md do cache após re-ingerir).
 fn respond_json(req: Request, code: u16, payload: String, set_cookie: Option<&str>) {
-    let mut resp = Response::from_string(payload).with_status_code(code).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap());
+    let mut resp = Response::from_string(payload).with_status_code(code)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap())
+        .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap());
     if let Some(c) = set_cookie {
         resp.add_header(Header::from_bytes(&b"Set-Cookie"[..], c.as_bytes()).unwrap());
     }
     let _ = req.respond(resp);
 }
 
+/// [#33] Console ValHalla = frontend React (dist/) + reverse-proxy pros backends, igual ao
+/// proxy do Vite em dev: `/api/*` → API pública (127.0.0.1:api_port), `/nidhogg/*` → nidhoggd,
+/// e todo o resto → estáticos do `web_dir` com SPA-fallback pro index.html. O dashboard.html
+/// legado fica preservado em `handle_dashboard_legacy` (molde de referência; NÃO servido).
+fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
+    let method = req.method().clone();
+    let full = req.url().to_string();
+    let (path, query) = match full.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (full, String::new()),
+    };
+    // [#33 JWT] o Bearer TEM que atravessar o proxy — sem isto a API vê a request sem
+    // token e o guard devolve 401 mesmo com o usuário logado.
+    let auth_hdr: Option<String> = req.headers().iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+        .map(|h| h.value.as_str().to_string());
+    let mut body = Vec::new();
+    if method == Method::Post || method == Method::Put {
+        req.as_reader().take(1024 * 1024 * 1024).read_to_end(&mut body).ok();
+    }
+
+    // 1) /nidhogg-api/* → nidhoggd (mesma origem, sem CORS). O prefixo tem -api de
+    // propósito: /nidhogg/* são ROTAS SPA do React (F5 nelas tem que cair no index).
+    if path == "/nidhogg-api" || path.starts_with("/nidhogg-api/") {
+        let url = { state.read().nidhogg_url.clone() };
+        let rest = &path["/nidhogg-api".len()..];
+        proxy_pass(req, &method, &format!("{url}{rest}"), &query, &body, auth_hdr.as_deref());
+        return;
+    }
+    // 2) /api/* → API pública local (127.0.0.1:api_port)
+    if path == "/api" || path.starts_with("/api/") {
+        let port = { state.read().api_port };
+        let rest = &path["/api".len()..];
+        proxy_pass(req, &method, &format!("http://127.0.0.1:{port}{rest}"), &query, &body, auth_hdr.as_deref());
+        return;
+    }
+    // 3) estáticos do dist + SPA fallback
+    let web_dir = { state.read().web_dir.clone() };
+    serve_static(req, &path, &web_dir);
+}
+
+/// [#33] Reverse-proxy cru via curl: repassa método + body + status do upstream (localhost).
+/// Respostas dos backends são JSON, então devolvemos como JSON (respond_json).
+fn proxy_pass(req: Request, method: &Method, url: &str, query: &str, body: &[u8], auth: Option<&str>) {
+    use std::io::Write;
+    let full = if query.is_empty() { url.to_string() } else { format!("{url}?{query}") };
+    const SEP: &str = "\n<<<RAGD_HTTP_STATUS>>>";
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-X", method.as_str(), "-m", "120", "-w", &format!("{SEP}%{{http_code}}"), &full]);
+    if let Some(a) = auth {
+        cmd.args(["-H", &format!("Authorization: {a}")]);   // [#33 JWT] Bearer atravessa o proxy
+    }
+    let has_body = !body.is_empty();
+    if has_body {
+        cmd.args(["-H", "Content-Type: application/json", "--data-binary", "@-"]);
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => { respond_json(req, 502, json!({"error": format!("proxy spawn: {e}")}).to_string(), None); return; }
+    };
+    if has_body {
+        if let Some(mut si) = child.stdin.take() { let _ = si.write_all(body); }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => { respond_json(req, 502, json!({"error": format!("proxy wait: {e}")}).to_string(), None); return; }
+    };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let (payload, code) = match raw.rsplit_once(SEP) {
+        Some((b, s)) => (b.to_string(), s.trim().parse::<u16>().unwrap_or(502)),
+        None => (raw.to_string(), if out.status.success() { 200 } else { 502 }),
+    };
+    respond_json(req, code, payload, None);
+}
+
+/// [#33] Serve um arquivo do `web_dir`; se não existir, cai no index.html (SPA-fallback do
+/// react-router). Bloqueia path traversal. Assets com hash ganham cache longo; index no-store.
+fn serve_static(req: Request, path: &str, web_dir: &str) {
+    let rel = path.trim_start_matches('/');
+    let candidate = if rel.is_empty() { "index.html".to_string() } else { rel.to_string() };
+    if Path::new(&candidate).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        respond_json(req, 400, json!({"error": "path inválido"}).to_string(), None);
+        return;
+    }
+    let base = Path::new(web_dir);
+    let file = base.join(&candidate);
+    let (bytes, ct) = if file.is_file() {
+        (std::fs::read(&file), mime_by_ext(&file))
+    } else {
+        (std::fs::read(base.join("index.html")), "text/html; charset=utf-8")
+    };
+    match bytes {
+        Ok(b) => {
+            let cache = if candidate.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-store" };
+            let resp = Response::from_data(b)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap())
+                .with_header(Header::from_bytes(&b"Cache-Control"[..], cache.as_bytes()).unwrap());
+            let _ = req.respond(resp);
+        }
+        Err(_) => respond_json(req, 404, json!({"error": "não encontrado (web_dir sem dist?)", "path": path}).to_string(), None),
+    }
+}
+
+fn mime_by_ext(p: &Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Servidor da porta de controle (ValHalla): serve o shell HTML (público — sem segredos)
 /// + endpoints /api/* atrás de SESSÃO POR COOKIE (login/logout reais). Reusa o motor da API.
-fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
+/// [#33] LEGADO — preservado como molde de referência; NÃO é mais servido (a nova
+/// handle_dashboard entrega o React). Mantido pra reaproveitar recursos das telas.
+#[allow(dead_code)]
+fn handle_dashboard_legacy(mut req: Request, state: &Arc<RwLock<State>>) {
     let method = req.method().clone();
     let full = req.url().to_string();
     let (path, query) = match full.split_once('?') {
@@ -1791,17 +1967,61 @@ fn handle_dashboard(mut req: Request, state: &Arc<RwLock<State>>) {
 fn is_write_route(method: &Method, path: &str) -> bool {
     matches!((method, path),
         (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
-        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
-    || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}
+        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any")
+        | (Method::Post, "/auth/perfis") | (Method::Post, "/auth/usuarios")
+        | (Method::Post, "/auth/password")   // [#33 JWT] CRUD/troca de senha mutam o Auth
+        | (Method::Post, "/config")          // [#33] set_config muta o State (chaves/storage/ttl)
+        | (Method::Post, "/driver_move") | (Method::Post, "/thesaurus_toggle"))  // [#33] tela Drivers
+    || matches!(method, Method::Delete)   // /bases/{name}, /collections/{name}, /auth/*
 }
 
 /// [#6] Dispatch READ-ONLY: roda sob `state.read()`, N requests em paralelo. Os caches que
 /// search/search_expand precisam mutar (collection_profiles, expansions) têm interior
 /// mutability (RwLock<>) — sob outer-read continuam funcionando.
-fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, String)],
+fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             body_bytes: &[u8], state: &State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     match (method, path) {
+        // ── [#33 JWT] auth: login/refresh públicos; leituras de CRUD sob admin.usuarios ──
+        (Method::Post, "/login") => state.auth.login(body_str(), state.session_ttl),
+        (Method::Post, "/refresh") => state.auth.refresh(body_str()),
+        (Method::Get, "/auth/caps") =>
+            (200, json!({"caps": auth::CAPS}).to_string()),   // catálogo pro form de perfis
+        (Method::Get, "/auth/me") => match auth::bearer_claims(headers, &state.auth.secret) {
+            Some(c) => (200, json!({"usuario": {"login": c["sub"], "nome": c["name"],
+                        "perfil": c["perfil"], "caps": c["caps"], "colls": c["colls"]},
+                        "exp": c["exp"]}).to_string()),
+            None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
+        },
+        // tail do log do daemon (guard: admin.servicos) — ?n=300 linhas
+        (Method::Get, "/logs") => match auth::require_cap(headers, &state.auth, "admin.servicos") {
+            Ok(_) => {
+                let n = query_param(query, "n").and_then(|s| s.parse().ok()).unwrap_or(300usize).min(5000);
+                (200, json!({"file": state.log_file, "log": tail_lines(&state.log_file, n)}).to_string())
+            }
+            Err(e) => e,
+        },
+        // ── [#33] configuração do daemon (guard: admin.config; chaves saem mascaradas) ──
+        (Method::Get, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => (200, config_json(state)), Err(e) => e,
+        },
+        // testa a chave CADASTRADA do provider com chamada real (lista de modelos)
+        (Method::Post, "/config/test_provider") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => {
+                let v: Value = serde_json::from_str(body_str()).unwrap_or(Value::Null);
+                let p = v["provider"].as_str().unwrap_or("");
+                let key = match p { "anthropic" => state.anthropic_key.clone(), "openai" => state.openai_key.clone(), _ => String::new() };
+                let (ok, msg) = test_provider_key(p, &key);
+                (200, json!({"provider": p, "ok": ok, "message": msg}).to_string())
+            }
+            Err(e) => e,
+        },
+        (Method::Get, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.perfis_json(), Err(e) => e,
+        },
+        (Method::Get, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.usuarios_json(), Err(e) => e,
+        },
         (Method::Get, "/health") =>
             (200, json!({"status": "ok", "bases": total_bases(&state.bases),
                          "collections": state.bases.len(),
@@ -1810,20 +2030,31 @@ fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, Strin
         (Method::Get, p) if p.starts_with("/bases/") && p[7..].contains('/') => {   // [#4]
             let rest = &p[7..];
             match rest.split_once('/') {
-                Some((coll, name)) => base_meta(coll, name, &state.bases),
+                // percent_decode: nome com espaço/acento chega %XX no path e dava 404
+                Some((coll, name)) => base_meta(&percent_decode(coll), &percent_decode(name), &state.bases),
                 None => (404, json!({"error": "uso: GET /bases/{coll}/{name}"}).to_string()),
             }
         }
         (Method::Get, "/collections") => list_collections(&state.bases),
-        (Method::Get, "/profile") => profile(query, &state.bases),                  // [#1]
+        (Method::Get, "/profile") => profile(query, &state.bases, &state.collection_profiles),  // [#1]
         (Method::Get, "/expansions") => (200, expansions_json(state)),              // [#48] cache p/ CacheDigest
         (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
+        // drivers DESINSTALADOS (drivers.out) — a outra coluna da tela Drivers
+        (Method::Get, "/drivers_out") => {
+            let out = format!("{}.out", state.drivers_dir);
+            if Path::new(&out).is_dir() { list_drivers(query, &out) }
+            else { (200, json!({"drivers_dir": out, "match": "*", "count": 0, "drivers": []}).to_string()) }
+        }
+        // drivers de INGESTÃO (scripts shell/python do ingestors_dir) — listagem real
+        (Method::Get, "/ingestors") => list_ingestors(&state.ingestors_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
         (Method::Post, "/search") => search(body_str(), &state.bases, &state.collection_profiles),
         (Method::Post, "/search_expand") => search_expand(body_str(), state),
         (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases),
+        // histograma do hit #1 (matched filter + embedding × query) — tela Performance do ValHalla
+        (Method::Post, "/histogram") => histogram(body_str(), &state.bases),
         _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
     }
 }
@@ -1832,25 +2063,80 @@ fn route_ro(method: &Method, path: &str, query: &str, _headers: &[(String, Strin
 fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
          body_bytes: &[u8], state: &mut State) -> (u16, String) {
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
+    // [leak-fix 13/ago] rota que MUTA bases invalida o cache de perfis unificados (antes só o
+    // DELETE de coleção invalidava — search/profile serviam perfil VELHO após ingest).
+    let muta_bases = matches!((method, path),
+        (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
+        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
+        || (matches!(method, Method::Delete) && (path.starts_with("/bases/") || path.starts_with("/collections/")));
+    if muta_bases { state.collection_profiles.write().clear(); }
     match (method, path) {
+        // ── [#33 JWT] CRUD de perfis/usuários (guard: admin.usuarios) ──
+        (Method::Post, "/auth/perfis") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.perfil_upsert(body_str()), Err(e) => e,
+        },
+        (Method::Post, "/auth/usuarios") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => state.auth.usuario_upsert(body_str()), Err(e) => e,
+        },
+        // configuração do daemon (persiste no cfg; guard admin.config)
+        (Method::Post, "/config") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => set_config(body_str(), state), Err(e) => e,
+        },
+        // instala/desinstala driver de linguagem (move drivers ↔ drivers.out)
+        (Method::Post, "/driver_move") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => driver_move(body_str(), &state.drivers_dir), Err(e) => e,
+        },
+        // liga/desliga dicionário (inuse.flag) e recarrega o mapa por-palavra na hora
+        (Method::Post, "/thesaurus_toggle") => match auth::require_cap(headers, &state.auth, "admin.config") {
+            Ok(_) => dict_toggle(body_str(), state), Err(e) => e,
+        },
+        // troca da PRÓPRIA senha: basta token válido (sub identifica quem)
+        (Method::Post, "/auth/password") => match auth::bearer_claims(headers, &state.auth.secret) {
+            Some(c) => { let sub = c["sub"].as_str().unwrap_or("").to_string(); state.auth.password_change(&sub, body_str()) }
+            None => (401, json!({"error": "token ausente, inválido ou expirado"}).to_string()),
+        },
+        (Method::Delete, p) if p.starts_with("/auth/perfis/") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => { let n = percent_decode(&p["/auth/perfis/".len()..]); state.auth.perfil_delete(&n) }
+            Err(e) => e,
+        },
+        (Method::Delete, p) if p.starts_with("/auth/usuarios/") => match auth::require_cap(headers, &state.auth, "admin.usuarios") {
+            Ok(_) => { let n = percent_decode(&p["/auth/usuarios/".len()..]); state.auth.usuario_delete(&n) }
+            Err(e) => e,
+        },
         (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state, false),
         // [#9] /ingest_any = /ingest_upload + passo do driver de ingestão (mime|ext → script shell).
         (Method::Post, "/ingest_any") => ingest_upload(query, headers, body_bytes, state, true),
         (Method::Delete, p) if p.starts_with("/bases/") => {
-            let name = &p["/bases/".len()..];
+            // percent_decode: nome com espaço/acento chega %XX no path e dava 404
+            let name = percent_decode(&p["/bases/".len()..]);
             let coll = query_param(query, "collection").unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
-            if remove_base(&mut state.bases, &coll, name) {
-                (200, json!({"ok": true, "removed": name, "collection": coll,
+            if remove_base(&mut state.bases, &coll, &name) {
+                // ?purge=1 apaga também o JSON do disco (senão o autoload ressuscita a base
+                // no próximo boot) — mesmo contrato do DELETE /collections/{name}?purge=1.
+                let purge = query_param(query, "purge").map(|s| s == "true" || s == "1").unwrap_or(false);
+                let mut purged = false;
+                if purge {
+                    let f = Path::new(&state.ragfiles_dir).join(&coll)
+                        .join(format!("{}-tokenized.json", nfc(&name)));
+                    if f.exists() {
+                        if let Err(e) = std::fs::remove_file(&f) {
+                            return (500, json!({"error": format!("removida da memória mas falhou apagar {}: {e}", f.display()),
+                                                "removed": name, "collection": coll}).to_string());
+                        }
+                        purged = true;
+                    }
+                }
+                (200, json!({"ok": true, "removed": name, "collection": coll, "purged": purged,
                              "bases": total_bases(&state.bases)}).to_string())
             } else {
                 (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string())
             }
         }
         (Method::Delete, p) if p.starts_with("/collections/") => {                  // [#2]
-            let name = &p["/collections/".len()..];
-            drop_collection(name, query, state)
+            let name = percent_decode(&p["/collections/".len()..]);
+            drop_collection(&name, query, state)
         }
         _ => (404, json!({"error": "rota write não encontrada", "path": path}).to_string()),
     }
@@ -2372,7 +2658,7 @@ fn expansions_json(st: &State) -> String {
     json!({"count": map.len(), "expansions": Value::Object(obj)}).to_string()
 }
 
-fn profile(query: &str, bases: &Bases) -> (u16, String) {
+fn profile(query: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::CollectionProfile>>) -> (u16, String) {
     let coll = match query_param(query, "collection") {
         Some(c) => c, None => return (400, json!({"error": "falta 'collection'"}).to_string()),
     };
@@ -2410,7 +2696,24 @@ fn profile(query: &str, bases: &Bases) -> (u16, String) {
         Some(m) if !m.is_empty() => m,
         _ => return (404, json!({"error": format!("coleção '{coll}' vazia ou não encontrada")}).to_string()),
     };
-    let prof = rag::build_collection_profile(inner);
+    // [leak-fix 13/ago] USA O CACHE unificado (mesmo padrão do search). Recomputar a cada
+    // chamada custava 6,2s + ~1,5GB de transientes na `livros` — o nidhoggd chama /profile
+    // todo ciclo e o glibc não devolve as arenas pro SO: o RSS só subia até derrubar a Aron.
+    {
+        let p = profiles.read();
+        if !p.contains_key(&coll) {
+            drop(p);
+            let mut w = profiles.write();
+            if !w.contains_key(&coll) {
+                w.insert(coll.clone(), rag::build_collection_profile(inner));
+            }
+        }
+    }
+    let profiles_guard = profiles.read();
+    let prof = match profiles_guard.get(&coll) {
+        Some(p) => p,
+        None => return (500, json!({"error": "perfil evaporou do cache (corrida?)"}).to_string()),
+    };
     let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
     for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
 
@@ -2811,6 +3114,31 @@ fn driver_language(fname: &str) -> String {
 
 /// GET /drivers  — lista os drivers .drv instalados. ?match=ASP* (wildcard, default todos).
 /// Cada item traz header / description / extensions extraidos do cabecalho do .drv.
+/// GET /ingestors — lista os drivers de ingestão (scripts em ingestors_dir).
+/// A descrição vem da primeira linha de comentário/docstring do script, se houver.
+fn list_ingestors(dir: &str) -> (u16, String) {
+    let mut items: Vec<Value> = vec![];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if !p.is_file() || name.starts_with('.') { continue; }
+            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            // primeira linha de comentário (# … ou """…) vira a descrição
+            let desc = std::fs::read_to_string(&p).ok().and_then(|t| t.lines()
+                .filter(|l| !l.starts_with("#!"))
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix('#').or_else(|| l.strip_prefix("\"\"\""))
+                        .map(|s| s.trim().trim_end_matches("\"\"\"").trim().to_string())
+                })).filter(|s| !s.is_empty()).unwrap_or_default();
+            items.push(json!({"name": name, "bytes": bytes, "description": desc}));
+        }
+    }
+    items.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    (200, json!({"ingestors_dir": dir, "count": items.len(), "ingestors": items}).to_string())
+}
+
 fn list_drivers(query: &str, drivers_dir: &str) -> (u16, String) {
     let pattern = query_param(query, "match").unwrap_or_else(|| "*".to_string());
     let abs_dir = std::fs::canonicalize(drivers_dir)
@@ -3048,7 +3376,7 @@ fn help() {
 uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
        [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ingestors-dir {DEFAULT_INGESTORS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
-       [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
+       [--web-dir {DEFAULT_WEB_DIR}] [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
        [--preload nome=caminho.json ...]
 
   config: --config <arq>, senao /etc/ragnarock/ragnarock.cfg, senao ./ragnarock.cfg, senao defaults.

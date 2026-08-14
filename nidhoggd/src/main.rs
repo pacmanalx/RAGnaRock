@@ -27,12 +27,17 @@ const DEFAULT_CADENCE: u64 = 300;   // s entre ciclos do worm (cadência = orça
 
 // ───────────────────────────── níveis de inteligência (slider) ─────────────────────────────
 // Cumulativos. 0 não usa IA; 1+ precisam de provider de IA configurado.
+// Régua RECRAVADA 13/ago/2026 (Pacman, textual): "L3 será o mesmo que a L2 só que 100% LLM
+// bound e teremos a L4 que é a camada propositiva". L2 grafa DETERMINÍSTICO; L3 grafa o que o
+// determinístico não alcança (100% LLM); L4 (propositiva: parâmetros do usuário + recursão +
+// pesquisa externa) NÃO se implementa sem discussão prévia — aqui é só o nome reservado.
 fn level_name(l: u8) -> &'static str {
-    match l { 0 => "minerador", 1 => "consciente", 2 => "estrutural", 3 => "propositivo", _ => "minerador" }
+    match l { 0 => "minerador", 1 => "consciente", 2 => "estrutural", 3 => "estrutural-llm", 4 => "propositivo", _ => "minerador" }
 }
 fn level_num(s: &str) -> u8 {
     match s.trim().to_lowercase().as_str() {
-        "consciente" | "1" => 1, "estrutural" | "2" => 2, "propositivo" | "3" => 3,
+        "consciente" | "1" => 1, "estrutural" | "2" => 2, "estrutural-llm" | "3" => 3,
+        "propositivo" | "4" => 4,
         // "burro" aceito como sinônimo retrocompatível de "minerador" (nome antigo do nível 0).
         "minerador" | "burro" | "0" | _ => 0,
     }
@@ -41,8 +46,9 @@ fn levels_json() -> Value {
     json!([
         {"n":0,"name":"minerador","ia":false,"desc":"Zero IA. Minera a estrutura do corpus — assinatura léxica (as raízes que só a coleção tem), dicionário e digest do cache. O material bruto sobre o qual todos os níveis de IA trabalham."},
         {"n":1,"name":"consciente","ia":true,"desc":"1º nível com IA. Classifica cada documento em {natureza, tipo} por IA leve (vocabulário editável) e normaliza o dado — a camada de significado que vive no ClickHouse, aponta pro corpus e sobrevive à deleção da coleção."},
-        {"n":2,"name":"estrutural","ia":true,"desc":"Grafa as relações sobre o dado já normalizado — entidades, dimensões e como uma coisa encaixa na outra entre coleções. O grafo navegável do conhecimento."},
-        {"n":3,"name":"propositivo","ia":true,"desc":"As perguntas que você não está fazendo. Acha lacunas, levanta hipóteses e aponta o que falta sobre o dado dos níveis anteriores — IA cara só nos pontos de decisão."}
+        {"n":2,"name":"estrutural","ia":false,"desc":"Grafa as relações DETERMINISTICAMENTE sobre o dado já normalizado — nós de valor, censo de menções, dimensões e co-ocorrência de cena. O grafo navegável do conhecimento, zero IA."},
+        {"n":3,"name":"estrutural-llm","ia":true,"desc":"O MESMO que o L2, só que 100% LLM-bound: destila as relações que o determinístico não alcança — quem é o quê de quem, temas de cena — e grava no MESMO grafo, com selo de origem."},
+        {"n":4,"name":"propositivo","ia":true,"desc":"A camada PROPOSITIVA: você cadastra QUESTÕES DIRETAS (\"quanto faturamos este mês?\", \"qual o ROI do contrato X?\") e o worm responde todo ciclo sobre o conhecimento acumulado. Determinística no ponto de inferência: o contexto é montado por regra, a resposta é do LLM. Cada mudança de perspectiva vira etapa na timeline."}
     ])
 }
 
@@ -85,7 +91,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "port"     => if let Ok(p) = v.parse() { cfg.port = p },
             "ragd_api" => cfg.ragd_api = v.to_string(),
             "nidhogg" | "on" => cfg.on = matches!(v, "true" | "1" | "yes" | "on"),
-            "level"    => cfg.level = level_num(v),
+            "level"    => cfg.level = level_num(v).min(4),
             "dir"      => cfg.dir = v.to_string(),
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
@@ -183,6 +189,42 @@ fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
     }
     None
 }
+// ── Diário de mastigação do LLM ("o esquilinho") ──
+// TODA chamada de IA (classificador, modelador, extrator…) passa por llm_post e deixa registro
+// COMPLETO em JSONL: prompt, resposta, contexto e latência. É o que permite ver a evolução do
+// entendimento ciclo a ciclo. Caminho: <dir>/llm-ledger.jsonl (setado no boot a partir do cfg).
+static LLM_LEDGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn llm_post(tag: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<String> {
+    let t0 = std::time::Instant::now();
+    let resp = http_post_t(url, body, secs);
+    let ms = t0.elapsed().as_millis() as u64;
+    let (conteudo, finish) = match resp.as_deref() {
+        Some(r) => {
+            let rv: Value = serde_json::from_str(r).unwrap_or_else(|_| json!({}));
+            (rv["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string(),
+             rv["choices"][0]["finish_reason"].as_str().unwrap_or("").to_string())
+        }
+        None => (String::new(), String::new()),
+    };
+    if let Some(path) = LLM_LEDGER.get() {
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        let entry = json!({
+            "ts": now_stamp(), "tag": tag, "ctx": ctx, "ms": ms, "ok": resp.is_some(),
+            "url": url, "messages": req["messages"], "finish": finish, "resposta": conteudo,
+        });
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{entry}");
+        }
+    }
+    // rastro curto no log principal (o diário guarda o inteiro teor)
+    nlog(&format!("🐿️ llm {tag} [{ctx}] {ms}ms → {}", if resp.is_some() {
+        format!("{}ch{}", conteudo.len(), if finish == "length" { " (CORTADO)" } else { "" })
+    } else { "SEM RESPOSTA".to_string() }));
+    resp
+}
+
 /// Busca o /health do ragd (usado SÓ pela thread de keepalive, nunca no caminho do request).
 fn fetch_ragd_health(api: &str) -> Option<Value> {
     http_get(&format!("{api}/health")).and_then(|s| serde_json::from_str(&s).ok())
@@ -260,6 +302,786 @@ fn list_knowledge(dir: &str) -> Vec<Value> {
 /// Valor de um parâmetro da query string (sem urldecode — chaves do Nidhogg são simples).
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| kv.split_once('=').and_then(|(k, v)| (k == key).then(|| v.to_string())))
+}
+
+/// percent-decode mínimo (pra parâmetros com texto livre, ex.: ?q= da busca da árvore).
+fn pdec(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) { out.push((h << 4) | l); i += 3; continue; }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// [FORMA] Assinatura ESTRUTURAL do documento (zero-IA): o esqueleto de rótulos.
+/// Extrai os rótulos "Nome:" no início de linha (ordem preservada, dedup) e hasheia.
+/// Documentos irmãos de forma (100 mil PIX do mesmo template) compartilham a assinatura;
+/// formas DIFERENTES do mesmo tipo ganham moldes separados — é o agrupador que faz o
+/// "1 IA por FORMA" escalar. "" = sem estrutura rotulada (narrativo/código não têm forma).
+fn form_signature(text: &str) -> String {
+    let mut labels: Vec<String> = vec![];
+    for line in text.lines().take(400) {
+        let t = line.trim_start();
+        if let Some(p) = t.find(':') {
+            if (2..=28).contains(&p) {
+                let lab = &t[..p];
+                if lab.chars().any(|c| c.is_alphabetic())
+                    && lab.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '/' | '-' | '.')) {
+                    let norm = lab.trim().to_uppercase();
+                    if !labels.contains(&norm) { labels.push(norm); }
+                }
+            }
+        }
+    }
+    if labels.len() < 2 { return String::new(); }   // 1 rótulo solto não é estrutura
+    hash_hex(&labels.join("|"))[..8].to_string()
+}
+
+/// [L2] Normaliza um valor de campo pra virar CHAVE DE LIGAÇÃO do KnowledgeTree.
+/// Dois registros que compartilham a chave estão LIGADOS (a aresta implícita).
+/// None = valor que não identifica nada (data, dinheiro, texto curto) — ligar por ele é ruído.
+fn norm_valor(campo: &str, v: &str) -> Option<String> {
+    let c = campo.to_lowercase();
+    // campos de medida/tempo não identificam entidades (mas "nome_*" sempre vale)
+    if !c.contains("nome") && ["data", "valor", "total", "preco", "qtd", "quant"].iter().any(|k| c.contains(k)) {
+        return None;
+    }
+    let t = v.trim();
+    if t.is_empty() || t.to_lowercase().starts_with("r$") { return None; }
+    let digits: String = t.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    // data dd/mm/aaaa (8 dígitos com separador) não é identidade
+    if t.contains('/') && digits.len() == 8 && t.chars().count() <= 10 { return None; }
+    // numérico longo (CNPJ/CPF/conta/ticket): a chave são os dígitos crus
+    if digits.len() >= 8 && digits.len() * 2 >= t.chars().count() { return Some(digits); }
+    // texto: precisa de corpo e ser NOME, não descrição — frase longa não é identidade.
+    // Campos de nome próprio (mencao/personagem/nome) aceitam 3 chars: Sam, Eva, Rui existem.
+    let min = if c.contains("mencao") || c.contains("personagem") || c.contains("nome") { 3 } else { 5 };
+    if t.chars().count() < min || t.chars().count() > 60 || !t.chars().any(|ch| ch.is_alphabetic()) { return None; }
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String = t.nfd()
+        .filter(|ch| !unicode_normalization::char::is_combining_mark(*ch))
+        .collect::<String>().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(folded)
+}
+
+// [L2] Extrator narrativo = CENSO DETERMINÍSTICO de menções (zero IA, texto INTEIRO).
+// A v1/v2 usava LLM em 4 janelas de 2000 chars (0,3% de um livro) a 1 base/ciclo — Gandalf
+// não cruzava e Ellen White nem aparecia. Doutrina aplicada a si mesma: o L0 varre o volume
+// (nomes próprios por capitalização, CPU barata, cobertura 100%); o LLM vira enriquecedor
+// dirigido no futuro. Os registros {mencao, freq} entram no dump e o mine_links cruza.
+const MENCAO_BASES_PER_CYCLE: usize = 60;  // varredura é CPU — o corpus inteiro em poucos ciclos
+const MENCAO_TOP_MAX: usize = 2500;        // proteção patológica, NÃO ranking por vaga
+const MENCAO_MIN_FREQ: u32 = 3;            // aparece ≥3× no livro = personagem/entidade, não acaso
+
+/// v7: SEM escassez artificial — entra TUDO que passa no piso de frequência. Raridade não é
+/// irrelevância: o Pônei Saltitante (freq 6 na trilogia) importa PORQUE é raro e específico;
+/// ranking por vaga só deixava a corte principal. O teto de 800 é rede contra texto patológico.
+fn mencao_top(_n_chars: usize) -> usize { MENCAO_TOP_MAX }
+
+/// Nomes próprios por heurística zero-IA: sequências de palavras Capitalizadas (com conectores
+/// "de/da/do/G." — José de Arimateia, Ellen G. White), contadas no texto INTEIRO. Palavra única
+/// capitalizada só vale se a forma minúscula NÃO domina (mata o "The/O/A" de início de frase).
+fn extract_mencoes(text: &str, top: usize) -> Vec<(String, u32)> {
+    extract_mencoes_lf(text, top, MENCAO_MIN_FREQ, None)
+}
+/// [v9] Conta as palavras de inicial MINÚSCULA de um texto — a estatística que desmascara
+/// "palavra comum capitalizada por posição". No censo por chunk ela é computada no LIVRO
+/// INTEIRO (por chunk era fraca demais: "Então" 1× no chunk passava e inflava o teto).
+fn lower_freq_de(text: &str) -> std::collections::HashMap<String, u32> {
+    let mut m = std::collections::HashMap::new();
+    for w in text.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '\'' || c == '-')) {
+        if w.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+            *m.entry(w.to_lowercase()).or_insert(0) += 1;
+        }
+    }
+    m
+}
+/// Variante com piso parametrizado e estatística de minúsculas EXTERNA (o censo por chunk
+/// passa a do livro inteiro; None = computa local, comportamento clássico).
+fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
+                      lf_ext: Option<&std::collections::HashMap<String, u32>>) -> Vec<(String, u32)> {
+    const CONECTORES: &[&str] = &["de", "da", "do", "dos", "das", "van", "von", "del", "la", "e"];
+    let stop = |w: &str| matches!(w.to_lowercase().as_str(),
+        "the" | "a" | "o" | "os" | "as" | "um" | "uma" | "and" | "but" | "he" | "she" | "it"
+        | "in" | "on" | "at" | "of" | "to" | "is" | "was" | "for" | "with" | "that" | "this"
+        | "chapter" | "capitulo" | "capítulo" | "livro" | "book" | "parte" | "part"
+        | "i" | "ii" | "iii" | "iv" | "v" | "vi" | "não" | "nao" | "sim" | "mas" | "por"
+        | "quando" | "então" | "entao" | "depois" | "antes" | "agora" | "assim" | "como");
+    let cap = |w: &str| {
+        let mut ch = w.chars();
+        matches!(ch.next(), Some(c) if c.is_uppercase())
+            && w.chars().skip(1).all(|c| c.is_lowercase() || c == '.')
+            && w.chars().filter(|c| c.is_alphabetic()).count() >= 2
+    };
+    let inicial = |w: &str| w.len() <= 2 && w.ends_with('.') && w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+    // contagem de minúsculas (pra rejeitar palavra comum capitalizada por posição) —
+    // externa quando o chamador tem estatística melhor (o livro inteiro)
+    let local_lf;
+    let lower_freq: &std::collections::HashMap<String, u32> = match lf_ext {
+        Some(m) => m,
+        None => { local_lf = lower_freq_de(text); &local_lf }
+    };
+    let words: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '\'' || c == '-'))
+        .filter(|w| !w.is_empty()).collect();
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].trim_matches(|c: char| c == '\'' || c == '-');
+        if (cap(w) || inicial(w)) && !stop(w) {
+            let mut seq: Vec<&str> = vec![w];
+            let mut j = i + 1;
+            while j < words.len() {
+                let nx = words[j].trim_matches(|c: char| c == '\'' || c == '-');
+                if cap(nx) || inicial(nx) { if !stop(nx) { seq.push(nx); j += 1; continue; } else { break; } }
+                // conector minúsculo NO MEIO (José de Arimateia) — só se o próximo for Cap
+                if seq.len() >= 1 && CONECTORES.contains(&nx.to_lowercase().as_str())
+                    && j + 1 < words.len() && cap(words[j + 1].trim_matches(|c: char| c == '\'' || c == '-')) {
+                    seq.push(nx); j += 1; continue;
+                }
+                break;
+            }
+            i = j;
+            // palavra única: rejeita se a forma minúscula domina (é palavra comum, não nome)
+            if seq.len() == 1 {
+                let low = seq[0].to_lowercase();
+                let lf = lower_freq.get(&low).copied().unwrap_or(0);
+                if lf >= 2 { continue; }
+                // [v10] VERBO capitalizado por POSIÇÃO (abre item de lista/frase). Caso real:
+                // "**Amplificar §3.7** — alavanca que o Arthur (CFO!) precisa" virou entidade,
+                // o L3 destilou "Arthur é CFO da Amplificar" e o L4 respondeu isso como fato.
+                // Infinitivo português (-ar/-er/-ir) que TAMBÉM aparece em minúscula no texto
+                // não é nome próprio. Piso de 1 só aqui: nome real (Xavier, Éder) nunca tem
+                // forma minúscula no corpo do texto; palavra comum inglesa (never, after) já
+                // cai no lf>=2 acima.
+                if lf >= 1 && low.chars().count() >= 5
+                    && (low.ends_with("ar") || low.ends_with("er") || low.ends_with("ir")) { continue; }
+            }
+            // poda ponto final de palavra NÃO-inicial ("Gandalf." → "Gandalf"; "G." fica)
+            let nome = seq.iter().map(|w| {
+                if w.ends_with('.') && w.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
+                    w.trim_end_matches('.')
+                } else { w }
+            }).collect::<Vec<_>>().join(" ");
+            if nome.chars().filter(|c| c.is_alphabetic()).count() >= 3 && nome.chars().count() <= 50 {
+                *counts.entry(nome).or_insert(0) += 1;
+            }
+        } else { i += 1; }
+    }
+    let mut v: Vec<(String, u32)> = counts.into_iter().filter(|(_, c)| *c >= min_freq).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.truncate(top);
+    v
+}
+
+fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
+    // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
+    // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
+    let ecfg = hash_hex("mencao|v10|verbo-infinitivo|lf-global|posicoes|miolo");
+    let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    let mut feitas = 0usize;
+    let mut mencoes_total = 0usize;
+    for b in &bases {
+        if feitas >= MENCAO_BASES_PER_CYCLE { break; }
+        if b["natureza"].as_str() != Some("narrativo") { continue; }
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
+        if !chdb::needs_extract(ch_url, coll, name, &sh, &ecfg, true).unwrap_or(true) { continue; }
+        let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
+        // miolo POR ÍNDICE de chunk (5%–95% em docs com >10 chunks): capa/licença Gutenberg fora
+        let nch = chunks.len();
+        let (clo, chi) = if nch > 10 { (nch * 5 / 100, nch * 95 / 100) } else { (0, nch) };
+        // anti-ruído GLOBAL: a estatística de minúsculas vem do miolo INTEIRO do livro
+        let miolo_lf = {
+            let todo: String = chunks[clo..chi.max(clo + 1).min(nch)].iter()
+                .map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" ");
+            lower_freq_de(&todo)
+        };
+        // varre POR CHUNK e acumula (freq total, posições) por menção — a chave da cena
+        let mut acc: std::collections::BTreeMap<String, (String, u32, Vec<usize>)> = std::collections::BTreeMap::new();
+        for (cid, ctext) in &chunks[clo..chi.max(clo + 1).min(nch)] {
+            for (nome, f) in extract_mencoes_lf(ctext, 300, 1, Some(&miolo_lf)) {
+                // dentro do chunk o piso é 1 (o piso global ≥3 aplica no total)
+                let key = norm_valor("mencao", &nome).unwrap_or_else(|| nome.to_lowercase());
+                let e = acc.entry(key).or_insert((nome, 0, vec![]));
+                e.1 += f;
+                if e.2.last() != Some(cid) && e.2.len() < 400 { e.2.push(*cid); }
+            }
+        }
+        let mut mencoes: Vec<(String, u32, Vec<usize>)> = acc.into_values()
+            .filter(|(_, f, _)| *f >= MENCAO_MIN_FREQ).collect();
+        mencoes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        mencoes.truncate(mencao_top(0));
+        let version = chdb::now_version();
+        let at = now_stamp();
+        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq, pos))| {
+            let pos_s: Vec<String> = pos.iter().map(|p| p.to_string()).collect();
+            chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: idx as u32,
+                dado: json!({"mencao": nome, "freq": freq.to_string(), "chunks": pos_s.join(",")}).to_string(),
+                modo: "mencao".to_string(), nqi: 1.0,
+                prov: json!({"via": "mencao-det", "freq": freq, "n_chunks": pos.len(), "scan": "por-chunk"}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }
+        }).collect();
+        // base SEM menção grava sentinela (senão nunca checkpointa e fica eterna na fila)
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: 0, dado: json!({"mencao": ""}).to_string(), modo: "mencao".to_string(),
+                nqi: 1.0, prov: json!({"via": "mencao-det", "vazio": true, "n_chunks": 0, "scan": "por-chunk"}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
+        // base SEM menções também grava (rows vazio ⇒ marca via linha sentinela? não: precisa
+        // de ao menos 1 linha pro checkpoint — bases sem nome próprio ganham 1 registro vazio)
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
+                idx: 0, dado: json!({"mencao": ""}).to_string(), modo: "mencao".to_string(),
+                nqi: 1.0, prov: json!({"via": "mencao-det", "vazio": true}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
+        match chdb::insert_entities(ch_url, &rows) {
+            Ok(_) => { feitas += 1; mencoes_total += mencoes.len(); }
+            Err(e) => nlog(&format!("mencoes {coll}/{name}: insert falhou ({e})")),
+        }
+    }
+    if feitas > 0 { nlog(&format!("mencões {coll}: {feitas} base(s) varridas, {mencoes_total} menção(ões)")); }
+    json!({"ok": true, "collection": coll, "bases": feitas, "mencoes": mencoes_total})
+}
+
+// [L3] Estrutural-LLM — a MESMA grafação do L2, mas 100% LLM-bound (régua 13/ago). Pega as
+// CENAS mais densas do censo (chunks onde mais entidades co-ocorrem), manda o trecho + a lista
+// de presentes pro LLM local e destila relações {a, rel, b, tema}. Os registros entram no dump
+// (tipo="relacao", idx=chunk) e o mine_links os cola no MESMO grafo — o nó do LLM funde com o
+// nó do censo pela mesma normalização. LLM-bound = caro: 1 base/ciclo, poucas janelas.
+const RELACAO_BASES_PER_CYCLE: usize = 1;
+const RELACAO_JANELAS: usize = 4;          // cenas por base por passada
+const RELACAO_JANELA_MAX_CHARS: usize = 6_000;
+const RELACAO_TOP_MENCOES: usize = 40;     // entidades mais frequentes que definem "cena densa"
+
+/// Normaliza um nome para o casamento contra a lista de entidades (NFC + minúsculas +
+/// espaços colapsados). É a chave do veto determinístico do L3.
+fn norm_ent(s: &str) -> String {
+    nfc(s).to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Verbos de ligação PUROS. "X é Y" quase nunca é relação — é atributo disfarçado de aresta
+/// ("OMS API com paginação é armadilha clássica"). O caso legítimo carrega complemento e não
+/// cai aqui: "é CFO de", "é fornecedor de", "é mentor de".
+const REL_LIGACAO: &[&str] = &[
+    "é", "e", "são", "sao", "era", "eram", "foi", "foram", "ser", "sendo",
+    "tem", "têm", "ter", "possui", "possuem", "está", "esta", "estão", "estao",
+    "não é", "nao e", "não são", "nao sao", "não tem", "nao tem", "existe", "existem",
+];
+
+fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
+    let (sys, max_tokens) = relacao_system(lib);
+    // checkpoint ACOPLADO ao prompt E ao filtro: mudar qualquer um dos dois re-mastiga tudo
+    let ecfg = hash_hex(&format!("relacao|v2-ancora|{}", hash_hex(&sys)));
+    let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
+        .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
+    let (mut feitas, mut rel_total) = (0usize, 0usize);
+    for b in &bases {
+        if feitas >= RELACAO_BASES_PER_CYCLE { break; }
+        if b["natureza"].as_str() != Some("narrativo") { continue; }
+        let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n, _ => continue };
+        let (sh, _) = chdb::get_class_hashes(ch_url, coll, name).unwrap_or_default();
+        if !chdb::needs_extract_tipo(ch_url, coll, name, &sh, &ecfg, "relacao").unwrap_or(true) { continue; }
+        // pré-requisito: o censo do L2 (o L3 trabalha SOBRE o determinístico, nunca às cegas).
+        // Sem menções ainda → NÃO checkpointa (volta quando o censo passar).
+        let mencoes = chdb::mencoes_da_base(ch_url, coll, name).unwrap_or_default();
+        let mut top: Vec<(String, u32, Vec<u32>)> = mencoes.iter().filter_map(|m| {
+            let d: Value = serde_json::from_str(m.as_str()?).ok()?;
+            let nome = d["mencao"].as_str()?.trim().to_string();
+            if nome.is_empty() { return None; }
+            let freq: u32 = d["freq"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let poss: Vec<u32> = d["chunks"].as_str().unwrap_or("")
+                .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            Some((nome, freq, poss))
+        }).collect();
+        if top.is_empty() { continue; }
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.truncate(RELACAO_TOP_MENCOES);
+        // cena densa = chunk com MAIS entidades do topo presentes
+        let mut por_chunk: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (_, _, poss) in &top { for p in poss { *por_chunk.entry(*p).or_insert(0) += 1; } }
+        let mut cenas: Vec<(u32, u32)> = por_chunk.into_iter().filter(|(_, n)| *n >= 2).collect();
+        cenas.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        cenas.truncate(RELACAO_JANELAS);
+        if cenas.is_empty() { continue; }
+        let chunks = match fetch_base_chunks(api, coll, name) { Some(c) if !c.is_empty() => c, _ => continue };
+        let (version, at) = (chdb::now_version(), now_stamp());
+        let mut rows: Vec<chdb::EntidadeRow> = vec![];
+        let mut falhou = false;
+        // contadores do veto — vão pro log: sem eles o filtro é uma caixa-preta que "some" com relação
+        let (mut vet_ent, mut vet_lig, mut propostas) = (0usize, 0usize, 0usize);
+        for (cid, _) in &cenas {
+            let texto = match chunks.iter().find(|(i, _)| *i == *cid as usize) {
+                Some((_, t)) => t.chars().take(RELACAO_JANELA_MAX_CHARS).collect::<String>(),
+                None => continue,
+            };
+            let presentes: Vec<&str> = top.iter().filter(|(_, _, p)| p.contains(cid))
+                .map(|(n, _, _)| n.as_str()).collect();
+            if presentes.len() < 2 { continue; }
+            let schema = json!({"type": "object", "properties": {"relacoes": {"type": "array", "items": {
+                "type": "object", "properties": {"a": {"type": "string"}, "rel": {"type": "string"},
+                "b": {"type": "string"}, "tema": {"type": "string"}}, "required": ["a", "rel", "b"]}}},
+                "required": ["relacoes"]});
+            let body = json!({
+                "messages": [{"role": "system", "content": sys},
+                             {"role": "user", "content": format!("ENTIDADES PRESENTES: {}\n\nTRECHO (chunk {cid}):\n{texto}", presentes.join(", "))}],
+                "temperature": 0, "max_tokens": max_tokens,
+                "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+            }).to_string();
+            let obj = llm_post("relacoes", &format!("L3 {coll}/{name} chunk {cid}"), llm_url, &body, 150)
+                .and_then(|resp| serde_json::from_str::<Value>(&resp).ok())
+                .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
+                .and_then(|c| extract_json_object(&c));
+            let arr = match obj.as_ref().and_then(|o| o["relacoes"].as_array()) {
+                Some(a) => a.clone(),
+                // janela sem resposta/JSON → base NÃO checkpointa (re-tenta no próximo ciclo)
+                None => { falhou = true; break; }
+            };
+            // ÂNCORA DETERMINÍSTICA DO L3 (14/ago) — a mesma doutrina do censo no caso
+            // "Amplificar": o LLM PROPÕE, o determinístico VETA. Só passa relação cujas DUAS
+            // pontas estão na lista de entidades que o próprio modelo recebeu. É o que mata o
+            // "b" fabricado a partir de pedaço de frase ("armadilha clássica", "melhorar busca
+            // com IA", "nomeado desde o dia 1") — instrução em prompt não segura isso num 7B.
+            let presentes_norm: Vec<String> = presentes.iter().map(|p| norm_ent(p)).collect();
+            for r in &arr {
+                let (a, rel, bb) = (r["a"].as_str().unwrap_or("").trim(),
+                                    r["rel"].as_str().unwrap_or("").trim(),
+                                    r["b"].as_str().unwrap_or("").trim());
+                if a.is_empty() || rel.is_empty() || bb.is_empty() || a == bb { continue; }
+                propostas += 1;
+                let (na, nb) = (norm_ent(a), norm_ent(bb));
+                if !presentes_norm.iter().any(|p| *p == na) || !presentes_norm.iter().any(|p| *p == nb) {
+                    vet_ent += 1; continue;
+                }
+                // verbo de ligação puro = atributo, não laço
+                if REL_LIGACAO.contains(&norm_ent(rel).as_str()) { vet_lig += 1; continue; }
+                let tema = r["tema"].as_str().unwrap_or("").trim();
+                let mut dado = json!({"a": a, "rel": rel, "b": bb});
+                if !tema.is_empty() { dado["tema"] = json!(tema); }
+                rows.push(chdb::EntidadeRow {
+                    collection: coll.to_string(), base: name.to_string(), tipo: "relacao".to_string(),
+                    idx: *cid, dado: dado.to_string(), modo: "llm".to_string(), nqi: 0.8,
+                    prov: json!({"via": "relacao-llm", "chunk": cid, "presentes": presentes.len()}).to_string(),
+                    state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+                });
+            }
+        }
+        if falhou { nlog(&format!("L3 {coll}/{name}: janela sem resposta — sem checkpoint, re-tenta")); continue; }
+        if vet_ent + vet_lig > 0 {
+            nlog(&format!("L3 {coll}/{name}: âncora vetou {}/{} propostas ({} ponta fora do censo, {} verbo de ligação)",
+                          vet_ent + vet_lig, propostas, vet_ent, vet_lig));
+        }
+        // sentinela: cenas mastigadas e nada destilado TAMBÉM checkpointa (senão fila eterna)
+        let n_novas = rows.len();
+        let rows = if rows.is_empty() {
+            vec![chdb::EntidadeRow {
+                collection: coll.to_string(), base: name.to_string(), tipo: "relacao".to_string(),
+                idx: 0, dado: json!({"a": ""}).to_string(), modo: "llm".to_string(), nqi: 1.0,
+                prov: json!({"via": "relacao-llm", "vazio": true}).to_string(),
+                state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
+            }]
+        } else { rows };
+        match chdb::insert_entities(ch_url, &rows) {
+            Ok(_) => { feitas += 1; rel_total += n_novas; }
+            Err(e) => nlog(&format!("L3 {coll}/{name}: insert falhou ({e})")),
+        }
+    }
+    if feitas > 0 { nlog(&format!("L3 {coll}: {feitas} base(s) mastigadas, {rel_total} relação(ões) destiladas")); }
+    json!({"ok": true, "collection": coll, "bases": feitas, "relacoes": rel_total})
+}
+
+// ───────────────────── [L4] Perguntas & Respostas — a camada propositiva ─────────────────────
+// Doutrina do Pacman (13/ago): "L4 é determinística DO PONTO DE INFERÊNCIA". O humano cadastra
+// a QUESTÃO DIRETA; o sistema monta o contexto por REGRA (agregados do dump + registros +
+// trechos do corpus pelo RAG) e o LLM responde. Três tipos de resposta:
+//   • tabular  — a resposta é uma TABELA cumulativa sobre o dump (colunas + linhas)
+//   • oneshot  — responde 1× e congela (fato que não muda)
+//   • vivo     — re-responde TODO ciclo; um comparador decide se a perspectiva MUDOU e só
+//                então materializa nova ETAPA. A timeline é o histórico de mudanças de
+//                entendimento — a mesma pergunta sob a perspectiva de cada ciclo.
+const L4_CTX_MAX_CHARS: usize = 14_000;   // teto do contexto (a mesma disciplina do modelador)
+const L4_REGISTROS: usize = 150;          // registros do dump na amostra determinística
+const L4_TRECHOS: usize = 6;              // trechos do corpus trazidos pelo RAG
+
+/// Monta o CONTEXTO — a metade determinística da L4. Nada aqui é decidido por IA: agregados
+/// do dump, amostra de registros e os trechos que o RAGnaRock casa com a pergunta.
+fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, String) {
+    let mut ctx = String::new();
+    // 1) o mapa do conhecimento no escopo (o que existe, por tipo)
+    // o ClickHouse devolve contagem ora como número, ora como string (FORMAT JSON) — normaliza
+    let num = |v: &Value| -> String {
+        v.as_u64().map(|n| n.to_string())
+            .or_else(|| v.as_str().map(String::from))
+            .unwrap_or_else(|| "0".into())
+    };
+    if let Ok(sum) = chdb::entities_summary(ch_url, Some(coll), None) {
+        ctx.push_str("== O QUE O SISTEMA ACUMULOU (por tipo de registro) ==\n");
+        for t in sum["por_tipo"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            ctx.push_str(&format!("- tipo={} registros={} bases={} modo={}\n",
+                t["tipo"].as_str().unwrap_or("?"), num(&t["c"]),
+                num(&t["bases"]), t["modo"].as_str().unwrap_or("?")));
+        }
+    }
+    // 2) os registros crus (o dado que responde "quanto/quantos")
+    if let Ok(regs) = chdb::registros_escopo(ch_url, coll, L4_REGISTROS) {
+        ctx.push_str("\n== REGISTROS DO DUMP (dado extraído, o material da conta) ==\n");
+        for r in &regs {
+            if ctx.len() > L4_CTX_MAX_CHARS * 2 / 3 { break; }
+            ctx.push_str(&format!("[{} #{}] {} :: {}\n",
+                r["tipo"].as_str().unwrap_or("?"), r["idx"].as_u64().unwrap_or(0),
+                r["base"].as_str().unwrap_or(""), r["dado"].as_str().unwrap_or("{}")));
+        }
+    }
+    // 3) as RELAÇÕES destiladas pelo L3 — o conhecimento que o determinístico não alcançou.
+    // É a camada de cima alimentando a de baixo: sem isso o analista responde "quem é X" sem
+    // enxergar justamente o que o worm entendeu sobre X.
+    if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 200) {
+        // ÂNCORA também aqui: o L4 lê relação como CONHECIMENTO, então só entra a que tem as
+        // duas pontas confirmadas pelo censo NA BASE. Foi o furo do caso "Amplificar" — o
+        // grafo já filtrava, mas o contexto do analista lia o dump cru e afirmava a pista.
+        // Regra: a ponta que SE APRESENTA COMO NOME PRÓPRIO (inicial maiúscula) precisa estar
+        // ancorada — é ela que afirma identidade ("é CFO de Amplificar"). Ponta em frase
+        // descritiva ("falta de Capex/payback/ROI") não afirma entidade e passa: derrubá-la
+        // custaria relações verdadeiras.
+        let ancora = chdb::mencoes_ancora(ch_url, coll).unwrap_or_default();
+        let arr: Vec<Value> = rels["relacoes"].as_array().cloned().unwrap_or_default()
+            .into_iter().filter(|r| {
+                let base = r["base"].as_str().unwrap_or("").to_string();
+                ["a", "b"].iter().all(|lado| {
+                    let txt = r["dado"][*lado].as_str().unwrap_or("").trim();
+                    let parece_nome = txt.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                    if !parece_nome { return true; }
+                    match norm_valor("mencao", txt) {
+                        Some(n) => ancora.contains(&(base.clone(), n)),
+                        None => true,   // não normaliza como identidade (número, frase longa)
+                    }
+                })
+            }).collect();
+        if !arr.is_empty() {
+            // o rótulo carrega a hierarquia de confiança no PRÓPRIO contexto (não só no
+            // prompt): pista automática pode estar errada; o texto abaixo é que é prova.
+            ctx.push_str("\n== PISTAS: RELAÇÕES DESTILADAS AUTOMATICAMENTE (podem conter erro — direção A→B) ==\n");
+            for r in &arr {
+                if ctx.len() > L4_CTX_MAX_CHARS * 5 / 6 { break; }
+                let d = &r["dado"];
+                ctx.push_str(&format!("- {} —[{}]→ {}{}  ({})\n",
+                    d["a"].as_str().unwrap_or(""), d["rel"].as_str().unwrap_or(""),
+                    d["b"].as_str().unwrap_or(""),
+                    d["tema"].as_str().map(|t| format!(" [tema: {t}]")).unwrap_or_default(),
+                    r["base"].as_str().unwrap_or("")));
+            }
+        }
+    }
+    // 4) trechos do CORPUS pela busca do RAGnaRock — a ponte entre as duas metades do produto
+    let req = json!({"query": pergunta, "base": "*",
+                     "collection": if coll == "*" { Value::Null } else { json!(coll) },
+                     "k": L4_TRECHOS}).to_string();
+    if let Some(resp) = http_post_t(&format!("{api}/search"), &req, 30) {
+        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+            ctx.push_str("\n== PROVA: TRECHOS DO CORPUS (texto original — vence qualquer pista acima) ==\n");
+            for h in v["hits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if ctx.len() > L4_CTX_MAX_CHARS { break; }
+                // o snippet vem com os marcadores «» em volta de CADA sílaba casada
+                // ("d«o»cum«e»nt«o»") — texto assim chega picado no modelo e ele não lê a
+                // frase. Limpar é obrigatório: o realce é pra tela, não pro LLM.
+                let limpo: String = h["snippet"].as_str().unwrap_or("")
+                    .chars().filter(|c| *c != '«' && *c != '»').take(900).collect();
+                ctx.push_str(&format!("[{}/{} chunk {}] {}\n",
+                    h["base"].as_str().unwrap_or(""), h["collection"].as_str().unwrap_or(""),
+                    h["chunk"].as_u64().unwrap_or(0), limpo));
+            }
+        }
+    }
+    let ctx: String = ctx.chars().take(L4_CTX_MAX_CHARS).collect();
+    let fp = chdb::fingerprint_escopo(ch_url, coll).unwrap_or_default();
+    (ctx, fp)
+}
+
+/// Chama o analista (LLM) com a pergunta + contexto determinístico. `tabular` muda a forma da
+/// resposta (tabela em vez de texto). Devolve o JSON estruturado validado.
+fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo: &str, ctx: &str)
+    -> Result<Value, String> {
+    let sys = match lib["templates"]["analista"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_ANALISTA_PROMPT.to_string(),
+    };
+    let max_tokens = lib["templates"]["analista"]["max_tokens"].as_u64().unwrap_or(1500) as u32;
+    // structured output: tabular pede colunas+linhas; os demais, texto corrido
+    let resposta_schema = if tipo == "tabular" {
+        json!({"type": "object", "properties": {
+            "colunas": {"type": "array", "items": {"type": "string"}},
+            "linhas": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            "nota": {"type": "string"}}, "required": ["colunas", "linhas"]})
+    } else {
+        json!({"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]})
+    };
+    let schema = json!({"type": "object", "properties": {
+        "resposta": resposta_schema,
+        "fontes": {"type": "array", "items": {"type": "object", "properties": {
+            "base": {"type": "string"}, "trecho": {"type": "string"}}, "required": ["base"]}},
+        "proximas": {"type": "array", "items": {"type": "string"}}
+    }, "required": ["resposta"]});
+    let forma = if tipo == "tabular" {
+        "A resposta DEVE ser uma TABELA (colunas + linhas). Some/conte a partir dos REGISTROS DO DUMP."
+    } else {
+        "A resposta DEVE ser texto corrido, direto e curto (até 6 linhas)."
+    };
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!(
+                "PERGUNTA: {pergunta}\n\nFORMA DA RESPOSTA: {forma}\n\n{ctx}")}
+        ],
+        "temperature": 0, "max_tokens": max_tokens,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let resp = llm_post("analista", ctxlabel, llm_url, &body, 240).ok_or("sem resposta (analista)")?;
+    let rv: Value = serde_json::from_str(&resp).map_err(|_| "resposta não-JSON".to_string())?;
+    let content = rv["choices"][0]["message"]["content"].as_str().ok_or("sem content")?;
+    extract_json_object(content).ok_or_else(|| "resposta não é JSON válido".to_string())
+}
+
+/// O COMPARADOR — o coração da timeline (decisão do Pacman): responde-se todo ciclo, mas só
+/// vira ETAPA se a perspectiva mudou. Devolve Some(o que mudou) ou None (nada novo).
+fn l4_mudou(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, antes: &str, agora: &str)
+    -> Option<String> {
+    if antes.trim() == agora.trim() { return None; }        // idêntico: nem gasta LLM
+    let sys = match lib["templates"]["comparador"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_COMPARADOR_PROMPT.to_string(),
+    };
+    let schema = json!({"type": "object", "properties": {
+        "mudou": {"type": "boolean"}, "o_que_mudou": {"type": "string"}}, "required": ["mudou"]});
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!(
+                "PERGUNTA: {pergunta}\n\nRESPOSTA ANTERIOR:\n{antes}\n\nRESPOSTA DE AGORA:\n{agora}")}
+        ],
+        "temperature": 0, "max_tokens": 300,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let obj = llm_post("comparador", ctxlabel, llm_url, &body, 120)
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
+        .and_then(|c| extract_json_object(&c))?;
+    if obj["mudou"].as_bool() == Some(true) {
+        let o = obj["o_que_mudou"].as_str().unwrap_or("").trim();
+        Some(if o.is_empty() { "perspectiva mudou".to_string() } else { o.to_string() })
+    } else { None }
+}
+
+/// Responde UMA pergunta e materializa etapa se mudou. Usado pelo ciclo e pelo /perguntar.
+/// `forcar` grava a etapa mesmo sem mudança (o "responder agora" do operador).
+fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, forcar: bool) -> Value {
+    let nome = p["nome"].as_str().unwrap_or("").to_string();
+    let texto = p["texto"].as_str().unwrap_or("").to_string();
+    let tipo = p["tipo"].as_str().unwrap_or("vivo").to_string();
+    let coll = p["escopo"].as_str().unwrap_or("*").to_string();
+    if nome.is_empty() || texto.is_empty() { return json!({"ok": false, "error": "pergunta sem nome/texto"}); }
+    let anterior = chdb::ultima_resposta(ch_url, &nome).ok().flatten();
+    // ONESHOT: fato que não muda — responde 1× e congela (só o forçar re-abre)
+    if tipo == "oneshot" && anterior.is_some() && !forcar {
+        return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "note": "one-shot já respondida"});
+    }
+    let t0 = std::time::Instant::now();
+    let (ctx, fp) = l4_contexto(api, ch_url, &coll, &texto);
+    if ctx.trim().is_empty() { return json!({"ok": false, "pergunta": nome, "error": "contexto vazio (nada acumulado no escopo)"}); }
+    let ctxlabel = format!("L4 {nome} [{coll}]");
+    let obj = match l4_responder(llm_url, lib, &ctxlabel, &texto, &tipo, &ctx) {
+        Ok(o) => o,
+        Err(e) => { nlog(&format!("L4 {nome}: {e}")); return json!({"ok": false, "pergunta": nome, "error": e}); }
+    };
+    let ms = t0.elapsed().as_millis() as u64;
+    // normaliza a resposta pra texto comparável (tabela vira JSON estável)
+    let resposta_v = obj["resposta"].clone();
+    let resposta_s = if tipo == "tabular" { resposta_v.to_string() }
+                     else { resposta_v["texto"].as_str().unwrap_or("").trim().to_string() };
+    if resposta_s.is_empty() { return json!({"ok": false, "pergunta": nome, "error": "resposta vazia"}); }
+    let (seq_ant, texto_ant) = match &anterior {
+        Some(a) => (a["seq"].as_u64().unwrap_or(0) as u32, a["resposta"].as_str().unwrap_or("").to_string()),
+        None => (0, String::new()),
+    };
+    // primeira resposta SEMPRE vira etapa; depois, só quando o comparador diz que mudou
+    let mudou = if anterior.is_none() { Some("primeira resposta".to_string()) }
+                else if forcar { Some(l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s)
+                                        .unwrap_or_else(|| "resposta forçada pelo operador".to_string())) }
+                else { l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s) };
+    let mudou = match mudou {
+        Some(m) => m,
+        None => return json!({"ok": true, "pergunta": nome, "nova_etapa": false,
+                              "note": "mesma perspectiva — timeline inalterada", "ms": ms}),
+    };
+    let row = chdb::RespostaRow {
+        pergunta: nome.clone(), seq: seq_ant + 1, tipo: tipo.clone(),
+        resposta: resposta_s, mudou: mudou.clone(),
+        // o modelo pode omitir fontes/proximas (são opcionais no schema) — grava array vazio,
+        // nunca "null": a UI itera esses campos
+        fontes: if obj["fontes"].is_array() { obj["fontes"].to_string() } else { "[]".into() },
+        proximas: if obj["proximas"].is_array() { obj["proximas"].to_string() } else { "[]".into() },
+        ctx_hash: fp, ms, at: now_stamp(),
+    };
+    if let Err(e) = chdb::insert_resposta(ch_url, &row) {
+        return json!({"ok": false, "pergunta": nome, "error": format!("insert: {e}")});
+    }
+    nlog(&format!("L4 {nome}: etapa {} — {mudou}", seq_ant + 1));
+    json!({"ok": true, "pergunta": nome, "nova_etapa": true, "seq": seq_ant + 1, "mudou": mudou, "ms": ms})
+}
+
+/// O ciclo da L4: passa por TODAS as perguntas ativas (o cadastro é global, não por coleção).
+fn mine_respostas(api: &str, llm_url: &str, ch_url: &str, lib: &Value) -> Value {
+    let ps = match chdb::perguntas(ch_url) { Ok(p) => p, Err(e) => return json!({"ok": false, "error": e}) };
+    let lista = ps.as_array().cloned().unwrap_or_default();
+    let (mut respondidas, mut etapas) = (0usize, 0usize);
+    for p in &lista {
+        if p["ativa"].as_bool() == Some(false) { continue; }
+        let r = l4_processar(api, llm_url, ch_url, lib, p, false);
+        if r["ok"].as_bool() == Some(true) {
+            respondidas += 1;
+            if r["nova_etapa"].as_bool() == Some(true) { etapas += 1; }
+        }
+    }
+    if respondidas > 0 { nlog(&format!("L4: {respondidas} pergunta(s) respondida(s), {etapas} etapa(s) nova(s)")); }
+    json!({"ok": true, "perguntas": respondidas, "etapas": etapas})
+}
+
+/// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
+/// nidhogg.no_valor. Incremental por fingerprint (max version do dump) guardado no
+/// knowledge.json — religa SÓ quando a extração produziu algo novo. Zero IA.
+fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
+    if let Err(e) = chdb::ensure_no_schema(ch_url) {
+        return json!({"ok": false, "collection": coll, "error": format!("schema no_valor: {e}")});
+    }
+    let fp = chdb::max_entity_version(ch_url, coll).unwrap_or(0);
+    let k = read_knowledge(dir, coll);
+    if fp == 0 { return json!({"ok": true, "collection": coll, "linked": 0, "note": "dump vazio"}); }
+    if k["link_src"].as_u64() == Some(fp) {
+        return json!({"ok": true, "collection": coll, "linked": 0, "note": "dump inalterado"});
+    }
+    let regs = match chdb::entities_dump(ch_url, coll) {
+        Ok(r) => r, Err(e) => return json!({"ok": false, "collection": coll, "error": e}),
+    };
+    let version = chdb::now_version();
+    let at = now_stamp();
+    // [ÂNCORA do L3] O que o CENSO viu em cada base — os nomes que a contagem determinística
+    // confirma. As pontas das relações do LLM só viram NÓ se estiverem aqui: sem isso, frase
+    // solta no slot de entidade ("conduziu a mesa") criava vocabulário novo no grafo.
+    // A relação continua inteira no dump (a tela do L3 mostra tudo) — o que a âncora protege
+    // é o GRAFO, que é o que o Navigator e o L4 leem como conhecimento.
+    let mut confirmados: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for r in &regs {
+        if r["tipo"].as_str() != Some("mencao") { continue; }
+        let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+        let nome = dado.get("mencao").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if let Some(norm) = norm_valor("mencao", nome) {
+            confirmados.insert((r["base"].as_str().unwrap_or("").to_string(), norm));
+        }
+    }
+    let mut rows: Vec<chdb::NoValorRow> = vec![];
+    let mut ancorados_fora = 0usize;
+    for r in &regs {
+        let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+        let obj = match dado.as_object() { Some(o) => o, None => continue };
+        // [v8] MENÇÃO: um nó POR POSIÇÃO DE CHUNK (idx = chunk) — a co-ocorrência vira
+        // proximidade de CENA com a MESMA regra dos registros (mesmo base+idx).
+        if r["tipo"].as_str() == Some("mencao") {
+            let nome = obj.get("mencao").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if let Some(norm) = norm_valor("mencao", nome) {
+                let poss: Vec<u32> = obj.get("chunks").and_then(|v| v.as_str()).unwrap_or("")
+                    .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                for p in poss {
+                    rows.push(chdb::NoValorRow {
+                        collection: coll.to_string(), valor_norm: norm.clone(), valor: nome.to_string(),
+                        campo: "mencao".to_string(), tipo: "mencao".to_string(),
+                        base: r["base"].as_str().unwrap_or("").to_string(),
+                        idx: p, nqi: 1.0, version, linked_at: at.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+        // [L3] RELAÇÃO destilada por LLM: nós pros DOIS lados (a, b) com idx = chunk da cena —
+        // a mesma regra (base,idx) da co-ocorrência liga a↔b e ambos às menções do censo na
+        // mesma cena. Normalização de "mencao" de propósito: o nó do LLM FUNDE com o do censo.
+        // O rótulo do laço (rel) NÃO vira nó (viraria hub de ruído: "serve", "trai"…) — ele
+        // vive no registro do dump (drill-down). Tema vira nó próprio (campo="tema").
+        if r["tipo"].as_str() == Some("relacao") {
+            let base = r["base"].as_str().unwrap_or("").to_string();
+            let cid = r["idx"].as_u64().unwrap_or(0) as u32;
+            let nqi = r["nqi"].as_f64().unwrap_or(0.0);
+            for lado in ["a", "b"] {
+                let nome = obj.get(lado).and_then(|v| v.as_str()).unwrap_or("").trim();
+                if let Some(norm) = norm_valor("mencao", nome) {
+                    // ÂNCORA: só entra no grafo o que o censo determinístico confirmou na base
+                    if !confirmados.contains(&(base.clone(), norm.clone())) { ancorados_fora += 1; continue; }
+                    rows.push(chdb::NoValorRow {
+                        collection: coll.to_string(), valor_norm: norm, valor: nome.to_string(),
+                        campo: "relacao".to_string(), tipo: "relacao".to_string(),
+                        base: base.clone(), idx: cid, nqi, version, linked_at: at.clone(),
+                    });
+                }
+            }
+            let tema = obj.get("tema").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if let Some(norm) = norm_valor("tema", tema) {
+                rows.push(chdb::NoValorRow {
+                    collection: coll.to_string(), valor_norm: norm, valor: tema.to_string(),
+                    campo: "tema".to_string(), tipo: "relacao".to_string(),
+                    base, idx: cid, nqi, version, linked_at: at.clone(),
+                });
+            }
+            continue;
+        }
+        for (campo, val) in obj {
+            let vs = match val.as_str() { Some(s) => s, None => continue };
+            if let Some(norm) = norm_valor(campo, vs) {
+                rows.push(chdb::NoValorRow {
+                    collection: coll.to_string(), valor_norm: norm, valor: vs.trim().to_string(),
+                    campo: campo.clone(), tipo: r["tipo"].as_str().unwrap_or("?").to_string(),
+                    base: r["base"].as_str().unwrap_or("").to_string(),
+                    idx: r["idx"].as_u64().unwrap_or(0) as u32,
+                    nqi: r["nqi"].as_f64().unwrap_or(0.0), version, linked_at: at.clone(),
+                });
+            }
+        }
+    }
+    if let Err(e) = chdb::clear_nos(ch_url, coll) {
+        return json!({"ok": false, "collection": coll, "error": format!("clear nós: {e}")});
+    }
+    if let Err(e) = chdb::insert_nos(ch_url, &rows) {
+        return json!({"ok": false, "collection": coll, "error": format!("insert nós: {e}")});
+    }
+    // persiste o fingerprint (escrita leve — mesmo padrão da saturação)
+    let mut cur = read_knowledge(dir, coll);
+    cur["link_src"] = json!(fp);
+    write_knowledge(dir, coll, &cur);
+    nlog(&format!("L2 {coll}: {} nó(s) de valor ligados de {} registro(s){}", rows.len(), regs.len(),
+        if ancorados_fora > 0 { format!(" · {ancorados_fora} ponta(s) do L3 fora da âncora do censo") } else { String::new() }));
+    json!({"ok": true, "collection": coll, "linked": rows.len(), "registros": regs.len(),
+           "ancorados_fora": ancorados_fora})
+}
+
+/// Normalização Unicode NFC — mesmo fix do ragd: o macOS entrega nomes em NFD e o mesmo
+/// documento virava DUAS classes no doc_class (NFD picada + NFC limpa). Aplicar em TODO
+/// nome de base/coleção que entra (API própria e /bases do ragd).
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
 }
 
 /// [#29] Monta a resposta de leitura do conhecimento, aplicando os filtros opcionais
@@ -372,7 +1194,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // [Fase 1] classes {natureza,tipo} do banco auxiliar — distribuição por coleção (ou todas).
         (Method::Get, "/api/nidhogg/classes") => {
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
-            let coll = query_param(query, "collection");
+            let coll = query_param(query, "collection").map(|c| nfc(&c));
             match store_classes_summary(&store, &dir, &ch_url, coll.as_deref()) {
                 Ok(v) => (200, v.to_string()),
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
@@ -381,12 +1203,225 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // [Fase 2] entidades extraídas (o dump denso) — ClickHouse only, sempre via a view entidade_atual.
         (Method::Get, "/api/nidhogg/entities") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
-            let coll = query_param(query, "collection");
-            let base = query_param(query, "base");
+            let coll = query_param(query, "collection").map(|c| nfc(&c));
+            let base = query_param(query, "base").map(|b| nfc(&b));
             if store != "clickhouse" {
                 (200, json!({"count": 0, "note": "extração requer clickhouse"}).to_string())
             } else {
                 match chdb::entities_summary(&ch_url, coll.as_deref(), base.as_deref()) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [L2] KnowledgeTree — a árvore de assuntos: nós de valor (≥2 participações) →
+        // ramos por tipo → registros. ?collection= obrigatório, ?q= busca por assunto.
+        (Method::Get, "/api/nidhogg/tree") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c))).unwrap_or_default();
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" {
+                (200, json!({"nodes": [], "note": "KnowledgeTree requer clickhouse"}).to_string())
+            } else if coll.is_empty() {
+                (400, json!({"error": "falta ?collection="}).to_string())
+            } else {
+                match chdb::tree_json(&ch_url, &coll, &q, 100) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [L3] relações destiladas pelo LLM (tipo="relacao" no dump) — a leitura do cockpit.
+        (Method::Get, "/api/nidhogg/relacoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)));
+            let n: usize = query_param(query, "n").and_then(|v| v.parse().ok()).unwrap_or(200).min(1000);
+            if store != "clickhouse" {
+                (200, json!({"count": 0, "relacoes": [], "note": "relações requerem clickhouse"}).to_string())
+            } else {
+                match chdb::relacoes_json(&ch_url, coll.as_deref(), n) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [Diário de mastigação] cauda do llm-ledger pro ValHalla (?n=30, máx 200). Prompt e
+        // resposta vão TRUNCADOS (o inteiro teor fica no arquivo) com os tamanhos reais anotados.
+        (Method::Get, "/api/nidhogg/llm_ledger") => {
+            let n: usize = query_param(query, "n").and_then(|v| v.parse().ok()).unwrap_or(30).min(200);
+            let path = match LLM_LEDGER.get() { Some(p) => p.clone(), None => return (200, json!({"entries": []}).to_string()) };
+            const TAIL_BYTES: u64 = 12 * 1024 * 1024;   // entradas podem ter MB (documento no prompt)
+            let (texto, cortado) = (|| -> std::io::Result<(String, bool)> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&path)?;
+                let len = f.metadata()?.len();
+                let start = len.saturating_sub(TAIL_BYTES);
+                f.seek(SeekFrom::Start(start))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)?;
+                Ok((String::from_utf8_lossy(&buf).into_owned(), start > 0))
+            })().unwrap_or((String::new(), false));
+            let corta = |s: &str, max: usize| -> String {
+                if s.chars().count() <= max { s.to_string() }
+                else { format!("{}…", s.chars().take(max).collect::<String>()) }
+            };
+            let mut linhas: Vec<&str> = texto.lines().filter(|l| !l.trim().is_empty()).collect();
+            if cortado && !linhas.is_empty() { linhas.remove(0); }   // primeira pode ser parcial
+            let entries: Vec<Value> = linhas.iter().rev().take(n)
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .map(|e| {
+                    let sys = e["messages"][0]["content"].as_str().unwrap_or("");
+                    let user = e["messages"][1]["content"].as_str().unwrap_or("");
+                    let resp = e["resposta"].as_str().unwrap_or("");
+                    json!({
+                        "ts": e["ts"], "tag": e["tag"], "ctx": e["ctx"], "ms": e["ms"],
+                        "ok": e["ok"], "finish": e["finish"],
+                        "system": corta(sys, 2000), "system_len": sys.chars().count(),
+                        "user": corta(user, 4000), "user_len": user.chars().count(),
+                        "resposta": corta(resp, 6000), "resposta_len": resp.chars().count(),
+                    })
+                }).collect();
+            (200, json!({"file": path, "entries": entries}).to_string())
+        }
+        // [Dimensões] cadastro (a ponte L2→L3): eixos declarados de navegação/exigência.
+        (Method::Get, "/api/nidhogg/dimensoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (200, json!({"dimensoes": []}).to_string()); }
+            let mut dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            // seed na primeira visita: dois eixos que o corpus atual já alimenta
+            if dims.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                dims = json!([
+                    {"nome": "CNPJ/CPF", "descricao": "identidade fiscal — liga contratos, comprovantes e cadastros",
+                     "campos": ["*_cnpj", "*_cpf", "cnpj", "cpf"], "tipos": []},
+                    {"nome": "Pessoas & Entidades", "descricao": "nomes próprios — personagens, pessoas, organizações",
+                     "campos": ["mencao", "*_nome", "personagem"], "tipos": []},
+                ]);
+                let _ = chdb::write_dimensoes(&ch_url, &dims);
+            }
+            (200, json!({"dimensoes": dims}).to_string())
+        }
+        (Method::Post, "/api/nidhogg/dimensoes") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error": "requer clickhouse"}).to_string()); }
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()) };
+            let dims = &v["dimensoes"];
+            let arr = match dims.as_array() { Some(a) => a, None => return (400, json!({"error": "falta 'dimensoes' (array)"}).to_string()) };
+            for d in arr {
+                let nome = d["nome"].as_str().unwrap_or("");
+                if nome.trim().is_empty() { return (400, json!({"error": "dimensão sem 'nome'"}).to_string()); }
+                let campos = d["campos"].as_array().map(|a| a.len()).unwrap_or(0);
+                if campos == 0 { return (400, json!({"error": format!("dimensão '{nome}' sem 'campos'")}).to_string()); }
+                for c in d["campos"].as_array().unwrap() {
+                    let cs = c.as_str().unwrap_or("");
+                    if cs.is_empty() || !cs.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '*' | '.' | '-')) {
+                        return (400, json!({"error": format!("padrão de campo inválido em '{nome}': {cs:?} (use letras, dígitos, _ . - e *)")}).to_string());
+                    }
+                }
+            }
+            match chdb::write_dimensoes(&ch_url, dims) {
+                Ok(_) => { nlog(&format!("dimensões salvas: {} eixo(s)", arr.len())); (200, json!({"ok": true, "dimensoes": dims}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [Dimensões] valores de um eixo (o primeiro clique da corrente)
+        (Method::Get, "/api/nidhogg/dimensao/valores") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let nome = query_param(query, "nome").map(|v| pdec(&v)).unwrap_or_default();
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" || nome.is_empty() {
+                return (400, json!({"error": "requer clickhouse + ?nome="}).to_string());
+            }
+            let dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            let dim = dims.as_array().and_then(|a| a.iter().find(|d| d["nome"].as_str() == Some(nome.as_str()))).cloned();
+            let dim = match dim { Some(d) => d, None => return (404, json!({"error": format!("dimensão '{nome}' não existe")}).to_string()) };
+            let padroes: Vec<String> = dim["campos"].as_array().map(|a| a.iter()
+                .filter_map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default();
+            match chdb::dimensao_valores(&ch_url, &coll, &padroes, &q, 200) {
+                Ok(mut v) => { v["nome"] = json!(nome); (200, v.to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [Dimensões→L3] GAPS: onde o eixo declarado NÃO alcança — tipos do corpus sem nenhum
+        // campo que case os padrões. É a demanda de mastigação que o humano injetou.
+        (Method::Get, "/api/nidhogg/dimensoes/gaps") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            if store != "clickhouse" { return (200, json!({"gaps": []}).to_string()); }
+            let dims = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            let tc = chdb::tipos_campos(&ch_url, &coll).unwrap_or_default();
+            // tipos EXTRAÍVEIS do corpus (documento/tabela — narrativo não gera registro rotulado)
+            let classes = chdb::classes_summary(&ch_url, if coll == "*" { None } else { Some(&coll) })
+                .unwrap_or_else(|_| json!({}));
+            let mut tipos_corpus: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+            for b in classes["bases"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                let (nat, tip) = (b["natureza"].as_str().unwrap_or(""), b["tipo"].as_str().unwrap_or(""));
+                if matches!(nat, "documento" | "tabela") && !tip.is_empty() && tip != "sem-texto" {
+                    tipos_corpus.insert(tip.to_string(), nat.to_string());
+                }
+            }
+            let casa = |p: &str, campo: &str| -> bool {
+                // wildcard simples: '*' casa qualquer trecho
+                let partes: Vec<&str> = p.split('*').collect();
+                let mut resto = campo;
+                for (i, parte) in partes.iter().enumerate() {
+                    if parte.is_empty() { continue; }
+                    if i == 0 && !p.starts_with('*') {
+                        if !resto.starts_with(parte) { return false; }
+                        resto = &resto[parte.len()..];
+                    } else if i == partes.len() - 1 && !p.ends_with('*') {
+                        if !resto.ends_with(parte) { return false; }
+                    } else {
+                        match resto.find(parte) { Some(pos) => resto = &resto[pos + parte.len()..], None => return false }
+                    }
+                }
+                true
+            };
+            let gaps: Vec<Value> = dims.as_array().map(|a| a.iter().map(|d| {
+                let nome = d["nome"].as_str().unwrap_or("");
+                let padroes: Vec<&str> = d["campos"].as_array().map(|a| a.iter()
+                    .filter_map(|c| c.as_str()).collect()).unwrap_or_default();
+                let alvo: Vec<String> = d["tipos"].as_array()
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                    .unwrap_or_else(|| tipos_corpus.keys().cloned().collect());
+                let cobertos: std::collections::BTreeSet<&String> = alvo.iter().filter(|t| {
+                    tc.iter().any(|(tt, cc)| tt == *t && padroes.iter().any(|p| casa(p, cc)))
+                }).collect();
+                let faltando: Vec<&String> = alvo.iter().filter(|t| !cobertos.contains(t)).collect();
+                json!({"nome": nome, "alvo": alvo.len(), "cobertos": cobertos.len(),
+                       "gaps": faltando, "nota": if faltando.is_empty() { "eixo plenamente alimentado" }
+                               else { "tipos sem campo do eixo — candidatos a molde dirigido (L3)" }})
+            }).collect()).unwrap_or_default();
+            (200, json!({"collection": coll, "gaps": gaps}).to_string())
+        }
+        // [Think Navigator] sugestões leves de tema. collection é FILTRO opcional (default: todas).
+        (Method::Get, "/api/nidhogg/suggest") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            let q = query_param(query, "q").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" || q.is_empty() {
+                (400, json!({"error": "requer clickhouse + ?q="}).to_string())
+            } else {
+                match chdb::suggest_json(&ch_url, &coll, &q, 8) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+                }
+            }
+        }
+        // [Think Navigator] expande UM nó do mindmap. collection é FILTRO opcional (default: todas).
+        (Method::Get, "/api/nidhogg/node") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let coll = query_param(query, "collection").map(|c| nfc(&pdec(&c)))
+                .filter(|c| !c.is_empty()).unwrap_or_else(|| "*".to_string());
+            let norm = query_param(query, "norm").map(|v| pdec(&v)).unwrap_or_default();
+            if store != "clickhouse" || norm.is_empty() {
+                (400, json!({"error": "requer clickhouse + ?norm="}).to_string())
+            } else {
+                match chdb::node_json(&ch_url, &coll, &norm, 24) {
                     Ok(v) => (200, v.to_string()),
                     Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
                 }
@@ -445,8 +1480,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // muda o ext_cfg → needs_extract dispara). Corrige os mal-tipados e o COMPARATIVO nqi-baixo.
         (Method::Post, "/api/nidhogg/reclass") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
-            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
-            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
+            let base = nfc(v["base"].as_str().unwrap_or("").trim());
             let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
             if coll.is_empty() || base.is_empty() || tipo.is_empty() {
                 return (400, json!({"error":"faltam 'collection', 'base' e 'tipo'"}).to_string());
@@ -459,12 +1494,19 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 return (400, json!({"error": format!("tipo desconhecido: {tipo}"), "tipos": tipos}).to_string());
             }
             // csv DETERMINÍSTICO (tabular_spec no texto real); natureza deriva do tipo (ou 'tabela' se csv)
-            let csv = fetch_base_text(&api, &coll, &base).map(|t| tabular_spec(&t).is_some()).unwrap_or(false);
+            let texto = fetch_base_text(&api, &coll, &base);
+            let csv = texto.as_deref().map(|t| tabular_spec(t).is_some()).unwrap_or(false);
+            let forma = texto.as_deref().map(form_signature).unwrap_or_default();
             let natureza = if csv { "tabela".to_string() } else { natureza_do_tipo(&tipo).to_string() };
-            // extraível AGORA? csv (det) OU já existe molde pro tipo. Se não (documento sem molde ainda,
-            // ou narrativo/código que nunca gera registro), NÃO há re-extração — e uma extração ANTIGA
-            // desta base (se houver) PERMANECE no dump sob o tipo velho até um molde existir. Avisamos.
-            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| t.get(tipo.as_str()).is_some()).unwrap_or(false);
+            // extraível AGORA? csv (det) OU já existe molde pro tipo (puro ou tipo@forma). Se não
+            // (documento sem molde ainda, ou narrativo/código que nunca gera registro), NÃO há
+            // re-extração — e uma extração ANTIGA desta base (se houver) PERMANECE no dump sob o
+            // tipo velho até um molde existir. Avisamos.
+            let tem_molde = chdb::get_templates(&ch_url).ok().map(|t| {
+                let util = |k: &str| t.get(k).map(|m| m["origem"].as_str() != Some("reprovado")
+                    && m["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+                util(tipo.as_str()) || (!forma.is_empty() && util(&format!("{tipo}@{forma}")))
+            }).unwrap_or(false);
             let extraivel = csv || tem_molde;
             let nota = if extraivel { "re-extrai no próximo ciclo" }
                        else if natureza == "documento" { "sem molde — extração antiga purgada; dê um molde dirigido pra re-extrair" }
@@ -472,7 +1514,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let (sh, ch) = chdb::get_class_hashes(&ch_url, &coll, &base).unwrap_or_default();
             let row = chdb::ClassRow {
                 collection: coll.clone(), name: base.clone(), state_hash: sh, cfg_hash: ch,
-                natureza: natureza.clone(), tipo: tipo.clone(), csv, origem: "humano".to_string(),
+                natureza: natureza.clone(), tipo: tipo.clone(), forma, csv, origem: "humano".to_string(),
                 confianca: 1.0, classified_at: now_stamp(), version: chdb::now_version(),
             };
             match chdb::insert_classes(&ch_url, &[row]) {
@@ -498,8 +1540,8 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let tipo = v["tipo"].as_str().unwrap_or("").trim().to_string();
             let instrucao = v["instrucao"].as_str().unwrap_or("").trim().to_string();
-            let coll = v["collection"].as_str().unwrap_or("").trim().to_string();
-            let base = v["base"].as_str().unwrap_or("").trim().to_string();
+            let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
+            let base = nfc(v["base"].as_str().unwrap_or("").trim());
             if tipo.is_empty() || coll.is_empty() || base.is_empty() {
                 return (400, json!({"error":"faltam 'tipo', 'collection' e 'base' (a amostra)"}).to_string());
             }
@@ -509,10 +1551,10 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let (api, store, dir, llm_url, ch_url) = { let s = st.lock().unwrap(); (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.llm_url.clone(), s.ch_url.clone()) };
             if store != "clickhouse" { return (400, json!({"error":"registry requer clickhouse"}).to_string()); }
             if let Err(e) = chdb::ensure_template_schema(&ch_url) { return (500, json!({"error": format!("schema template: {e}")}).to_string()); }
-            let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => t, None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
+            let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => cap_amostra(&t), None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
             let lib = read_prompts(&dir);
             let (sys, _from) = template_system(&lib);
-            let (schema, regras) = match llm_make_template(&llm_url, &sys, &tipo, &amostra, &instrucao) {
+            let (schema, regras) = match llm_make_template(&llm_url, &format!("molde-dirigido {coll}/{base} tipo={tipo}"), &sys, &tipo, &amostra, &instrucao) {
                 Ok(x) => x,
                 Err(e) => return (502, json!({"error": format!("L1 não criou o molde: {e}")}).to_string()),
             };
@@ -532,12 +1574,78 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("upsert: {e}")}).to_string()),
             }
         }
+        // ── [L4] cadastro de PERGUNTAS (blob versionado, como doctypes/dimensões) ──
+        (Method::Get, "/api/nidhogg/perguntas") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (200, json!({"perguntas": []}).to_string()); }
+            match chdb::perguntas(&ch_url) {
+                Ok(p) => (200, json!({"perguntas": p}).to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        (Method::Post, "/api/nidhogg/perguntas") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let ps = match v["perguntas"].as_array() { Some(a) => a.clone(), None => return (400, json!({"error":"falta 'perguntas' (array)"}).to_string()) };
+            // saneia: nome e texto obrigatórios; tipo dentro do vocabulário; escopo default '*'
+            let mut limpo: Vec<Value> = vec![];
+            for p in &ps {
+                let nome = p["nome"].as_str().unwrap_or("").trim().to_string();
+                let texto = p["texto"].as_str().unwrap_or("").trim().to_string();
+                if nome.is_empty() || texto.is_empty() { continue; }
+                let tipo = match p["tipo"].as_str().unwrap_or("vivo") {
+                    t @ ("tabular" | "oneshot" | "vivo") => t, _ => "vivo",
+                };
+                limpo.push(json!({
+                    "nome": nome, "texto": texto, "tipo": tipo,
+                    "escopo": nfc(p["escopo"].as_str().unwrap_or("*").trim()),
+                    "ativa": p["ativa"].as_bool().unwrap_or(true),
+                    "pai": p["pai"].as_str().unwrap_or(""),   // recursão declarada: filha de qual pergunta
+                }));
+            }
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"perguntas requerem clickhouse"}).to_string()); }
+            match chdb::write_perguntas(&ch_url, &json!(limpo)) {
+                Ok(_) => { nlog(&format!("L4: cadastro de perguntas atualizado ({} ativa(s))", limpo.len()));
+                           (200, json!({"ok": true, "perguntas": limpo}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [L4] a TIMELINE de uma pergunta — as etapas em ordem cronológica
+        (Method::Get, "/api/nidhogg/respostas") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let p = query_param(query, "pergunta").map(|v| nfc(&pdec(&v))).unwrap_or_default();
+            if p.is_empty() { return (400, json!({"error":"falta ?pergunta="}).to_string()); }
+            if store != "clickhouse" { return (200, json!({"etapas": []}).to_string()); }
+            match chdb::timeline(&ch_url, &p, 100) {
+                Ok(v) => (200, v.to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [L4] responde UMA pergunta AGORA (o operador não espera o ciclo). LENTO: contexto +
+        // analista + comparador. Grava etapa mesmo sem mudança (forcar=true) pra dar retorno visível.
+        (Method::Post, "/api/nidhogg/perguntar") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let nome = v["pergunta"].as_str().unwrap_or("").trim().to_string();
+            if nome.is_empty() { return (400, json!({"error":"falta 'pergunta' (o nome cadastrado)"}).to_string()); }
+            let (api, store, dir, llm_url, ch_url) = { let s = st.lock().unwrap();
+                (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.llm_url.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"L4 requer clickhouse"}).to_string()); }
+            let ps = chdb::perguntas(&ch_url).unwrap_or_else(|_| json!([]));
+            let p = match ps.as_array().and_then(|a| a.iter().find(|p| p["nome"].as_str() == Some(&nome))) {
+                Some(p) => p.clone(),
+                None => return (404, json!({"error": format!("pergunta '{nome}' não está no cadastro")}).to_string()),
+            };
+            let lib = read_prompts(&dir);
+            let r = l4_processar(&api, &llm_url, &ch_url, &lib, &p, true);
+            let code = if r["ok"].as_bool() == Some(true) { 200 } else { 502 };
+            (code, r.to_string())
+        }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
             if let Some(on) = v["on"].as_bool() { s.on = on; let p = s.cfg_path.clone(); set_cfg_key(&p, "nidhogg", if on {"true"} else {"false"}); }
             if let Some(lv) = v["level"].as_str().map(level_num).or_else(|| v["level"].as_u64().map(|n| n as u8)) {
-                let lv = lv.min(3); s.level = lv; let p = s.cfg_path.clone(); set_cfg_key(&p, "level", level_name(lv));
+                let lv = lv.min(4); s.level = lv; let p = s.cfg_path.clone(); set_cfg_key(&p, "level", level_name(lv));
             }
             if let Some(c) = v["cadence"].as_u64() { s.cadence = c.max(10); let p = s.cfg_path.clone(); set_cfg_key(&p, "cadence", &s.cadence.to_string()); }
             nlog(&format!("config: on={} nível={} cadência={}s", s.on, level_name(s.level), s.cadence));
@@ -546,7 +1654,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // liga/desliga o acesso do Nidhogg a UMA coleção (não re-mastiga a mesma N vezes)
         (Method::Post, "/api/nidhogg/collection") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
-            let coll = match v["collection"].as_str() { Some(c) if !c.is_empty() => c.to_string(), _ => return (400, json!({"error":"falta 'collection'"}).to_string()) };
+            let coll = match v["collection"].as_str() { Some(c) if !c.is_empty() => nfc(c), _ => return (400, json!({"error":"falta 'collection'"}).to_string()) };
             let enabled = v["enabled"].as_bool().unwrap_or(false);
             let s = st.lock().unwrap();
             let mut k = read_knowledge(&s.dir, &coll);
@@ -735,6 +1843,26 @@ const EXTRACT_INPUT_CHARS_PER_WINDOW: usize = 1500; // janela por ORÇAMENTO DE 
                                                     // densas pegam menos linhas → não satura o teto de saída
 const EXTRACT_MAX_TOKENS: u64 = 1500;
 const TEMPLATE_MIN_COVERAGE: f64 = 0.7;   // Fase 3: molde só é gravado se casa ≥70% dos campos na amostra
+// Molde se aprende com a CABEÇA do documento (os campos rotulados aparecem cedo). Sem teto, uma
+// base classificada errado (livro de 1,8M chars…) derruba o transporte antes de chegar no LLM.
+const TEMPLATE_SAMPLE_MAX_CHARS: usize = 12_000;
+fn cap_amostra(s: &str) -> String {
+    if s.chars().count() <= TEMPLATE_SAMPLE_MAX_CHARS { s.to_string() }
+    else { s.chars().take(TEMPLATE_SAMPLE_MAX_CHARS).collect() }
+}
+/// Marca uma tentativa de molde REPROVADA no registry (schema/regras vazios, origem="reprovado").
+/// A presença da chave tira o cluster da fila (fim do re-try a cada ciclo); a extração IGNORA
+/// moldes reprovados; o destrave é humano: molde dirigido (sobrescreve) ou re-tipagem.
+fn marca_reprovado(ch_url: &str, reg_key: &str, cobertura: f64, motivo: &str) {
+    let row = chdb::TemplateRow {
+        tipo: reg_key.to_string(), schema: "[]".into(), regras: "[]".into(),
+        cobertura, origem: "reprovado".into(), created_at: now_stamp(), version: chdb::now_version(),
+    };
+    match chdb::upsert_template(ch_url, &row) {
+        Ok(_) => nlog(&format!("molde {reg_key}: REPROVADO gravado ({motivo}) — sai da fila; destrave via molde dirigido ou re-tipagem")),
+        Err(e) => nlog(&format!("molde {reg_key}: falha ao gravar reprovação: {e}")),
+    }
+}
 /// Prompt do extrator (editável no ValHalla como o classificador). `{tipo}` é substituído pela classe.
 const BUILTIN_EXTRACT_PROMPT: &str = "Este documento é um {tipo}. Extraia os REGISTROS como um array JSON — um objeto por linha/registro, com os campos relevantes (nomes de campo claros e minúsculos). Responda APENAS com o array JSON, nada além dele.";
 /// System prompt calibrado (89,5% no Qwen2.5-7B). Os TIPOS não entram aqui — vêm do `enum` do
@@ -1022,7 +2150,7 @@ fn template_system(lib: &Value) -> (String, String) {
 }
 /// Fase 3 — o L1 cria o molde de um tipo a partir de UMA amostra. Structured output força
 /// `{schema:[...], regras:[{campo,regex,limpar}]}`. Devolve (schema_json, regras_json) como strings.
-fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
+fn llm_make_template(llm_url: &str, ctx: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -1049,7 +2177,7 @@ fn llm_make_template(llm_url: &str, sys: &str, tipo: &str, amostra: &str, instru
         "temperature": 0, "max_tokens": 1200,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = http_post_t(llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
+    let resp = llm_post("modelador", ctx, llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
         .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(120).collect::<String>()))?;
@@ -1070,29 +2198,66 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     let templates = chdb::get_templates(ch_url).unwrap_or_else(|_| json!({}));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
-    // tipos NÃO-CSV, sem molde ainda → escolhe o mais populoso (name = 1 amostra por tipo)
-    let mut por_tipo: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+    // [FORMA] clusters (tipo, forma) NÃO-CSV sem molde → escolhe o mais populoso (name = amostra).
+    // O molde nasce POR FORMA: 100 mil docs da mesma forma = 1 molde; formas distintas do mesmo
+    // tipo = moldes separados. Registry usa chave composta "tipo@forma" ('' de forma = tipo puro).
+    let mut por_cluster: std::collections::HashMap<(String, String), (usize, String)> = std::collections::HashMap::new();
     for b in &bases {
         let is_csv = b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1);
         let natureza = b["natureza"].as_str().unwrap_or("");
         let tipo = b["tipo"].as_str().unwrap_or("");
+        let forma = b["forma"].as_str().unwrap_or("");
         let name = b["name"].as_str().unwrap_or("");
         // SÓ natureza=documento (átomos da ponta ESTRUTURADOS: comprovante/nota/holerite/OC). Narrativo
         // (contrato, memorial) e código NÃO têm campos rotulados → molde regex não serve (viraria lixo).
         if is_csv || natureza != "documento" || tipo.is_empty() || tipo == "sem-texto" || name.is_empty() { continue; }
-        if templates.get(tipo).is_some() { continue; }   // já tem molde
-        let e = por_tipo.entry(tipo.to_string()).or_insert((0, name.to_string()));
+        let key = if forma.is_empty() { tipo.to_string() } else { format!("{tipo}@{forma}") };
+        if templates.get(&key).is_some() { continue; }               // já tem molde desta forma
+        if forma.is_empty() && templates.get(tipo).is_some() { continue; }
+        let e = por_cluster.entry((tipo.to_string(), forma.to_string())).or_insert((0, name.to_string()));
         e.0 += 1;
     }
-    let (tipo, count, aname) = match por_tipo.into_iter().max_by_key(|(_, (c, _))| *c) {
-        Some((t, (c, n))) => (t, c, n),
-        None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "tipos não-CSV já têm molde (ou não há)"}),
+    let ((tipo, forma), (count, aname)) = match por_cluster.into_iter().max_by_key(|(_, (c, _))| *c) {
+        Some((k, v)) => (k, v),
+        None => return json!({"ok": true, "collection": coll, "criados": 0, "note": "clusters (tipo,forma) não-CSV já têm molde (ou não há)"}),
     };
-    let amostra = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let amostra_full = match fetch_base_text(api, coll, &aname) { Some(t) => t, None => return json!({"ok": false, "collection": coll, "error": "sem amostra"}) };
+    let amostra = cap_amostra(&amostra_full);
+    if amostra.len() < amostra_full.len() {
+        nlog(&format!("template {coll}/{tipo}: amostra {aname} capada em {TEMPLATE_SAMPLE_MAX_CHARS} chars (original {})", amostra_full.chars().count()));
+    }
+    let reg_key = if forma.is_empty() { tipo.clone() } else { format!("{tipo}@{forma}") };
+    // HERANÇA: se o molde do TIPO puro já cobre esta forma (cobertura ≥ gate na amostra do
+    // cluster), materializa um alias — a decisão persiste e o cluster nunca mais entra na fila.
+    if !forma.is_empty() {
+        if let Some(t) = templates.get(&tipo) {
+            let compiled = compile_template(&t["regras"]);
+            let rec = apply_template(&amostra, &compiled);
+            let nc = compiled.len();
+            let n_ok = rec.as_object().map(|o| o.values().filter(|v| !v.as_str().unwrap_or("").is_empty()).count()).unwrap_or(0);
+            let cob = if nc > 0 { n_ok as f64 / nc as f64 } else { 0.0 };
+            if cob >= TEMPLATE_MIN_COVERAGE {
+                let row = chdb::TemplateRow {
+                    tipo: reg_key.clone(), schema: t["schema"].to_string(), regras: t["regras"].to_string(),
+                    cobertura: cob, origem: "herdado".into(), created_at: now_stamp(), version: chdb::now_version(),
+                };
+                if let Err(e) = chdb::upsert_template(ch_url, &row) {
+                    return json!({"ok": false, "collection": coll, "error": format!("alias herdado: {e}")});
+                }
+                nlog(&format!("template {coll}/{reg_key}: molde do tipo puro cobre a forma ({:.0}%) — herdado, sem LLM", cob * 100.0));
+                return json!({"ok": true, "collection": coll, "criados": 1, "tipo": reg_key, "origem": "herdado", "cobertura": cob});
+            }
+        }
+    }
     let (sys, _from) = template_system(lib);
-    let (schema, regras) = match llm_make_template(llm_url, &sys, &tipo, &amostra, "") {
+    let (schema, regras) = match llm_make_template(llm_url, &format!("mineração {coll} tipo={tipo}"), &sys, &tipo, &amostra, "") {
         Ok(x) => x,
-        Err(e) => { nlog(&format!("template {coll}/{tipo}: {e}")); return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e}); }
+        Err(e) => {
+            nlog(&format!("template {coll}/{tipo}: {e}"));
+            // sem memória disso, o cluster mais populoso re-tenta TODO ciclo e tranca a fila
+            marca_reprovado(ch_url, &reg_key, 0.0, &format!("LLM falhou: {e}"));
+            return json!({"ok": false, "collection": coll, "tipo": tipo, "error": e});
+        }
     };
     // valida cobertura aplicando o molde na própria amostra (% de campos que casaram)
     let regras_v: Value = serde_json::from_str(&regras).unwrap_or_else(|_| json!([]));
@@ -1106,18 +2271,19 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
     if cobertura < TEMPLATE_MIN_COVERAGE {
         nlog(&format!("molde REJEITADO: tipo={tipo} cobertura={:.0}% < {:.0}% (sem estrutura extraível)",
             cobertura * 100.0, TEMPLATE_MIN_COVERAGE * 100.0));
+        marca_reprovado(ch_url, &reg_key, cobertura, &format!("cobertura {:.0}% < gate", cobertura * 100.0));
         return json!({"ok": true, "collection": coll, "criados": 0, "tipo": tipo,
                       "cobertura": cobertura, "rejeitado": "cobertura baixa"});
     }
     let row = chdb::TemplateRow {
-        tipo: tipo.clone(), schema, regras, cobertura, origem: "llm".into(),
+        tipo: reg_key.clone(), schema, regras, cobertura, origem: "llm".into(),
         created_at: now_stamp(), version: chdb::now_version(),
     };
     if let Err(e) = chdb::upsert_template(ch_url, &row) {
-        return json!({"ok": false, "collection": coll, "tipo": tipo, "error": format!("upsert: {e}")});
+        return json!({"ok": false, "collection": coll, "tipo": reg_key, "error": format!("upsert: {e}")});
     }
-    nlog(&format!("molde criado: tipo={tipo} campos={n_campos} cobertura={:.0}% ({count} exemplares aguardando)", cobertura * 100.0));
-    json!({"ok": true, "collection": coll, "criados": 1, "tipo": tipo, "campos": n_campos, "cobertura": cobertura})
+    nlog(&format!("molde criado: {reg_key} campos={n_campos} cobertura={:.0}% ({count} exemplares aguardando)", cobertura * 100.0));
+    json!({"ok": true, "collection": coll, "criados": 1, "tipo": reg_key, "campos": n_campos, "cobertura": cobertura})
 }
 
 /// Garante que os templates "classificador" e "extrator" existem na biblioteca (pra aparecerem no
@@ -1137,7 +2303,91 @@ fn ensure_prompt_templates(dir: &str) {
             "system": BUILTIN_EXTRACT_PROMPT, "updated": now_stamp() });
         changed = true;
     }
+    if !lib["templates"]["fichas"].is_object() {
+        lib["templates"]["fichas"] = json!({
+            "description": "Fichas narrativas (L2): personagens/entidades e características por janela de texto.",
+            "system": BUILTIN_FICHA_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
+        changed = true;
+    }
+    if !lib["templates"]["analista"].is_object() {
+        lib["templates"]["analista"] = json!({
+            "description": "L4: responde a questão direta cadastrada usando SÓ o contexto montado (agregados do dump + registros + trechos do corpus). Cita fontes e propõe dimensões não exploradas.",
+            "system": BUILTIN_ANALISTA_PROMPT, "updated": now_stamp(), "max_tokens": 1500 });
+        changed = true;
+    }
+    if !lib["templates"]["comparador"].is_object() {
+        lib["templates"]["comparador"] = json!({
+            "description": "L4: decide se a resposta deste ciclo MUDA A PERSPECTIVA da anterior — é o que faz a timeline registrar mudanças de entendimento, não repetições.",
+            "system": BUILTIN_COMPARADOR_PROMPT, "updated": now_stamp(), "max_tokens": 300 });
+        changed = true;
+    }
+    if !lib["templates"]["relacoes"].is_object() {
+        lib["templates"]["relacoes"] = json!({
+            "description": "Relações estruturais (L3, 100% LLM): destila quem-é-o-quê-de-quem e o tema da cena nas janelas mais densas do censo. Editar re-mastiga (checkpoint por hash do prompt).",
+            "system": BUILTIN_RELACAO_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
+        changed = true;
+    }
     if changed { write_prompts(dir, &lib); }
+}
+
+const BUILTIN_FICHA_PROMPT: &str = "Você lê um TRECHO de uma obra narrativa em português. Extraia as ENTIDADES NOMEADAS \
+(personagens, pessoas, organizações, lugares importantes) que aparecem NESTE trecho. Responda APENAS com um array JSON; \
+cada elemento: {\"nome\": \"...\", \"atributos\": [\"característica citada no trecho\", ...], \"relacoes\": [\"nome de outra entidade ligada a esta no trecho\", ...]}. \
+Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidades → [].";
+
+// [L4] O analista: responde a questão direta SÓ com o que o contexto determinístico trouxe.
+// A regra do "não sei" é o que separa análise de invenção — e é o que torna a timeline
+// confiável (uma resposta que muda porque o dado chegou, não porque o modelo alucinou).
+const BUILTIN_ANALISTA_PROMPT: &str = "Você é o analista do RAGnaRock. Responde a PERGUNTA usando EXCLUSIVAMENTE o \
+CONTEXTO fornecido. \
+HIERARQUIA DE CONFIANÇA (a regra mais importante): os TRECHOS DO CORPUS são PROVA — texto original. As RELAÇÕES DESTILADAS são \
+apenas PISTAS de uma leitura automática anterior e PODEM ESTAR ERRADAS. Quando uma pista contradisser o texto, o TEXTO VENCE; \
+quando uma pista não tiver apoio no texto, NÃO a afirme como fato. \
+DIREÇÃO: a relação 'A —[laço]→ B' significa que A exerce o laço sobre B, nessa ordem. NUNCA inverta os lados. \
+Regras: (1) NUNCA invente número, nome ou fato fora do contexto — se o material não permite responder, diga exatamente o que falta; \
+(2) ao somar ou contar, use os REGISTROS DO DUMP e diga quantos registros entraram na conta; (3) cite as FONTES (base de cada \
+afirmação); (4) em \"proximas\", liste até 3 DIMENSÕES NÃO EXPLORADAS que os dados permitem investigar. \
+Responda APENAS o JSON pedido, em português.";
+
+// [L4] O comparador: o guardião da timeline. Só uma MUDANÇA DE PERSPECTIVA vira etapa —
+// reformulação, sinônimo ou ordem diferente das mesmas frases NÃO conta.
+const BUILTIN_COMPARADOR_PROMPT: &str = "Você compara duas respostas para a MESMA pergunta, produzidas em ciclos diferentes. \
+Decida se a resposta de AGORA MUDA A PERSPECTIVA em relação à anterior. Mudança de perspectiva = número/fato diferente, conclusão \
+diferente, informação nova relevante, ou contradição. NÃO é mudança: reformulação, sinônimo, ordem das frases, detalhe irrelevante. \
+Responda APENAS JSON: {\"mudou\": true|false, \"o_que_mudou\": \"em uma frase, o que mudou (vazio se não mudou)\"}. Seja RIGOROSO: \
+na dúvida, mudou=false.";
+
+// [L3] O prompt do destilador de relações — a régua manda: MESMO objetivo do L2 (grafar
+// relações), mas 100% LLM. O trecho vem das cenas mais densas do censo (chunks onde mais
+// entidades co-ocorrem) e a lista de presentes ANCORA os nomes (o nó do LLM COLA no nó do
+// censo pela mesma normalização).
+const BUILTIN_RELACAO_PROMPT: &str = "Você lê um TRECHO de uma obra em português e a lista das ENTIDADES presentes nele. \
+Destile as RELAÇÕES que o texto AFIRMA entre essas entidades — o que uma contagem determinística não alcança: quem é o quê de quem, \
+quem fez o quê a quem, e o TEMA da cena. Responda APENAS JSON: {\"relacoes\":[{\"a\":\"entidade\",\"rel\":\"laço curto (1-4 palavras: \
+mentor de, viaja com, trai, serve…)\",\"b\":\"entidade\",\"tema\":\"tema da cena em 1-3 palavras (opcional)\"}]}. \
+Use os nomes EXATOS da lista de entidades; seja FIEL ao trecho (só o que ele afirma); sem relações → {\"relacoes\":[]}.";
+
+/// System do destilador de relações (L3): template "relacoes" editável ou o BUILTIN.
+fn relacao_system(lib: &Value) -> (String, u32) {
+    let sys = match lib["templates"]["relacoes"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_RELACAO_PROMPT.to_string(),
+    };
+    let max_tokens = lib["templates"]["relacoes"]["max_tokens"].as_u64().unwrap_or(1200) as u32;
+    (sys, max_tokens)
+}
+
+/// [v8] Chunks SEPARADOS de uma base (id + texto) — o censo de menções varre por chunk
+/// pra gravar as POSIÇÕES (a posição do chunk é o eixo do tempo narrativo).
+fn fetch_base_chunks(api: &str, coll: &str, name: &str) -> Option<Vec<(usize, String)>> {
+    let req = json!({"collection": coll, "base": name, "id": 0, "after": 999_999}).to_string();
+    let v: Value = serde_json::from_str(&http_post_t(&format!("{api}/chunk"), &req, 120)?).ok()?;
+    let chunks = v["chunks"].as_array()?;
+    Some(chunks.iter().filter_map(|c| {
+        let id = c["id"].as_u64()? as usize;
+        let t = c["text"].as_str()?.to_string();
+        if t.trim().is_empty() { None } else { Some((id, t)) }
+    }).collect())
 }
 
 /// Texto do chunk 0 de uma base (primeiros CLASSIFY_MAX_CHARS chars). Leve — não puxa a base
@@ -1152,7 +2402,7 @@ fn fetch_chunk0(api: &str, coll: &str, name: &str) -> Option<String> {
 
 /// Uma classificação por LLM com CONSTRAINED DECODING (json_schema/enum). temperature 0.
 /// Err carrega o motivo. Devolve (natureza, tipo).
-fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
+fn llm_classify(llm_url: &str, ctx: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
     -> Result<(String, String), String>
 {
     let schema = json!({
@@ -1171,7 +2421,7 @@ fn llm_classify(llm_url: &str, sys: &str, text: &str, naturezas: &[String], tipo
         "temperature": 0, "max_tokens": 40,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = http_post_t(llm_url, &body, CLASSIFY_TIMEOUT_S)
+    let resp = llm_post("classificador", ctx, llm_url, &body, CLASSIFY_TIMEOUT_S)
         .ok_or(format!("sem resposta (timeout {CLASSIFY_TIMEOUT_S}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -1191,7 +2441,7 @@ fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
                  naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
     let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
     let csv = tabular_spec(&text).is_some();
-    let (nat, tip) = llm_classify(llm_url, sys, &text, naturezas, tipos)?;
+    let (nat, tip) = llm_classify(llm_url, &format!("classe {coll}/{name}"), sys, &text, naturezas, tipos)?;
     Ok((nat, tip, csv))
 }
 
@@ -1269,8 +2519,8 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         None => return json!({"ok": false, "error": "ragd /bases sem resposta"}),
     };
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
-        let name = b["name"].as_str().unwrap_or("");
-        !name.is_empty() && store_needs_class(store, dir, ch_url, coll, name, &base_state_hash(b), &cfg_hash)
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        !name.is_empty() && store_needs_class(store, dir, ch_url, coll, &name, &base_state_hash(b), &cfg_hash)
     }).collect();
     queue.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 
@@ -1280,13 +2530,19 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
     let at = now_stamp();
     let mut rows: Vec<chdb::ClassRow> = vec![];   // acumula o lote (1 INSERT no fim)
     for b in queue.iter().take(CLASSIFY_PER_CYCLE) {
-        let name = b["name"].as_str().unwrap_or("");
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        let name = name.as_str();
         let sh = base_state_hash(b);
         let has_text = b["has_text"].as_bool().unwrap_or(true);
+        // [FORMA] assinatura estrutural carimbada junto com a classe (zero-IA, 1 fetch extra
+        // só pra base NOVA/mudada — é o agrupador do "1 molde por forma")
+        let forma = if has_text {
+            fetch_base_text(api, coll, name).map(|t| form_signature(&t)).unwrap_or_default()
+        } else { String::new() };
         let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
             collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
             cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
-            csv, origem: "llm".to_string(),
+            forma: forma.clone(), csv, origem: "llm".to_string(),
             confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
         };
         if !has_text {
@@ -1351,14 +2607,14 @@ fn classify_list_cli(cfg: &Config, path: &str) {
 
 /// Extrai os registros de UMA janela como array JSON. temperature 0. Reusa o salvage pra truncado.
 /// O chamador valida cada elemento (all-or-nothing).
-fn llm_extract_records(llm_url: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
+fn llm_extract_records(llm_url: &str, ctx: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
     let sys_r = sys.replace("{tipo}", tipo);
     let body = json!({
         "messages": [{"role":"system","content":sys_r},{"role":"user","content":format!("DOCUMENTO:\n{text}")}],
         "temperature": 0, "max_tokens": EXTRACT_MAX_TOKENS
     }).to_string();
     let to = ((text.len() / 90) + (EXTRACT_MAX_TOKENS as usize / 10) + 90).min(400) as u32;
-    let resp = http_post_t(llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
+    let resp = llm_post("extrator", ctx, llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let truncated = rv["choices"][0]["finish_reason"].as_str() == Some("length");
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -1395,21 +2651,35 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let bases_class: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let is_csv = |b: &Value| b["csv"].as_i64() == Some(1) || b["csv"].as_u64() == Some(1) || b["csv"].as_str() == Some("1");
-    let mut extraiveis: std::collections::HashMap<String, (String, bool, String)> = std::collections::HashMap::new();
+    // valor: (tipo, csv, ext_cfg, molde_key) — molde_key = "tipo@forma" quando há molde da
+    // forma, senão o tipo puro (fallback). O ecfg carrega a chave: molde novo → re-extrai.
+    let mut extraiveis: std::collections::HashMap<String, (String, bool, String, String)> = std::collections::HashMap::new();
     for b in &bases_class {
         let name = match b["name"].as_str() { Some(n) if !n.is_empty() => n.to_string(), _ => continue };
         let tipo = b["tipo"].as_str().unwrap_or("registro").to_string();
+        let forma = b["forma"].as_str().unwrap_or("");
         if is_csv(b) {
-            extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone()));
-        } else if let Some(t) = templates.get(tipo.as_str()) {
-            let ecfg = hash_hex(&format!("template|v2nqi|{tipo}|{}", hash_hex(&t["regras"].to_string())));
-            extraiveis.insert(name, (tipo, false, ecfg));
+            extraiveis.insert(name, (tipo, true, ext_cfg_csv.clone(), String::new()));
+        } else {
+            // molde ÚTIL = existe, tem regras e não é uma reprovação gravada (fila liberada ≠ extraível)
+            let util = |k: &str| templates.get(k).map(|t|
+                t["origem"].as_str() != Some("reprovado")
+                && t["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+            let composta = if forma.is_empty() { String::new() } else { format!("{tipo}@{forma}") };
+            let mkey = if !composta.is_empty() && util(&composta) { composta }
+                       else if util(tipo.as_str()) { tipo.clone() }
+                       else { continue };
+            let t = &templates[mkey.as_str()];
+            let ecfg = hash_hex(&format!("template|v2nqi|{mkey}|{}", hash_hex(&t["regras"].to_string())));
+            extraiveis.insert(name, (tipo, false, ecfg, mkey));
         }
     }
     // ponto cego: natureza=tabela sem csv E sem molde → ninguém extrai (VISÍVEL, não silencioso)
     let blind = bases_class.iter()
         .filter(|b| b["natureza"].as_str() == Some("tabela") && !is_csv(b)
-                && !templates.get(b["tipo"].as_str().unwrap_or("")).is_some()).count();
+                && !templates.get(b["tipo"].as_str().unwrap_or("")).map(|t|
+                    t["origem"].as_str() != Some("reprovado")
+                    && t["regras"].as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false)).count();
     if blind > 0 { nlog(&format!("extract {coll}: {blind} base(s) natureza=tabela sem csv nem molde — não extraídas")); }
     if extraiveis.is_empty() {
         return json!({"ok": true, "collection": coll, "extracted": 0, "pending": 0, "note": "nada extraível (sem CSV nem molde)"});
@@ -1421,9 +2691,9 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
         None => return json!({"ok": false, "collection": coll, "error": "ragd /bases sem resposta"}),
     };
     let mut queue: Vec<Value> = bases.into_iter().filter(|b| {
-        let name = b["name"].as_str().unwrap_or("");
-        match extraiveis.get(name) {
-            Some((_, _, ecfg)) => chdb::needs_extract(ch_url, coll, name, &base_state_hash(b), ecfg).unwrap_or(true),
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        match extraiveis.get(name.as_str()) {
+            Some((_, _, ecfg, _)) => chdb::needs_extract(ch_url, coll, &name, &base_state_hash(b), ecfg, false).unwrap_or(true),
             None => false,
         }
     }).collect();
@@ -1434,9 +2704,10 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
     let mut compiled_cache: std::collections::HashMap<String, Vec<(String, regex::Regex, Vec<String>)>> = std::collections::HashMap::new();
     let at = now_stamp();
     for b in queue.iter().take(EXTRACT_PER_CYCLE) {
-        let name = b["name"].as_str().unwrap_or("");
+        let name = nfc(b["name"].as_str().unwrap_or(""));
+        let name = name.as_str();
         let sh = base_state_hash(b);
-        let (tipo, _bcsv, ecfg) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
+        let (tipo, _bcsv, ecfg, mkey) = match extraiveis.get(name) { Some(x) => x.clone(), None => continue };
         let text = match fetch_base_text(api, coll, name) { Some(t) => t, None => continue };
         let spec = tabular_spec(&text);
         let rows_src = spec.map(|(_, n)| n);
@@ -1461,17 +2732,18 @@ fn mine_entities(api: &str, store: &str, ch_url: &str, lib: &Value, coll: &str) 
                 idx += 1;
             }
         } else {
-            // Fase 3: aplica o MOLDE do tipo (regex ancorado). 1 documento = 1 registro. Zero LLM.
+            // Fase 3: aplica o MOLDE da forma (ou do tipo puro, fallback). 1 doc = 1 registro. Zero LLM.
             modo = "template";
-            let molde_ver = templates[tipo.as_str()]["version"].as_u64().unwrap_or(0);
-            let compiled = compiled_cache.entry(tipo.clone())
-                .or_insert_with(|| compile_template(&templates[tipo.as_str()]["regras"]));
+            let molde_ver = templates[mkey.as_str()]["version"].as_u64().unwrap_or(0);
+            let compiled = compiled_cache.entry(mkey.clone())
+                .or_insert_with(|| compile_template(&templates[mkey.as_str()]["regras"]));
             // path-tree (Fase 5): cada campo veio de um REGEX ancorado no rótulo
             let origem: std::collections::HashMap<String, (String, String)> = compiled.iter()
                 .map(|(c, re, _)| (c.clone(), ("regex".to_string(), re.as_str().to_string()))).collect();
             let n_esperado = compiled.len();
             let rec = apply_template(&text, &compiled[..]);
-            let (nqi, prov) = qualidade_prov(coll, name, "template", Some((&tipo, molde_ver)), &origem, &rec, n_esperado);
+            // prov aponta o molde REAL aplicado (tipo@forma quando específico)
+            let (nqi, prov) = qualidade_prov(coll, name, "template", Some((&mkey, molde_ver)), &origem, &rec, n_esperado);
             ents.push(chdb::EntidadeRow {
                 collection: coll.to_string(), base: name.to_string(), tipo: tipo.clone(),
                 idx: 0, dado: rec.to_string(), modo: "template".to_string(), nqi, prov,
@@ -1509,11 +2781,19 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         match mine_level0(&api, coll) {
             Some((src, pillars, n_bases, total_chunks)) => {
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
+                // saturação = fração do corpus com a digestão da camada ATIVA em dia.
+                // L0 digere tudo num passe (1.0 ao minerar); L1 mede pelo `pending` da
+                // classificação (a porta da consciência — extração vem atrás dela).
+                let mut sat: Option<f64> = if level >= 1 { None } else { Some(1.0) };
                 if level >= 1 {
                     // Fase 1: classifica {natureza,tipo} das bases novas/mudadas (doc_class no ClickHouse).
                     let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
+                    }
+                    if cl["ok"].as_bool() == Some(true) && n_bases > 0 {
+                        let pending = cl["pending"].as_u64().unwrap_or(0) as f64;
+                        sat = Some(((n_bases as f64 - pending) / n_bases as f64).clamp(0.0, 1.0));
                     }
                     // Fase 3: o L1 cria/mantém os MOLDES dos tipos não-CSV (1 tipo por ciclo). Roda
                     // ANTES da extração pra o molde já estar no registry quando o L0 for aplicar.
@@ -1523,6 +2803,17 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     let ex = mine_entities(&api, &store, &ch_url, &lib, coll);
                     if ex["extracted"].as_u64().unwrap_or(0) > 0 { extracted_ents.push(coll.clone()); }
                     det_total += ex["deterministicas"].as_u64().unwrap_or(0) + ex["templates"].as_u64().unwrap_or(0);
+                    // [L2] KnowledgeTree: censo de menções (determinístico) e a ligação por
+                    // valores-chave (zero IA, incremental por fingerprint).
+                    if level >= 2 && store == "clickhouse" {
+                        let _f = mine_fichas(&api, &llm_url, &ch_url, &lib, coll);
+                        // [L3] estrutural-LLM: destila relações das cenas densas (100% LLM,
+                        // 1 base/ciclo) ANTES do link — o mesmo mine_links cola tudo no grafo.
+                        if level >= 3 {
+                            let _r = mine_relacoes(&api, &llm_url, &ch_url, &lib, coll);
+                        }
+                        let _lk = mine_links(&ch_url, &dir, coll);
+                    }
                     // Summary d00a009 REMOVIDO (10/ago): o normalizador aberto (1 LLM pesado/base,
                     // extração às cegas + agregação) foi substituído pela Fase 1 (classifica) + Fase 2/4
                     // (extrai determinístico) + Fase 3 (moldes). Dead-code varrido — não há mais mine_summary.
@@ -1537,6 +2828,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     k["source_hash"] = json!(src);
                     k["updated"] = json!(now_stamp());
                     k["knowledge"] = json!(pillars);
+                    if let Some(s) = sat { k["saturation"] = json!(s); }
                     k["provenance"] = json!({
                         "digestion_id": format!("l0-{}", &src[..src.len().min(8)]),
                         "at": now_stamp(), "via": "level0/no-ai",
@@ -1545,11 +2837,27 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     write_knowledge(&dir, coll, &k);   // nível 0 (léxico) numa escrita atômica
                     if !l0_same || force { mined.push(coll.clone()); }
                 } else {
+                    // a saturação avança MESMO sem o L0 mudar (a fila da Fase 1 anda por ciclo):
+                    // escrita leve só quando o valor de fato mudou (>0.1%)
+                    if let Some(s) = sat {
+                        let mut cur = read_knowledge(&dir, coll);
+                        if (cur["saturation"].as_f64().unwrap_or(0.0) - s).abs() > 0.001 {
+                            cur["saturation"] = json!(s);
+                            write_knowledge(&dir, coll, &cur);
+                        }
+                    }
                     skipped.push(coll.clone());
                 }
             }
             None => failed.push(coll.clone()),
         }
+    }
+    // [L4] As perguntas cadastradas são GLOBAIS (cada uma declara seu próprio escopo), então
+    // rodam UMA vez por ciclo, fora do laço de coleções. Responde todas; só materializa etapa
+    // onde a perspectiva mudou.
+    let mut l4 = json!(null);
+    if level >= 4 && store == "clickhouse" {
+        l4 = mine_respostas(&api, &llm_url, &ch_url, &lib);
     }
     // CacheDigest (#48): 3º pilar do nível 0, GLOBAL — UMA vez por ciclo, FORA do loop de
     // coleções (senão reescreveria N×). Cache vazio é válido; só não grava se o ragd caiu.
@@ -1565,7 +2873,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
            "mined": mined, "skipped": skipped, "failed": failed,
-           "classified": classified, "extracted": extracted_ents,
+           "classified": classified, "extracted": extracted_ents, "l4": l4,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
 }
@@ -1618,13 +2926,18 @@ fn help() {
 uso:
   nidhoggd [--config <arq>] [--port {DEFAULT_PORT}] [--ragd <url>]
   config: --config <arq>, senão ./nidhogg.cfg, senão defaults.
-          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|propositivo), dir, cadence, cors_origin
+          chaves: port, ragd_api, nidhogg(on/off), level(minerador|consciente|estrutural|estrutural-llm), dir, cadence, cors_origin
   nasce DESLIGADO (precisa de IA). Liga pelo ValHalla ou pelo cfg.
 rotas:
   GET  /health
   GET  /api/nidhogg                 status (nível, cadência, keepalive do ragd, conhecimento)
   GET  /api/nidhogg/collections     coleções do ragd + estado de digestão (liga/desliga por coleção)
   GET  /api/nidhogg/knowledge       conhecimento destilado (?collection=&type=&level=) — só leitura
+  GET  /api/nidhogg/relacoes        relações destiladas pelo L3 (?collection=&n=) — só leitura
+  GET  /api/nidhogg/perguntas       cadastro de questões diretas do L4
+  POST /api/nidhogg/perguntas       {{\"perguntas\":[{{nome,texto,tipo:tabular|oneshot|vivo,escopo,ativa}}]}}
+  GET  /api/nidhogg/respostas       timeline de uma pergunta (?pergunta=nome)
+  POST /api/nidhogg/perguntar       {{\"pergunta\":\"nome\"}} responde AGORA (lento: analista + comparador)
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
   POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)
@@ -1645,6 +2958,9 @@ fn main() {
         p
     };
     if Path::new(&cfg_path).exists() { load_cfg(&mut cfg, &cfg_path); } else { cfg.cfg_path = cfg_path.clone(); }
+    // diário de mastigação do LLM: <dir>/llm-ledger.jsonl (todas as consultas/respostas de IA)
+    let _ = std::fs::create_dir_all(&cfg.dir);
+    let _ = LLM_LEDGER.set(format!("{}/llm-ledger.jsonl", cfg.dir.trim_end_matches('/')));
     // CLI sobrescreve
     let mut it = args.iter();
     while let Some(a) = it.next() {

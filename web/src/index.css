@@ -1,0 +1,47 @@
+@import 'tailwindcss';
+
+/* Tema "cockpit" — dois modos. REGRA (igual ao design-system do Innova): componentes usam
+   SÓ tokens semânticos var(--color-*), NUNCA hex hardcoded. Assim toda tela nasce funcionando
+   em light e dark automaticamente. O dark é o default (supervisório nasce escuro). */
+@theme {
+  --color-bg: #0b0f14;
+  --color-panel: #121821;
+  --color-panel-2: #171f2b;
+  --color-border: #223044;
+  --color-fg: #e6edf3;
+  --color-muted: #8b98a9;
+  --color-accent: #2f9ee6;
+  --color-accent-fg: #08131f;
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-crit: #f85149;
+}
+
+/* Light mode — sobrescreve os tokens (especificidade maior que o :root do @theme). */
+:root[data-theme='light'] {
+  --color-bg: #f4f6f9;
+  --color-panel: #ffffff;
+  --color-panel-2: #eef1f6;
+  --color-border: #d3dae3;
+  --color-fg: #16202e;
+  --color-muted: #5b6b7f;
+  --color-accent: #1668c0;
+  --color-accent-fg: #ffffff;
+  --color-ok: #1a7f37;
+  --color-warn: #9a6700;
+  --color-crit: #cf222e;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+a { color: inherit; text-decoration: none; }

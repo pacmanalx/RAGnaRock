@@ -12,6 +12,12 @@ rayon = "1"
 # [#6] parking_lot — RwLock sem PoisonError, com starvation prevention nativo.
 # RwLock dá N leitores concorrentes (search) + 1 escritor exclusivo (ingest/delete).
 parking_lot = "0.12"
+# [#33] normaliza nomes de base pra NFC — o macOS manda nomes de arquivo em NFD (drag&drop),
+# senão "Locação" (ç/ã precompostos, NFC) e a forma decomposta viram DUAS bases distintas.
+unicode-normalization = "0.1"
+# [#33 JWT] sha2+hmac: HS256 do token e PBKDF2 das senhas (puro Rust, sem C)
+sha2 = "0.10"
+hmac = "0.12"
 
 [profile.release]
 opt-level = 3

@@ -26,6 +26,7 @@ pub struct ClassRow {
     pub cfg_hash: String,
     pub natureza: String,
     pub tipo: String,
+    pub forma: String,    // [FORMA] assinatura estrutural (esqueleto de rótulos); '' = sem estrutura
     pub csv: bool,        // determinístico (tabular_spec): é um CSV regular → gate da Fase 2
     pub origem: String,   // "llm" (classificou) | "humano" (re-tipado no cockpit — o LLM NÃO sobrescreve)
     pub confianca: f64,
@@ -126,6 +127,8 @@ pub fn ensure_schema(url: &str) -> Result<(), String> {
     // migrações idempotentes: colunas que doc_class antigo não tinha
     ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS csv UInt8 DEFAULT 0", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS origem String DEFAULT 'llm'", 15)?;
+    // [FORMA] assinatura estrutural (esqueleto de rótulos, 8 hex; '' = sem estrutura rotulada)
+    ch_exec(url, "ALTER TABLE nidhogg.doc_class ADD COLUMN IF NOT EXISTS forma String DEFAULT ''", 15)?;
     ch_exec(url,
         "CREATE TABLE IF NOT EXISTS nidhogg.doctype (version UInt64, naturezas String, tipos String) \
          ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
@@ -203,7 +206,7 @@ pub fn insert_classes(url: &str, rows: &[ClassRow]) -> Result<(), String> {
     for r in rows {
         let line = json!({
             "collection": r.collection, "name": r.name, "state_hash": r.state_hash,
-            "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo,
+            "cfg_hash": r.cfg_hash, "natureza": r.natureza, "tipo": r.tipo, "forma": r.forma,
             "csv": if r.csv { 1 } else { 0 }, "origem": r.origem,
             "confianca": r.confianca, "classified_at": r.classified_at, "version": r.version,
         });
@@ -242,7 +245,7 @@ pub fn classes_summary(url: &str, collection: Option<&str>) -> Result<Value, Str
     let total: i64 = total_body.trim().parse().unwrap_or(0);
 
     let bases_sql = format!(
-        "SELECT collection, name, natureza, tipo, csv, origem, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
+        "SELECT collection, name, natureza, tipo, forma, csv, origem, confianca, classified_at FROM nidhogg.doc_class FINAL{where_c} \
          ORDER BY collection, name FORMAT JSON");
     let bases_body = ch_query_param(url, &bases_sql, &params, 20)?;
     let bv: Value = serde_json::from_str(&bases_body).map_err(|e| format!("json bases: {e}"))?;
@@ -286,24 +289,85 @@ pub fn ensure_entidade_schema(url: &str) -> Result<(), String> {
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS modo String DEFAULT 'llm'", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS nqi Float64 DEFAULT 0", 15)?;
     ch_exec(url, "ALTER TABLE nidhogg.entidade ADD COLUMN IF NOT EXISTS prov String DEFAULT ''", 15)?;
-    // OR REPLACE: a view é SELECT * e precisa reincluir as colunas novas
+    // OR REPLACE: a view é SELECT * e precisa reincluir as colunas novas.
+    // Partição por TIPO: menções (censo) e extração (fichas) convivem na mesma base com
+    // versions próprios — sem o tipo no corte, o escritor mais recente esconderia o outro.
     ch_exec(url,
         "CREATE OR REPLACE VIEW nidhogg.entidade_atual AS SELECT * FROM nidhogg.entidade \
-         WHERE (collection, base, version) IN \
-         (SELECT collection, base, max(version) FROM nidhogg.entidade GROUP BY collection, base)", 15)?;
+         WHERE (collection, base, tipo, version) IN \
+         (SELECT collection, base, tipo, max(version) FROM nidhogg.entidade GROUP BY collection, base, tipo)", 15)?;
     Ok(())
 }
 
 /// Precisa extrair se não há entidades atuais OU state_hash/ext_cfg_hash divergem. Vazio = precisa.
-pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str) -> Result<bool, String> {
-    let body = ch_query_param(url,
+/// `so_mencao` delimita o escritor: o censo de menções e a extração de fichas dividem a tabela,
+/// e cada um só pode comparar hash com as PRÓPRIAS linhas — senão um invalida/pula o outro.
+pub fn needs_extract(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str,
+                     so_mencao: bool) -> Result<bool, String> {
+    let tipo_c = if so_mencao { "AND tipo = 'mencao'" } else { "AND tipo != 'mencao'" };
+    let sql = format!(
         "SELECT state_hash, ext_cfg_hash FROM nidhogg.entidade_atual \
-         WHERE collection={coll:String} AND base={base:String} LIMIT 1 FORMAT TabSeparated",
+         WHERE collection={{coll:String}} AND base={{base:String}} {tipo_c} LIMIT 1 FORMAT TabSeparated");
+    let body = ch_query_param(url, &sql,
         &[("coll", collection), ("base", base)], 10)?;
     let line = body.lines().next().unwrap_or("");
     if line.is_empty() { return Ok(true); }
     let mut it = line.split('\t');
     Ok(it.next().unwrap_or("") != state_hash || it.next().unwrap_or("") != ext_cfg)
+}
+
+/// [L3] Checkpoint por TIPO exato (o destilador de relações compara hash só com as PRÓPRIAS
+/// linhas — mesma doutrina do so_mencao, mas parametrizada pro terceiro escritor da tabela).
+pub fn needs_extract_tipo(url: &str, collection: &str, base: &str, state_hash: &str, ext_cfg: &str,
+                          tipo: &str) -> Result<bool, String> {
+    let body = ch_query_param(url,
+        "SELECT state_hash, ext_cfg_hash FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} AND tipo={t:String} LIMIT 1 FORMAT TabSeparated",
+        &[("coll", collection), ("base", base), ("t", tipo)], 10)?;
+    let line = body.lines().next().unwrap_or("");
+    if line.is_empty() { return Ok(true); }
+    let mut it = line.split('\t');
+    Ok(it.next().unwrap_or("") != state_hash || it.next().unwrap_or("") != ext_cfg)
+}
+
+/// [L3] Os `dado` das menções do censo de UMA base (JSON strings {mencao, freq, chunks}) —
+/// o material sobre o qual o destilador escolhe as cenas densas.
+pub fn mencoes_da_base(url: &str, collection: &str, base: &str) -> Result<Vec<Value>, String> {
+    let body = ch_query_param(url,
+        "SELECT dado FROM nidhogg.entidade_atual \
+         WHERE collection={coll:String} AND base={base:String} AND tipo='mencao' \
+         ORDER BY idx LIMIT 3000 FORMAT JSONEachRow",
+        &[("coll", collection), ("base", base)], 15)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| v["dado"].clone())
+        .collect())
+}
+
+/// [L3] Leitura das relações destiladas (tipo='relacao', sentinelas de vazio fora) pro cockpit.
+pub fn relacoes_json(url: &str, collection: Option<&str>, limit: usize) -> Result<Value, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = match collection {
+        Some(c) if c != "*" => (" AND collection={coll:String}", vec![("coll", c)]),
+        _ => ("", vec![]),
+    };
+    let body = ch_query_param(url, &format!(
+        "SELECT collection, base, idx, dado, nqi, prov, extracted_at FROM nidhogg.entidade_atual \
+         WHERE tipo='relacao' AND JSONExtractString(dado, 'a') != ''{wc} \
+         ORDER BY extracted_at DESC, base, idx LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
+    let mut relacoes: Vec<Value> = vec![];
+    let mut bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in body.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            let dado = v["dado"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null);
+            let prov = v["prov"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null);
+            bases.insert(format!("{}/{}", v["collection"].as_str().unwrap_or(""), v["base"].as_str().unwrap_or("")));
+            relacoes.push(json!({
+                "collection": v["collection"], "base": v["base"], "idx": v["idx"],
+                "dado": dado, "nqi": v["nqi"], "prov": prov, "extracted_at": v["extracted_at"],
+            }));
+        }
+    }
+    Ok(json!({"count": relacoes.len(), "bases": bases.len(), "relacoes": relacoes}))
 }
 
 /// INSERT em lote das entidades de UMA extração (mesmo version). All-or-nothing: o chamador só chega
@@ -324,22 +388,24 @@ pub fn insert_entities(url: &str, rows: &[EntidadeRow]) -> Result<(), String> {
     ch_insert(url, "nidhogg.entidade", &ndjson, 45)
 }
 
-/// Apaga TODAS as entidades de uma base (mutation SÍNCRONA — mutations_sync=1). Usado pelo re-tipar
-/// manual quando a base fica NÃO-extraível (narrativo/código, ou documento sem molde): o dump não pode
-/// guardar extração velha de um tipo que a base não tem mais. ALTER DELETE é raro (só no cockpit) e o
-/// volume por base é pequeno → custo aceitável. Params por binding (sem injeção via nome de base).
+/// Apaga as entidades de EXTRAÇÃO de uma base (mutation SÍNCRONA — mutations_sync=1). Usado pelo
+/// re-tipar manual quando a base fica NÃO-extraível (narrativo/código, ou documento sem molde): o dump
+/// não pode guardar extração velha de um tipo que a base não tem mais. As MENÇÕES sobrevivem à purga:
+/// narrativo é justamente onde o censo vive, e re-tipar não as invalida. ALTER DELETE é raro (só no
+/// cockpit) e o volume por base é pequeno → custo aceitável. Params por binding (sem injeção).
 pub fn delete_entities(url: &str, collection: &str, base: &str) -> Result<u64, String> {
     // conta antes (pra reportar quantas saíram) — a mutation em si não devolve contagem
     let cnt_body = ch_query_param(url,
         "SELECT count() FROM nidhogg.entidade_atual \
-         WHERE collection={coll:String} AND base={base:String} FORMAT TabSeparated",
+         WHERE collection={coll:String} AND base={base:String} AND tipo != 'mencao' FORMAT TabSeparated",
         &[("coll", collection), ("base", base)], 10)?;
     let n: u64 = cnt_body.trim().parse().unwrap_or(0);
     if n == 0 { return Ok(0); }   // nada a apagar
     // mutation via POST (GET é readonly no ClickHouse); mutations_sync=1 espera concluir
     let full = format!("{url}?mutations_sync=1&param_coll={}&param_base={}",
                        urlencode(collection), urlencode(base));
-    let sql = "ALTER TABLE nidhogg.entidade DELETE WHERE collection={coll:String} AND base={base:String}";
+    let sql = "ALTER TABLE nidhogg.entidade DELETE \
+               WHERE collection={coll:String} AND base={base:String} AND tipo != 'mencao'";
     let out = Command::new("curl")
         .args(["-s", "-m", "30", &full, "--data-binary", sql])
         .output()
@@ -421,7 +487,7 @@ pub fn ensure_template_schema(url: &str) -> Result<(), String> {
 /// o L0 lê pra decidir se um tipo já tem molde e aplicá-lo.
 pub fn get_templates(url: &str) -> Result<Value, String> {
     let body = ch_exec(url,
-        "SELECT tipo, schema, regras, cobertura, version FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
+        "SELECT tipo, schema, regras, cobertura, origem, created_at, version FROM nidhogg.template FINAL FORMAT JSONEachRow", 15)?;
     let mut map = serde_json::Map::new();
     for line in body.lines() {
         if line.trim().is_empty() { continue; }
@@ -429,7 +495,8 @@ pub fn get_templates(url: &str) -> Result<Value, String> {
         let tipo = match v["tipo"].as_str() { Some(t) if !t.is_empty() => t.to_string(), _ => continue };
         let schema = serde_json::from_str::<Value>(v["schema"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
         let regras = serde_json::from_str::<Value>(v["regras"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([]));
-        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"], "version": v["version"]}));
+        map.insert(tipo, json!({"schema": schema, "regras": regras, "cobertura": v["cobertura"],
+                                "origem": v["origem"], "created_at": v["created_at"], "version": v["version"]}));
     }
     Ok(Value::Object(map))
 }
@@ -466,7 +533,7 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
     }
     // candidatos: documento OU (tabela com csv=0)
     let body = ch_exec(url,
-        "SELECT collection, name, natureza, tipo, csv FROM nidhogg.doc_class FINAL \
+        "SELECT collection, name, natureza, tipo, forma, csv FROM nidhogg.doc_class FINAL \
          WHERE natureza='documento' OR (natureza='tabela' AND csv=0) FORMAT JSONEachRow", 20)?;
     let mut lista: Vec<Value> = vec![];
     for l in body.lines() {
@@ -476,11 +543,15 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
         let name = v["name"].as_str().unwrap_or("");
         let natureza = v["natureza"].as_str().unwrap_or("");
         let tipo = v["tipo"].as_str().unwrap_or("");
+        let forma = v["forma"].as_str().unwrap_or("");
         if name.is_empty() { continue; }
         let nqi = nqi_map.get(&(coll.to_string(), name.to_string())).copied();
+        // [FORMA] molde cobre o doc se existe pro tipo puro OU pra (tipo@forma)
+        let tem_molde = templates.get(tipo).is_some()
+            || (!forma.is_empty() && templates.get(&format!("{tipo}@{forma}")).is_some());
         let motivo = if natureza == "tabela" {
             "tabela não-CSV"
-        } else if templates.get(tipo).is_none() {
+        } else if !tem_molde {
             "sem molde"
         } else {
             match nqi {
@@ -501,4 +572,428 @@ pub fn rejeitados_summary(url: &str) -> Result<Value, String> {
         por_motivo.insert(m, json!(c));
     }
     Ok(json!({"count": lista.len(), "por_motivo": por_motivo, "rejeitados": lista}))
+}
+
+// ───────────────────────────── L2: KnowledgeTree (nós de VALOR) ─────────────────────────────
+// Modelo LINEAR: cada valor-entidade normalizado (CNPJ, nome…) é um NÓ; cada registro do dump
+// que o contém é uma PARTICIPAÇÃO. A "aresta" contrato↔comprovante é implícita via o nó — sem
+// explosão combinatória (40 comprovantes do mesmo CNPJ = 40 linhas, não C(41,2) arestas).
+
+pub struct NoValorRow {
+    pub collection: String,
+    pub valor_norm: String,  // chave de ligação (dígitos p/ CNPJ/CPF/ids; texto folded p/ nomes)
+    pub valor: String,       // forma de exibição (como apareceu no documento)
+    pub campo: String,       // de qual campo do registro veio (prov da ligação)
+    pub tipo: String,
+    pub base: String,
+    pub idx: u32,
+    pub nqi: f64,
+    pub version: u64,
+    pub linked_at: String,
+}
+
+pub fn ensure_no_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.no_valor (collection String, valor_norm String, \
+         valor String, campo String, tipo String, base String, idx UInt32, nqi Float64, \
+         version UInt64, linked_at String) ENGINE = ReplacingMergeTree(version) \
+         ORDER BY (collection, valor_norm, base, idx, campo)", 20)?;
+    Ok(())
+}
+
+/// Dump atual de UMA coleção (a matéria-prima da ligação).
+pub fn entities_dump(url: &str, coll: &str) -> Result<Vec<Value>, String> {
+    let body = ch_query_param(url,
+        "SELECT base, tipo, idx, dado, nqi FROM nidhogg.entidade_atual WHERE collection={coll:String} FORMAT JSONEachRow",
+        &[("coll", coll)], 30)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+/// Fingerprint do dump (max version) — o checkpoint incremental do L2: religa só quando mudou.
+pub fn max_entity_version(url: &str, coll: &str) -> Result<u64, String> {
+    let body = ch_query_param(url,
+        "SELECT max(version) FROM nidhogg.entidade_atual WHERE collection={coll:String} FORMAT TabSeparated",
+        &[("coll", coll)], 15)?;
+    Ok(body.trim().parse().unwrap_or(0))
+}
+
+/// Limpa os nós de UMA coleção antes do re-link (senão chaves antigas viram fantasmas —
+/// a régua de normalização pode mudar entre versões). Tabela pequena; mutation síncrona.
+pub fn clear_nos(url: &str, coll: &str) -> Result<(), String> {
+    let esc = coll.replace('\'', "''");
+    ch_exec(url, &format!(
+        "ALTER TABLE nidhogg.no_valor DELETE WHERE collection='{esc}' SETTINGS mutations_sync=1"), 60)?;
+    Ok(())
+}
+
+pub fn insert_nos(url: &str, rows: &[NoValorRow]) -> Result<(), String> {
+    if rows.is_empty() { return Ok(()); }
+    let mut ndjson = String::new();
+    for r in rows {
+        ndjson.push_str(&json!({
+            "collection": r.collection, "valor_norm": r.valor_norm, "valor": r.valor,
+            "campo": r.campo, "tipo": r.tipo, "base": r.base, "idx": r.idx,
+            "nqi": r.nqi, "version": r.version, "linked_at": r.linked_at,
+        }).to_string());
+        ndjson.push('\n');
+    }
+    ch_insert(url, "nidhogg.no_valor", &ndjson, 30)
+}
+
+/// A ÁRVORE: assuntos (nós com ≥2 participações) → ramos por tipo → registros.
+/// `q` filtra por substring do valor (a busca de assunto da tela).
+/// [Think Navigator] Sugestões LEVES: só (valor, norm, contagens) casando o prefixo —
+/// sem ramos nem co-ocorrência. coll="*" = TODAS as coleções (coleção é FILTRO, não jaula:
+/// o mesmo assunto em coleções diferentes agrega — o pensamento não respeita fronteira).
+pub fn suggest_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" {
+        ("", vec![("q", q)])
+    } else {
+        (" AND collection={coll:String}", vec![("q", q), ("coll", coll)])
+    };
+    let body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nb \
+         FROM nidhogg.no_valor FINAL \
+         WHERE positionCaseInsensitive(valor, {{q:String}}) > 0{wc} \
+         GROUP BY valor_norm ORDER BY nb DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &params, 20)?;
+    let nodes: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|t| json!({"valor": t["v"], "valor_norm": t["valor_norm"], "registros": t["regs"], "bases": t["nb"]}))
+        .collect();
+    Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
+}
+
+pub fn tree_json(url: &str, coll: &str, q: &str, limit: usize) -> Result<Value, String> {
+    let filter_q = if q.is_empty() { String::new() }
+                   else { " AND positionCaseInsensitive(valor, {q:String}) > 0".to_string() };
+    let mut params: Vec<(&str, &str)> = vec![("coll", coll)];
+    if !q.is_empty() { params.push(("q", q)); }
+    // alias v (NÃO "valor"): o CH resolveria o filtro do WHERE pro agregado any() e
+    // explodiria com ILLEGAL_AGGREGATION quando ?q= entra.
+    // Gate ≥2 SÓ na árvore espontânea: busca explícita mostra tudo que casa (Gandalf vive
+    // numa base só — a trilogia é UM arquivo — e sumia da busca com o gate).
+    let having = if q.is_empty() { "HAVING regs >= 2" } else { "" };
+    let tops_body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nbases \
+         FROM nidhogg.no_valor FINAL WHERE collection={{coll:String}}{filter_q} \
+         GROUP BY valor_norm {having} \
+         ORDER BY nbases DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow"), &params, 20)?;
+    let tops: Vec<Value> = tops_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if tops.is_empty() { return Ok(json!({"collection": coll, "nodes": []})); }
+
+    // participações dos nós do topo (IN com escape de aspas)
+    let in_list: Vec<String> = tops.iter()
+        .filter_map(|t| t["valor_norm"].as_str())
+        .map(|s| format!("'{}'", s.replace('\'', "''"))).collect();
+    let det_body = ch_query_param(url, &format!(
+        "SELECT valor_norm, campo, tipo, base, idx, nqi FROM nidhogg.no_valor FINAL \
+         WHERE collection={{coll:String}} AND valor_norm IN ({}) \
+         ORDER BY tipo, base, idx FORMAT JSONEachRow", in_list.join(",")),
+        &[("coll", coll)], 20)?;
+    let mut membros: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for l in det_body.lines() {
+        if l.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            if let Some(n) = v["valor_norm"].as_str() {
+                membros.entry(n.to_string()).or_default().push(v);
+            }
+        }
+    }
+    // CO-OCORRÊNCIA: assuntos que aparecem NO MESMO registro dos assuntos do topo — é a
+    // profundidade da árvore (EssenciaViva → seus favorecidos; Frodo → Sam/Gandalf).
+    // O DISTINCT do WITH mata a inflação de contagem por versões do ReplacingMergeTree.
+    // menções co-ocorrem POR BASE (Frodo↔Gandalf = mesmo livro); registros estruturados
+    // co-ocorrem POR REGISTRO (pagador↔favorecido = mesmo comprovante) — CSV por base viraria
+    // ruído (400 consultores todos "ligados").
+    let co_body = ch_query_param(url, &format!(
+        "WITH p AS (SELECT DISTINCT valor_norm, valor, tipo, base, idx FROM nidhogg.no_valor FINAL \
+                    WHERE collection={{coll:String}}) \
+         SELECT a.valor_norm pai, b.valor_norm filho, any(b.valor) v, count() n \
+         FROM p a INNER JOIN p b ON a.base=b.base AND a.idx=b.idx \
+         WHERE a.valor_norm IN ({}) AND b.valor_norm != a.valor_norm \
+         GROUP BY pai, filho ORDER BY n DESC LIMIT 800 FORMAT JSONEachRow", in_list.join(",")),
+        &[("coll", coll)], 25).unwrap_or_default();
+    let mut co_map: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for l in co_body.lines() {
+        if l.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(l) {
+            if let Some(p) = v["pai"].as_str() {
+                let e = co_map.entry(p.to_string()).or_default();
+                if e.len() < 10 {
+                    e.push(json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"]}));
+                }
+            }
+        }
+    }
+    let nodes: Vec<Value> = tops.iter().map(|t| {
+        let norm = t["valor_norm"].as_str().unwrap_or("");
+        // ramos por TIPO (contrato / cadastro / comprovante…)
+        let mut ramos: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+        for m in membros.get(norm).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let tipo = m["tipo"].as_str().unwrap_or("?").to_string();
+            ramos.entry(tipo).or_default().push(json!({
+                "base": m["base"], "campo": m["campo"], "idx": m["idx"], "nqi": m["nqi"],
+            }));
+        }
+        json!({
+            "valor": t["v"], "valor_norm": norm,
+            "registros": t["regs"], "bases": t["nbases"],
+            "ramos": ramos.into_iter().map(|(tipo, itens)| json!({"tipo": tipo, "n": itens.len(), "itens": itens})).collect::<Vec<_>>(),
+            "co": co_map.get(norm).cloned().unwrap_or_default(),
+        })
+    }).collect();
+    Ok(json!({"collection": coll, "count": nodes.len(), "nodes": nodes}))
+}
+
+/// [Think Navigator] Um NÓ e seus relacionados — a expansão infinita do mindmap.
+/// Regras de co-ocorrência: registro estruturado liga por (base,idx); menção liga por base.
+/// coll="*" = TODAS as coleções (o JOIN inclui collection: base homônima entre coleções
+/// distintas NÃO se liga por engano).
+pub fn node_json(url: &str, coll: &str, norm: &str, limit: usize) -> Result<Value, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" {
+        ("", vec![("norm", norm)])
+    } else {
+        (" AND collection={coll:String}", vec![("norm", norm), ("coll", coll)])
+    };
+    let stats = ch_query_param(url, &format!(
+        "SELECT any(valor) v, count() regs, uniqExact(base) nb FROM nidhogg.no_valor FINAL \
+         WHERE valor_norm={{norm:String}}{wc} FORMAT JSONEachRow"), &params, 20)?;
+    let st: Value = stats.lines().next().and_then(|l| serde_json::from_str(l).ok()).unwrap_or(json!({}));
+    if st["regs"].as_str().map(|s| s == "0").unwrap_or(st["regs"].as_i64() == Some(0)) {
+        return Ok(json!({"valor_norm": norm, "found": false, "co": []}));
+    }
+    let wc_p = if coll == "*" { "" } else { " WHERE collection={coll:String}" };
+    let co_body = ch_query_param(url, &format!(
+        "WITH p AS (SELECT DISTINCT collection, valor_norm, valor, tipo, base, idx \
+                    FROM nidhogg.no_valor FINAL{wc_p}) \
+         SELECT b.valor_norm filho, any(b.valor) v, count() n, uniqExact(b.base) nb \
+         FROM p a INNER JOIN p b ON a.collection=b.collection AND a.base=b.base AND a.idx=b.idx \
+         WHERE a.valor_norm={{norm:String}} AND b.valor_norm != a.valor_norm \
+         GROUP BY filho ORDER BY n DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &params, 30)?;
+    let co: Vec<Value> = co_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| json!({"valor": v["v"], "valor_norm": v["filho"], "n": v["n"], "bases": v["nb"]}))
+        .collect();
+    // facetas: em que TIPOS e por quais CAMPOS este valor vive no sistema — a cadeia
+    // "clicou no CNPJ → os tipos de relação que ele abre" do cadastro de dimensões
+    let fac_body = ch_query_param(url, &format!(
+        "SELECT tipo, campo, count() n, uniqExact(base) nb FROM nidhogg.no_valor FINAL \
+         WHERE valor_norm={{norm:String}}{wc} GROUP BY tipo, campo \
+         ORDER BY n DESC LIMIT 30 FORMAT JSONEachRow"), &params, 20).unwrap_or_default();
+    let facetas: Vec<Value> = fac_body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| json!({"tipo": v["tipo"], "campo": v["campo"], "n": v["n"], "bases": v["nb"]}))
+        .collect();
+    Ok(json!({
+        "found": true, "valor": st["v"], "valor_norm": norm,
+        "registros": st["regs"], "bases": st["nb"], "co": co, "facetas": facetas,
+    }))
+}
+
+// ───────────────────────── Dimensões (a ponte L2→L3) ─────────────────────────
+// Dimensão = EIXO DECLARADO de navegação/exigência: um conjunto de padrões de CAMPO
+// (*_cnpj, mencao…) e opcionalmente de TIPOS. O humano declara o que importa; a navegação
+// pivota por ela; e onde o corpus não a entrega vira GAP (demanda de mastigação → L3).
+// Blob versionado como o doctype: 1 linha = a lista inteira (falha de escrita nunca zera).
+
+pub fn ensure_dimensao_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.dimensao (version UInt64, dimensoes String) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
+    Ok(())
+}
+
+pub fn dimensoes(url: &str) -> Result<Value, String> {
+    ensure_dimensao_schema(url)?;
+    let body = ch_exec(url,
+        "SELECT dimensoes FROM nidhogg.dimensao FINAL ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow", 10)?;
+    let line = body.lines().next().unwrap_or("{}");
+    let v: Value = serde_json::from_str(line).unwrap_or_else(|_| json!({}));
+    Ok(serde_json::from_str(v["dimensoes"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([])))
+}
+
+pub fn write_dimensoes(url: &str, dims: &Value) -> Result<(), String> {
+    ensure_dimensao_schema(url)?;
+    let row = json!({"version": now_version(), "dimensoes": dims.to_string()});
+    ch_insert(url, "nidhogg.dimensao", &row.to_string(), 15)
+}
+
+/// Padrão de campo → SQL LIKE seguro: só [a-z0-9_*.-]; `*`→`%`; `_` literal escapado.
+/// ClickHouse escapa LIKE com backslash (sem cláusula ESCAPE); no literal SQL vai dobrado.
+fn padrao_like(p: &str) -> Option<String> {
+    if p.is_empty() || !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '*' | '.' | '-')) {
+        return None;
+    }
+    Some(p.replace('_', "\\\\_").replace('*', "%"))
+}
+
+/// Valores de uma dimensão: agrega no_valor pelos campos que casam os padrões.
+pub fn dimensao_valores(url: &str, coll: &str, padroes: &[String], q: &str, limit: usize) -> Result<Value, String> {
+    let likes: Vec<String> = padroes.iter().filter_map(|p| padrao_like(p))
+        .map(|l| format!("campo LIKE '{}'", l.replace('\'', ""))).collect();
+    if likes.is_empty() { return Ok(json!({"count": 0, "valores": []})); }
+    let mut conds = vec![format!("({})", likes.join(" OR "))];
+    let mut params: Vec<(&str, &str)> = vec![];
+    if coll != "*" { conds.push("collection={coll:String}".into()); params.push(("coll", coll)); }
+    if !q.is_empty() { conds.push("positionCaseInsensitive(valor, {q:String}) > 0".into()); params.push(("q", q)); }
+    let body = ch_query_param(url, &format!(
+        "SELECT valor_norm, any(valor) v, count() regs, uniqExact(base) nb, uniqExact(tipo) nt \
+         FROM nidhogg.no_valor FINAL WHERE {} \
+         GROUP BY valor_norm ORDER BY nb DESC, regs DESC LIMIT {limit} FORMAT JSONEachRow",
+        conds.join(" AND ")), &params, 25)?;
+    let valores: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|t| json!({"valor": t["v"], "valor_norm": t["valor_norm"],
+                        "registros": t["regs"], "bases": t["nb"], "tipos": t["nt"]}))
+        .collect();
+    Ok(json!({"count": valores.len(), "valores": valores}))
+}
+
+// ───────────────────── L4 · Perguntas & Respostas (a camada propositiva) ─────────────────────
+// A PERGUNTA é cadastro (blob versionado, como doctype/dimensão): o humano declara a questão
+// direta e o tipo de resposta. A RESPOSTA é uma linha por ETAPA da timeline — o worm re-responde
+// todo ciclo, mas só materializa etapa quando a perspectiva MUDOU (decisão do Pacman 13/ago):
+// a linha do tempo é o histórico de mudanças de entendimento, não de repetições.
+
+pub fn ensure_pergunta_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.pergunta (version UInt64, perguntas String) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.resposta (pergunta String, version UInt64, seq UInt32, \
+         tipo String, resposta String, mudou String, fontes String, proximas String, \
+         ctx_hash String, ms UInt64, at String) \
+         ENGINE=MergeTree ORDER BY (pergunta, version)", 15)?;
+    Ok(())
+}
+
+pub fn perguntas(url: &str) -> Result<Value, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_exec(url,
+        "SELECT perguntas FROM nidhogg.pergunta FINAL ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow", 10)?;
+    let line = body.lines().next().unwrap_or("{}");
+    let v: Value = serde_json::from_str(line).unwrap_or_else(|_| json!({}));
+    Ok(serde_json::from_str(v["perguntas"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([])))
+}
+
+pub fn write_perguntas(url: &str, ps: &Value) -> Result<(), String> {
+    ensure_pergunta_schema(url)?;
+    let row = json!({"version": now_version(), "perguntas": ps.to_string()});
+    ch_insert(url, "nidhogg.pergunta", &row.to_string(), 15)
+}
+
+pub struct RespostaRow {
+    pub pergunta: String,
+    pub seq: u32,
+    pub tipo: String,
+    pub resposta: String,   // texto (vivo/oneshot) ou JSON da tabela (tabular)
+    pub mudou: String,      // o QUE mudou vs a etapa anterior ("" na primeira)
+    pub fontes: String,     // JSON array [{base, idx}]
+    pub proximas: String,   // JSON array de dimensões/perguntas não exploradas
+    pub ctx_hash: String,
+    pub ms: u64,
+    pub at: String,
+}
+
+pub fn insert_resposta(url: &str, r: &RespostaRow) -> Result<(), String> {
+    ensure_pergunta_schema(url)?;
+    let row = json!({
+        "pergunta": r.pergunta, "version": now_version(), "seq": r.seq, "tipo": r.tipo,
+        "resposta": r.resposta, "mudou": r.mudou, "fontes": r.fontes, "proximas": r.proximas,
+        "ctx_hash": r.ctx_hash, "ms": r.ms, "at": r.at,
+    });
+    ch_insert(url, "nidhogg.resposta", &row.to_string(), 20)
+}
+
+/// A etapa mais recente de uma pergunta (a "cabeça" da timeline) — é contra ela que o
+/// comparador decide se a resposta do ciclo atual mudou a perspectiva.
+pub fn ultima_resposta(url: &str, pergunta: &str) -> Result<Option<Value>, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_query_param(url,
+        "SELECT seq, tipo, resposta, mudou, fontes, proximas, ctx_hash, at \
+         FROM nidhogg.resposta WHERE pergunta={p:String} ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow",
+        &[("p", pergunta)], 10)?;
+    Ok(body.lines().next().and_then(|l| serde_json::from_str::<Value>(l).ok()))
+}
+
+/// A timeline inteira de uma pergunta (etapas em ordem cronológica).
+pub fn timeline(url: &str, pergunta: &str, limit: usize) -> Result<Value, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_query_param(url, &format!(
+        "SELECT seq, tipo, resposta, mudou, fontes, proximas, ms, at FROM nidhogg.resposta \
+         WHERE pergunta={{p:String}} ORDER BY version DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &[("p", pergunta)], 15)?;
+    let mut etapas: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| {
+            // fontes/proximas são opcionais no structured output: quando o modelo omite, o
+            // campo vira "null" no disco. A UI itera esses arrays — devolver null derruba a
+            // tela. Normaliza SEMPRE para array (vale também pras linhas já gravadas).
+            let parse = |k: &str| {
+                let p = v[k].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+                match p { Some(x) if x.is_array() => x, _ => json!([]) }
+            };
+            json!({"seq": v["seq"], "tipo": v["tipo"], "resposta": v["resposta"], "mudou": v["mudou"],
+                   "fontes": parse("fontes"), "proximas": parse("proximas"), "ms": v["ms"], "at": v["at"]})
+        }).collect();
+    etapas.reverse();   // cronológica: a primeira etapa em cima, a cabeça embaixo
+    Ok(json!({"pergunta": pergunta, "count": etapas.len(), "etapas": etapas}))
+}
+
+/// Amostra do dump no escopo — a parte DETERMINÍSTICA do contexto que vai ao LLM da L4.
+/// Registros crus (dado JSON) com tipo/base, os mais recentes primeiro.
+pub fn registros_escopo(url: &str, coll: &str, limit: usize) -> Result<Vec<Value>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" AND collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT base, tipo, idx, dado FROM nidhogg.entidade_atual \
+         WHERE tipo NOT IN ('mencao','relacao'){wc} \
+         ORDER BY extracted_at DESC, base, idx LIMIT {limit} FORMAT JSONEachRow"), &params, 25)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect())
+}
+
+/// Os pares (base, valor_norm) que o CENSO determinístico confirmou como menção — a ÂNCORA.
+/// Quem lê relação como CONHECIMENTO (o grafo e o L4) filtra por aqui; quem lê como registro
+/// bruto (a tela do L3) vê tudo.
+pub fn mencoes_ancora(url: &str, coll: &str) -> Result<std::collections::HashSet<(String, String)>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" AND collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT DISTINCT base, valor_norm FROM nidhogg.no_valor FINAL \
+         WHERE campo='mencao'{wc} FORMAT JSONEachRow"), &params, 25)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["base"].as_str()?.to_string(), v["valor_norm"].as_str()?.to_string())))
+        .collect())
+}
+
+/// Fingerprint do conhecimento no escopo — muda quando entrou dado novo (dump ou grafo).
+/// É o `ctx_hash` que carimba cada etapa: dá pra ver se a resposta mudou por dado novo
+/// ou por variação do próprio modelo sobre o MESMO material.
+pub fn fingerprint_escopo(url: &str, coll: &str) -> Result<String, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" WHERE collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT count() c, max(version) v FROM nidhogg.entidade_atual{wc} FORMAT JSONEachRow"), &params, 15)?;
+    let v: Value = body.lines().next().and_then(|l| serde_json::from_str(l).ok()).unwrap_or(json!({}));
+    let g = |k: &str| v[k].as_u64().or_else(|| v[k].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+    Ok(format!("{}-{}", g("c"), g("v")))
+}
+
+/// Pares (tipo, campo) presentes no grafo — matéria-prima do cálculo de GAPS (feito em Rust,
+/// onde os padrões casam sem risco de SQL).
+pub fn tipos_campos(url: &str, coll: &str) -> Result<Vec<(String, String)>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" WHERE collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT DISTINCT tipo, campo FROM nidhogg.no_valor FINAL{wc} FORMAT JSONEachRow"), &params, 20)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["tipo"].as_str()?.to_string(), v["campo"].as_str()?.to_string())))
+        .collect())
 }

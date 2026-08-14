@@ -10,6 +10,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"] }
 regex = "1"   # Fase 3: aplica os moldes de extração (regex ancorado no rótulo) determinístico no L0
+unicode-normalization = "0.1"   # NFC nos nomes de base/coleção (mesmo fix do ragd — NFD do macOS duplicava)
 
 [[bin]]
 name = "nidhoggd"
