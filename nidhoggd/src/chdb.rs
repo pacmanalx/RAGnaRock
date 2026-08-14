@@ -853,6 +853,117 @@ pub fn dimensao_valores(url: &str, coll: &str, padroes: &[String], q: &str, limi
     Ok(json!({"count": valores.len(), "valores": valores}))
 }
 
+// ───────────────────── L4 · Perguntas & Respostas (a camada propositiva) ─────────────────────
+// A PERGUNTA é cadastro (blob versionado, como doctype/dimensão): o humano declara a questão
+// direta e o tipo de resposta. A RESPOSTA é uma linha por ETAPA da timeline — o worm re-responde
+// todo ciclo, mas só materializa etapa quando a perspectiva MUDOU (decisão do Pacman 13/ago):
+// a linha do tempo é o histórico de mudanças de entendimento, não de repetições.
+
+pub fn ensure_pergunta_schema(url: &str) -> Result<(), String> {
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.pergunta (version UInt64, perguntas String) \
+         ENGINE=ReplacingMergeTree(version) ORDER BY tuple()", 15)?;
+    ch_exec(url,
+        "CREATE TABLE IF NOT EXISTS nidhogg.resposta (pergunta String, version UInt64, seq UInt32, \
+         tipo String, resposta String, mudou String, fontes String, proximas String, \
+         ctx_hash String, ms UInt64, at String) \
+         ENGINE=MergeTree ORDER BY (pergunta, version)", 15)?;
+    Ok(())
+}
+
+pub fn perguntas(url: &str) -> Result<Value, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_exec(url,
+        "SELECT perguntas FROM nidhogg.pergunta FINAL ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow", 10)?;
+    let line = body.lines().next().unwrap_or("{}");
+    let v: Value = serde_json::from_str(line).unwrap_or_else(|_| json!({}));
+    Ok(serde_json::from_str(v["perguntas"].as_str().unwrap_or("[]")).unwrap_or_else(|_| json!([])))
+}
+
+pub fn write_perguntas(url: &str, ps: &Value) -> Result<(), String> {
+    ensure_pergunta_schema(url)?;
+    let row = json!({"version": now_version(), "perguntas": ps.to_string()});
+    ch_insert(url, "nidhogg.pergunta", &row.to_string(), 15)
+}
+
+pub struct RespostaRow {
+    pub pergunta: String,
+    pub seq: u32,
+    pub tipo: String,
+    pub resposta: String,   // texto (vivo/oneshot) ou JSON da tabela (tabular)
+    pub mudou: String,      // o QUE mudou vs a etapa anterior ("" na primeira)
+    pub fontes: String,     // JSON array [{base, idx}]
+    pub proximas: String,   // JSON array de dimensões/perguntas não exploradas
+    pub ctx_hash: String,
+    pub ms: u64,
+    pub at: String,
+}
+
+pub fn insert_resposta(url: &str, r: &RespostaRow) -> Result<(), String> {
+    ensure_pergunta_schema(url)?;
+    let row = json!({
+        "pergunta": r.pergunta, "version": now_version(), "seq": r.seq, "tipo": r.tipo,
+        "resposta": r.resposta, "mudou": r.mudou, "fontes": r.fontes, "proximas": r.proximas,
+        "ctx_hash": r.ctx_hash, "ms": r.ms, "at": r.at,
+    });
+    ch_insert(url, "nidhogg.resposta", &row.to_string(), 20)
+}
+
+/// A etapa mais recente de uma pergunta (a "cabeça" da timeline) — é contra ela que o
+/// comparador decide se a resposta do ciclo atual mudou a perspectiva.
+pub fn ultima_resposta(url: &str, pergunta: &str) -> Result<Option<Value>, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_query_param(url,
+        "SELECT seq, tipo, resposta, mudou, fontes, proximas, ctx_hash, at \
+         FROM nidhogg.resposta WHERE pergunta={p:String} ORDER BY version DESC LIMIT 1 FORMAT JSONEachRow",
+        &[("p", pergunta)], 10)?;
+    Ok(body.lines().next().and_then(|l| serde_json::from_str::<Value>(l).ok()))
+}
+
+/// A timeline inteira de uma pergunta (etapas em ordem cronológica).
+pub fn timeline(url: &str, pergunta: &str, limit: usize) -> Result<Value, String> {
+    ensure_pergunta_schema(url)?;
+    let body = ch_query_param(url, &format!(
+        "SELECT seq, tipo, resposta, mudou, fontes, proximas, ms, at FROM nidhogg.resposta \
+         WHERE pergunta={{p:String}} ORDER BY version DESC LIMIT {limit} FORMAT JSONEachRow"),
+        &[("p", pergunta)], 15)?;
+    let mut etapas: Vec<Value> = body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| {
+            let parse = |k: &str| v[k].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!([]));
+            json!({"seq": v["seq"], "tipo": v["tipo"], "resposta": v["resposta"], "mudou": v["mudou"],
+                   "fontes": parse("fontes"), "proximas": parse("proximas"), "ms": v["ms"], "at": v["at"]})
+        }).collect();
+    etapas.reverse();   // cronológica: a primeira etapa em cima, a cabeça embaixo
+    Ok(json!({"pergunta": pergunta, "count": etapas.len(), "etapas": etapas}))
+}
+
+/// Amostra do dump no escopo — a parte DETERMINÍSTICA do contexto que vai ao LLM da L4.
+/// Registros crus (dado JSON) com tipo/base, os mais recentes primeiro.
+pub fn registros_escopo(url: &str, coll: &str, limit: usize) -> Result<Vec<Value>, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" AND collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT base, tipo, idx, dado FROM nidhogg.entidade_atual \
+         WHERE tipo NOT IN ('mencao','relacao'){wc} \
+         ORDER BY extracted_at DESC, base, idx LIMIT {limit} FORMAT JSONEachRow"), &params, 25)?;
+    Ok(body.lines().filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect())
+}
+
+/// Fingerprint do conhecimento no escopo — muda quando entrou dado novo (dump ou grafo).
+/// É o `ctx_hash` que carimba cada etapa: dá pra ver se a resposta mudou por dado novo
+/// ou por variação do próprio modelo sobre o MESMO material.
+pub fn fingerprint_escopo(url: &str, coll: &str) -> Result<String, String> {
+    let (wc, params): (&str, Vec<(&str, &str)>) = if coll == "*" { ("", vec![]) }
+        else { (" WHERE collection={coll:String}", vec![("coll", coll)]) };
+    let body = ch_query_param(url, &format!(
+        "SELECT count() c, max(version) v FROM nidhogg.entidade_atual{wc} FORMAT JSONEachRow"), &params, 15)?;
+    let v: Value = body.lines().next().and_then(|l| serde_json::from_str(l).ok()).unwrap_or(json!({}));
+    let g = |k: &str| v[k].as_u64().or_else(|| v[k].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+    Ok(format!("{}-{}", g("c"), g("v")))
+}
+
 /// Pares (tipo, campo) presentes no grafo — matéria-prima do cálculo de GAPS (feito em Rust,
 /// onde os padrões casam sem risco de SQL).
 pub fn tipos_campos(url: &str, coll: &str) -> Result<Vec<(String, String)>, String> {

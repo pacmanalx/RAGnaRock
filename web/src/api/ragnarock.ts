@@ -7,7 +7,7 @@ import type {
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
   TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap, LlmLedgerResponse,
-  NidhoggRelacoes,
+  NidhoggRelacoes, Pergunta, TimelineResposta, RespondeuAgora,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -90,6 +90,16 @@ export const getNavNode = (collection: string, norm: string) =>
 export const getNidhoggRelacoes = (collection?: string, n = 300) =>
   nidhogg.get<NidhoggRelacoes>(
     `/api/nidhogg/relacoes?n=${n}${collection && collection !== '*' ? `&collection=${encodeURIComponent(collection)}` : ''}`)
+// ── [L4 · Perguntas] cadastro de questões diretas + timeline das respostas ──
+export const getPerguntas = () => nidhogg.get<{ perguntas: Pergunta[] }>('/api/nidhogg/perguntas')
+export const savePerguntas = (perguntas: Pergunta[]) =>
+  nidhogg.post<{ ok: boolean; perguntas: Pergunta[] }>('/api/nidhogg/perguntas', { perguntas })
+export const getTimeline = (pergunta: string) =>
+  nidhogg.get<TimelineResposta>(`/api/nidhogg/respostas?pergunta=${encodeURIComponent(pergunta)}`)
+// responde AGORA (não espera o ciclo) — LENTO: monta contexto, analista e comparador
+export const perguntarAgora = (pergunta: string) =>
+  nidhogg.post<RespondeuAgora>('/api/nidhogg/perguntar', { pergunta })
+
 // ── L4 · cockpit de destrave: re-tipar (origem=humano, sticky) + molde dirigido ──
 export const postReclass = (collection: string, base: string, tipo: string) =>
   nidhogg.post<{ ok: boolean; tipo: string; natureza: string; csv: boolean; extraivel: boolean; nota: string; purgadas: number }>(

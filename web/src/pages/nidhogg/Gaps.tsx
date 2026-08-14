@@ -8,6 +8,7 @@ import {
 import type { MoldeTemplate } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
+import { PerguntasPanel } from './Perguntas'
 
 // L4 · Gaps & Propostas — a casa da camada PROPOSITIVA (régua 13/ago: L3 = estrutural-LLM;
 // L4 = propõe sobre parâmetros do usuário, com recursão e pesquisa externa — o desenho dela
@@ -20,6 +21,32 @@ export type AcaoDirigido = { tipo: string; collection?: string; base?: string; i
 type AcaoRetipar = { collection: string; base: string; tipoAtual: string }
 
 export function NidhoggGaps() {
+  const [vista, setVista] = useState<'perguntas' | 'destrave'>('perguntas')
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-lg font-semibold">L4 · Propositivo</h1>
+        <span className="text-[12px] text-[var(--color-muted)]">
+          questões diretas respondidas sobre o conhecimento acumulado — determinístico no ponto de inferência
+        </span>
+        <div className="grow" />
+        <div className="flex gap-1 rounded-md border border-[var(--color-border)] p-0.5">
+          {([['perguntas', '❓ Perguntas'], ['destrave', '🚧 Destrave']] as const).map(([v, label]) => (
+            <button key={v} onClick={() => setVista(v)}
+              className={`rounded px-3 py-1 text-[12px] ${vista === v
+                ? 'bg-[var(--color-accent)] text-[var(--color-accent-fg)]'
+                : 'text-[var(--color-muted)] hover:text-[var(--color-fg)]'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {vista === 'perguntas' ? <PerguntasPanel /> : <DestravePanel />}
+    </div>
+  )
+}
+
+function DestravePanel() {
   const rej = useAsync(getNidhoggRejeitados, [])
   const tpls = useAsync(getNidhoggTemplates, [])
   const cls = useAsync(getNidhoggClasses, [])
@@ -41,9 +68,8 @@ export function NidhoggGaps() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-lg font-semibold">L4 · Gaps &amp; Propostas</h1>
         <span className="text-[12px] text-[var(--color-muted)]">
-          a camada propositiva (por vir) + o cockpit de destrave — onde a IA falhou e onde você a re-dirige
+          o cockpit de destrave — onde a IA falhou sozinha e onde você a re-dirige
         </span>
         <div className="grow" />
         <span className="rounded-full border border-[var(--color-border)] px-3 py-1 text-[12px] tabular-nums text-[var(--color-muted)]">
@@ -116,15 +142,14 @@ export function NidhoggGaps() {
         </div>
       </Panel>
 
-      {/* ── a camada propositiva (por vir) ── */}
-      <Panel title="💡 Perguntas não-perguntadas (propositivo)">
+      <Panel title="💡 De onde vem a proposta">
         <div className="flex items-start gap-2 text-[13px] text-[var(--color-muted)]">
           <Lightbulb size={15} className="mt-0.5 shrink-0 text-[var(--color-warn)]" />
           <div>
-            A camada que PROPÕE — "o CNPJ X aparece em 40 comprovantes mas não tem contrato no corpus;
-            falta o contrato ou falta ingerir?" — trabalha sobre <b>parâmetros que você declara</b>, com
-            recursão e pesquisa externa, aumentando o knowledge existente. Nasce em cima destas filas,
-            do grafo (L2 determinístico + L3 🧠) e dos gaps de dimensão (📐). Em desenho.
+            O destrave alimenta a vista <b>❓ Perguntas</b>: cada molde reprovado ou base mal classificada
+            é dado que a resposta não terá. Quando a IA responde uma questão, ela também aponta as
+            <b> dimensões não exploradas</b> — um clique desdobra em questão-filha, e é aí que a recursão
+            da camada propositiva acontece.
           </div>
         </div>
       </Panel>

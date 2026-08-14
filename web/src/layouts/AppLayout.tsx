@@ -28,7 +28,7 @@ const NAV: { section: string; items: Item[] }[] = [
     { to: '/nidhogg/summary', label: 'L1 · Summary', icon: ListTree },
     { to: '/nidhogg/tree', label: 'L2 · KnowledgeTree', icon: Network },
     { to: '/nidhogg/llm', label: 'L3 · Estrutural LLM', icon: Sparkles },
-    { to: '/nidhogg/gaps', label: 'L4 · Gaps & Propostas', icon: Lightbulb },
+    { to: '/nidhogg/gaps', label: 'L4 · Propositivo', icon: Lightbulb },
   ]},
   { section: 'Admin', items: [
     { to: '/admin/servicos', label: 'Serviços', icon: ServerCog },

@@ -48,7 +48,7 @@ fn levels_json() -> Value {
         {"n":1,"name":"consciente","ia":true,"desc":"1º nível com IA. Classifica cada documento em {natureza, tipo} por IA leve (vocabulário editável) e normaliza o dado — a camada de significado que vive no ClickHouse, aponta pro corpus e sobrevive à deleção da coleção."},
         {"n":2,"name":"estrutural","ia":false,"desc":"Grafa as relações DETERMINISTICAMENTE sobre o dado já normalizado — nós de valor, censo de menções, dimensões e co-ocorrência de cena. O grafo navegável do conhecimento, zero IA."},
         {"n":3,"name":"estrutural-llm","ia":true,"desc":"O MESMO que o L2, só que 100% LLM-bound: destila as relações que o determinístico não alcança — quem é o quê de quem, temas de cena — e grava no MESMO grafo, com selo de origem."},
-        {"n":4,"name":"propositivo","ia":true,"future":true,"desc":"A camada PROPOSITIVA (por vir): trabalha sobre parâmetros do usuário, com recursão, pesquisa externa e aumento do knowledge. Em desenho — não roda ainda."}
+        {"n":4,"name":"propositivo","ia":true,"desc":"A camada PROPOSITIVA: você cadastra QUESTÕES DIRETAS (\"quanto faturamos este mês?\", \"qual o ROI do contrato X?\") e o worm responde todo ciclo sobre o conhecimento acumulado. Determinística no ponto de inferência: o contexto é montado por regra, a resposta é do LLM. Cada mudança de perspectiva vira etapa na timeline."}
     ])
 }
 
@@ -91,9 +91,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "port"     => if let Ok(p) = v.parse() { cfg.port = p },
             "ragd_api" => cfg.ragd_api = v.to_string(),
             "nidhogg" | "on" => cfg.on = matches!(v, "true" | "1" | "yes" | "on"),
-            // .min(3): cfg antigo com "propositivo" (o ex-nível 3) migra pro teto vigente —
-            // L4 só existe como nome até a discussão de desenho
-            "level"    => cfg.level = level_num(v).min(3),
+            "level"    => cfg.level = level_num(v).min(4),
             "dir"      => cfg.dir = v.to_string(),
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
@@ -662,6 +660,214 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
     }
     if feitas > 0 { nlog(&format!("L3 {coll}: {feitas} base(s) mastigadas, {rel_total} relação(ões) destiladas")); }
     json!({"ok": true, "collection": coll, "bases": feitas, "relacoes": rel_total})
+}
+
+// ───────────────────── [L4] Perguntas & Respostas — a camada propositiva ─────────────────────
+// Doutrina do Pacman (13/ago): "L4 é determinística DO PONTO DE INFERÊNCIA". O humano cadastra
+// a QUESTÃO DIRETA; o sistema monta o contexto por REGRA (agregados do dump + registros +
+// trechos do corpus pelo RAG) e o LLM responde. Três tipos de resposta:
+//   • tabular  — a resposta é uma TABELA cumulativa sobre o dump (colunas + linhas)
+//   • oneshot  — responde 1× e congela (fato que não muda)
+//   • vivo     — re-responde TODO ciclo; um comparador decide se a perspectiva MUDOU e só
+//                então materializa nova ETAPA. A timeline é o histórico de mudanças de
+//                entendimento — a mesma pergunta sob a perspectiva de cada ciclo.
+const L4_CTX_MAX_CHARS: usize = 14_000;   // teto do contexto (a mesma disciplina do modelador)
+const L4_REGISTROS: usize = 150;          // registros do dump na amostra determinística
+const L4_TRECHOS: usize = 6;              // trechos do corpus trazidos pelo RAG
+
+/// Monta o CONTEXTO — a metade determinística da L4. Nada aqui é decidido por IA: agregados
+/// do dump, amostra de registros e os trechos que o RAGnaRock casa com a pergunta.
+fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, String) {
+    let mut ctx = String::new();
+    // 1) o mapa do conhecimento no escopo (o que existe, por tipo)
+    // o ClickHouse devolve contagem ora como número, ora como string (FORMAT JSON) — normaliza
+    let num = |v: &Value| -> String {
+        v.as_u64().map(|n| n.to_string())
+            .or_else(|| v.as_str().map(String::from))
+            .unwrap_or_else(|| "0".into())
+    };
+    if let Ok(sum) = chdb::entities_summary(ch_url, Some(coll), None) {
+        ctx.push_str("== O QUE O SISTEMA ACUMULOU (por tipo de registro) ==\n");
+        for t in sum["por_tipo"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            ctx.push_str(&format!("- tipo={} registros={} bases={} modo={}\n",
+                t["tipo"].as_str().unwrap_or("?"), num(&t["c"]),
+                num(&t["bases"]), t["modo"].as_str().unwrap_or("?")));
+        }
+    }
+    // 2) os registros crus (o dado que responde "quanto/quantos")
+    if let Ok(regs) = chdb::registros_escopo(ch_url, coll, L4_REGISTROS) {
+        ctx.push_str("\n== REGISTROS DO DUMP (dado extraído, o material da conta) ==\n");
+        for r in &regs {
+            if ctx.len() > L4_CTX_MAX_CHARS * 2 / 3 { break; }
+            ctx.push_str(&format!("[{} #{}] {} :: {}\n",
+                r["tipo"].as_str().unwrap_or("?"), r["idx"].as_u64().unwrap_or(0),
+                r["base"].as_str().unwrap_or(""), r["dado"].as_str().unwrap_or("{}")));
+        }
+    }
+    // 3) trechos do CORPUS pela busca do RAGnaRock — a ponte entre as duas metades do produto
+    let req = json!({"query": pergunta, "base": "*",
+                     "collection": if coll == "*" { Value::Null } else { json!(coll) },
+                     "k": L4_TRECHOS}).to_string();
+    if let Some(resp) = http_post_t(&format!("{api}/search"), &req, 30) {
+        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+            ctx.push_str("\n== TRECHOS DO CORPUS (busca do RAGnaRock pela pergunta) ==\n");
+            for h in v["hits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if ctx.len() > L4_CTX_MAX_CHARS { break; }
+                ctx.push_str(&format!("[{}/{} chunk {}] {}\n",
+                    h["base"].as_str().unwrap_or(""), h["collection"].as_str().unwrap_or(""),
+                    h["chunk"].as_u64().unwrap_or(0),
+                    h["snippet"].as_str().unwrap_or("").chars().take(700).collect::<String>()));
+            }
+        }
+    }
+    let ctx: String = ctx.chars().take(L4_CTX_MAX_CHARS).collect();
+    let fp = chdb::fingerprint_escopo(ch_url, coll).unwrap_or_default();
+    (ctx, fp)
+}
+
+/// Chama o analista (LLM) com a pergunta + contexto determinístico. `tabular` muda a forma da
+/// resposta (tabela em vez de texto). Devolve o JSON estruturado validado.
+fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo: &str, ctx: &str)
+    -> Result<Value, String> {
+    let sys = match lib["templates"]["analista"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_ANALISTA_PROMPT.to_string(),
+    };
+    let max_tokens = lib["templates"]["analista"]["max_tokens"].as_u64().unwrap_or(1500) as u32;
+    // structured output: tabular pede colunas+linhas; os demais, texto corrido
+    let resposta_schema = if tipo == "tabular" {
+        json!({"type": "object", "properties": {
+            "colunas": {"type": "array", "items": {"type": "string"}},
+            "linhas": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            "nota": {"type": "string"}}, "required": ["colunas", "linhas"]})
+    } else {
+        json!({"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]})
+    };
+    let schema = json!({"type": "object", "properties": {
+        "resposta": resposta_schema,
+        "fontes": {"type": "array", "items": {"type": "object", "properties": {
+            "base": {"type": "string"}, "trecho": {"type": "string"}}, "required": ["base"]}},
+        "proximas": {"type": "array", "items": {"type": "string"}}
+    }, "required": ["resposta"]});
+    let forma = if tipo == "tabular" {
+        "A resposta DEVE ser uma TABELA (colunas + linhas). Some/conte a partir dos REGISTROS DO DUMP."
+    } else {
+        "A resposta DEVE ser texto corrido, direto e curto (até 6 linhas)."
+    };
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!(
+                "PERGUNTA: {pergunta}\n\nFORMA DA RESPOSTA: {forma}\n\n{ctx}")}
+        ],
+        "temperature": 0, "max_tokens": max_tokens,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let resp = llm_post("analista", ctxlabel, llm_url, &body, 240).ok_or("sem resposta (analista)")?;
+    let rv: Value = serde_json::from_str(&resp).map_err(|_| "resposta não-JSON".to_string())?;
+    let content = rv["choices"][0]["message"]["content"].as_str().ok_or("sem content")?;
+    extract_json_object(content).ok_or_else(|| "resposta não é JSON válido".to_string())
+}
+
+/// O COMPARADOR — o coração da timeline (decisão do Pacman): responde-se todo ciclo, mas só
+/// vira ETAPA se a perspectiva mudou. Devolve Some(o que mudou) ou None (nada novo).
+fn l4_mudou(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, antes: &str, agora: &str)
+    -> Option<String> {
+    if antes.trim() == agora.trim() { return None; }        // idêntico: nem gasta LLM
+    let sys = match lib["templates"]["comparador"]["system"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => BUILTIN_COMPARADOR_PROMPT.to_string(),
+    };
+    let schema = json!({"type": "object", "properties": {
+        "mudou": {"type": "boolean"}, "o_que_mudou": {"type": "string"}}, "required": ["mudou"]});
+    let body = json!({
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": format!(
+                "PERGUNTA: {pergunta}\n\nRESPOSTA ANTERIOR:\n{antes}\n\nRESPOSTA DE AGORA:\n{agora}")}
+        ],
+        "temperature": 0, "max_tokens": 300,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
+    }).to_string();
+    let obj = llm_post("comparador", ctxlabel, llm_url, &body, 120)
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
+        .and_then(|c| extract_json_object(&c))?;
+    if obj["mudou"].as_bool() == Some(true) {
+        let o = obj["o_que_mudou"].as_str().unwrap_or("").trim();
+        Some(if o.is_empty() { "perspectiva mudou".to_string() } else { o.to_string() })
+    } else { None }
+}
+
+/// Responde UMA pergunta e materializa etapa se mudou. Usado pelo ciclo e pelo /perguntar.
+/// `forcar` grava a etapa mesmo sem mudança (o "responder agora" do operador).
+fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, forcar: bool) -> Value {
+    let nome = p["nome"].as_str().unwrap_or("").to_string();
+    let texto = p["texto"].as_str().unwrap_or("").to_string();
+    let tipo = p["tipo"].as_str().unwrap_or("vivo").to_string();
+    let coll = p["escopo"].as_str().unwrap_or("*").to_string();
+    if nome.is_empty() || texto.is_empty() { return json!({"ok": false, "error": "pergunta sem nome/texto"}); }
+    let anterior = chdb::ultima_resposta(ch_url, &nome).ok().flatten();
+    // ONESHOT: fato que não muda — responde 1× e congela (só o forçar re-abre)
+    if tipo == "oneshot" && anterior.is_some() && !forcar {
+        return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "note": "one-shot já respondida"});
+    }
+    let t0 = std::time::Instant::now();
+    let (ctx, fp) = l4_contexto(api, ch_url, &coll, &texto);
+    if ctx.trim().is_empty() { return json!({"ok": false, "pergunta": nome, "error": "contexto vazio (nada acumulado no escopo)"}); }
+    let ctxlabel = format!("L4 {nome} [{coll}]");
+    let obj = match l4_responder(llm_url, lib, &ctxlabel, &texto, &tipo, &ctx) {
+        Ok(o) => o,
+        Err(e) => { nlog(&format!("L4 {nome}: {e}")); return json!({"ok": false, "pergunta": nome, "error": e}); }
+    };
+    let ms = t0.elapsed().as_millis() as u64;
+    // normaliza a resposta pra texto comparável (tabela vira JSON estável)
+    let resposta_v = obj["resposta"].clone();
+    let resposta_s = if tipo == "tabular" { resposta_v.to_string() }
+                     else { resposta_v["texto"].as_str().unwrap_or("").trim().to_string() };
+    if resposta_s.is_empty() { return json!({"ok": false, "pergunta": nome, "error": "resposta vazia"}); }
+    let (seq_ant, texto_ant) = match &anterior {
+        Some(a) => (a["seq"].as_u64().unwrap_or(0) as u32, a["resposta"].as_str().unwrap_or("").to_string()),
+        None => (0, String::new()),
+    };
+    // primeira resposta SEMPRE vira etapa; depois, só quando o comparador diz que mudou
+    let mudou = if anterior.is_none() { Some("primeira resposta".to_string()) }
+                else if forcar { Some(l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s)
+                                        .unwrap_or_else(|| "resposta forçada pelo operador".to_string())) }
+                else { l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s) };
+    let mudou = match mudou {
+        Some(m) => m,
+        None => return json!({"ok": true, "pergunta": nome, "nova_etapa": false,
+                              "note": "mesma perspectiva — timeline inalterada", "ms": ms}),
+    };
+    let row = chdb::RespostaRow {
+        pergunta: nome.clone(), seq: seq_ant + 1, tipo: tipo.clone(),
+        resposta: resposta_s, mudou: mudou.clone(),
+        fontes: obj["fontes"].to_string(), proximas: obj["proximas"].to_string(),
+        ctx_hash: fp, ms, at: now_stamp(),
+    };
+    if let Err(e) = chdb::insert_resposta(ch_url, &row) {
+        return json!({"ok": false, "pergunta": nome, "error": format!("insert: {e}")});
+    }
+    nlog(&format!("L4 {nome}: etapa {} — {mudou}", seq_ant + 1));
+    json!({"ok": true, "pergunta": nome, "nova_etapa": true, "seq": seq_ant + 1, "mudou": mudou, "ms": ms})
+}
+
+/// O ciclo da L4: passa por TODAS as perguntas ativas (o cadastro é global, não por coleção).
+fn mine_respostas(api: &str, llm_url: &str, ch_url: &str, lib: &Value) -> Value {
+    let ps = match chdb::perguntas(ch_url) { Ok(p) => p, Err(e) => return json!({"ok": false, "error": e}) };
+    let lista = ps.as_array().cloned().unwrap_or_default();
+    let (mut respondidas, mut etapas) = (0usize, 0usize);
+    for p in &lista {
+        if p["ativa"].as_bool() == Some(false) { continue; }
+        let r = l4_processar(api, llm_url, ch_url, lib, p, false);
+        if r["ok"].as_bool() == Some(true) {
+            respondidas += 1;
+            if r["nova_etapa"].as_bool() == Some(true) { etapas += 1; }
+        }
+    }
+    if respondidas > 0 { nlog(&format!("L4: {respondidas} pergunta(s) respondida(s), {etapas} etapa(s) nova(s)")); }
+    json!({"ok": true, "perguntas": respondidas, "etapas": etapas})
 }
 
 /// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
@@ -1258,13 +1464,78 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("upsert: {e}")}).to_string()),
             }
         }
+        // ── [L4] cadastro de PERGUNTAS (blob versionado, como doctypes/dimensões) ──
+        (Method::Get, "/api/nidhogg/perguntas") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (200, json!({"perguntas": []}).to_string()); }
+            match chdb::perguntas(&ch_url) {
+                Ok(p) => (200, json!({"perguntas": p}).to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        (Method::Post, "/api/nidhogg/perguntas") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let ps = match v["perguntas"].as_array() { Some(a) => a.clone(), None => return (400, json!({"error":"falta 'perguntas' (array)"}).to_string()) };
+            // saneia: nome e texto obrigatórios; tipo dentro do vocabulário; escopo default '*'
+            let mut limpo: Vec<Value> = vec![];
+            for p in &ps {
+                let nome = p["nome"].as_str().unwrap_or("").trim().to_string();
+                let texto = p["texto"].as_str().unwrap_or("").trim().to_string();
+                if nome.is_empty() || texto.is_empty() { continue; }
+                let tipo = match p["tipo"].as_str().unwrap_or("vivo") {
+                    t @ ("tabular" | "oneshot" | "vivo") => t, _ => "vivo",
+                };
+                limpo.push(json!({
+                    "nome": nome, "texto": texto, "tipo": tipo,
+                    "escopo": nfc(p["escopo"].as_str().unwrap_or("*").trim()),
+                    "ativa": p["ativa"].as_bool().unwrap_or(true),
+                    "pai": p["pai"].as_str().unwrap_or(""),   // recursão declarada: filha de qual pergunta
+                }));
+            }
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"perguntas requerem clickhouse"}).to_string()); }
+            match chdb::write_perguntas(&ch_url, &json!(limpo)) {
+                Ok(_) => { nlog(&format!("L4: cadastro de perguntas atualizado ({} ativa(s))", limpo.len()));
+                           (200, json!({"ok": true, "perguntas": limpo}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [L4] a TIMELINE de uma pergunta — as etapas em ordem cronológica
+        (Method::Get, "/api/nidhogg/respostas") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            let p = query_param(query, "pergunta").map(|v| nfc(&pdec(&v))).unwrap_or_default();
+            if p.is_empty() { return (400, json!({"error":"falta ?pergunta="}).to_string()); }
+            if store != "clickhouse" { return (200, json!({"etapas": []}).to_string()); }
+            match chdb::timeline(&ch_url, &p, 100) {
+                Ok(v) => (200, v.to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // [L4] responde UMA pergunta AGORA (o operador não espera o ciclo). LENTO: contexto +
+        // analista + comparador. Grava etapa mesmo sem mudança (forcar=true) pra dar retorno visível.
+        (Method::Post, "/api/nidhogg/perguntar") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let nome = v["pergunta"].as_str().unwrap_or("").trim().to_string();
+            if nome.is_empty() { return (400, json!({"error":"falta 'pergunta' (o nome cadastrado)"}).to_string()); }
+            let (api, store, dir, llm_url, ch_url) = { let s = st.lock().unwrap();
+                (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.llm_url.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"L4 requer clickhouse"}).to_string()); }
+            let ps = chdb::perguntas(&ch_url).unwrap_or_else(|_| json!([]));
+            let p = match ps.as_array().and_then(|a| a.iter().find(|p| p["nome"].as_str() == Some(&nome))) {
+                Some(p) => p.clone(),
+                None => return (404, json!({"error": format!("pergunta '{nome}' não está no cadastro")}).to_string()),
+            };
+            let lib = read_prompts(&dir);
+            let r = l4_processar(&api, &llm_url, &ch_url, &lib, &p, true);
+            let code = if r["ok"].as_bool() == Some(true) { 200 } else { 502 };
+            (code, r.to_string())
+        }
         (Method::Post, "/api/nidhogg") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let mut s = st.lock().unwrap();
             if let Some(on) = v["on"].as_bool() { s.on = on; let p = s.cfg_path.clone(); set_cfg_key(&p, "nidhogg", if on {"true"} else {"false"}); }
             if let Some(lv) = v["level"].as_str().map(level_num).or_else(|| v["level"].as_u64().map(|n| n as u8)) {
-                // L4 (propositivo) é FUTURO — não selecionável até a discussão de desenho; teto no 3
-                let lv = lv.min(3); s.level = lv; let p = s.cfg_path.clone(); set_cfg_key(&p, "level", level_name(lv));
+                let lv = lv.min(4); s.level = lv; let p = s.cfg_path.clone(); set_cfg_key(&p, "level", level_name(lv));
             }
             if let Some(c) = v["cadence"].as_u64() { s.cadence = c.max(10); let p = s.cfg_path.clone(); set_cfg_key(&p, "cadence", &s.cadence.to_string()); }
             nlog(&format!("config: on={} nível={} cadência={}s", s.on, level_name(s.level), s.cadence));
@@ -1928,6 +2199,18 @@ fn ensure_prompt_templates(dir: &str) {
             "system": BUILTIN_FICHA_PROMPT, "updated": now_stamp(), "max_tokens": 1200 });
         changed = true;
     }
+    if !lib["templates"]["analista"].is_object() {
+        lib["templates"]["analista"] = json!({
+            "description": "L4: responde a questão direta cadastrada usando SÓ o contexto montado (agregados do dump + registros + trechos do corpus). Cita fontes e propõe dimensões não exploradas.",
+            "system": BUILTIN_ANALISTA_PROMPT, "updated": now_stamp(), "max_tokens": 1500 });
+        changed = true;
+    }
+    if !lib["templates"]["comparador"].is_object() {
+        lib["templates"]["comparador"] = json!({
+            "description": "L4: decide se a resposta deste ciclo MUDA A PERSPECTIVA da anterior — é o que faz a timeline registrar mudanças de entendimento, não repetições.",
+            "system": BUILTIN_COMPARADOR_PROMPT, "updated": now_stamp(), "max_tokens": 300 });
+        changed = true;
+    }
     if !lib["templates"]["relacoes"].is_object() {
         lib["templates"]["relacoes"] = json!({
             "description": "Relações estruturais (L3, 100% LLM): destila quem-é-o-quê-de-quem e o tema da cena nas janelas mais densas do censo. Editar re-mastiga (checkpoint por hash do prompt).",
@@ -1941,6 +2224,24 @@ const BUILTIN_FICHA_PROMPT: &str = "Você lê um TRECHO de uma obra narrativa em
 (personagens, pessoas, organizações, lugares importantes) que aparecem NESTE trecho. Responda APENAS com um array JSON; \
 cada elemento: {\"nome\": \"...\", \"atributos\": [\"característica citada no trecho\", ...], \"relacoes\": [\"nome de outra entidade ligada a esta no trecho\", ...]}. \
 Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidades → [].";
+
+// [L4] O analista: responde a questão direta SÓ com o que o contexto determinístico trouxe.
+// A regra do "não sei" é o que separa análise de invenção — e é o que torna a timeline
+// confiável (uma resposta que muda porque o dado chegou, não porque o modelo alucinou).
+const BUILTIN_ANALISTA_PROMPT: &str = "Você é o analista do RAGnaRock. Responde a PERGUNTA usando EXCLUSIVAMENTE o \
+CONTEXTO fornecido (agregados do dump, registros extraídos e trechos do corpus). Regras: (1) NUNCA invente número, nome ou fato \
+que não esteja no contexto — se o material não permite responder, diga exatamente o que falta; (2) quando somar ou contar, use os \
+REGISTROS DO DUMP e diga quantos registros entraram na conta; (3) cite as FONTES (base de onde veio cada afirmação); (4) em \
+\"proximas\", liste até 3 DIMENSÕES NÃO EXPLORADAS — ângulos que os dados permitem investigar e que esta resposta não cobriu. \
+Responda APENAS o JSON pedido, em português.";
+
+// [L4] O comparador: o guardião da timeline. Só uma MUDANÇA DE PERSPECTIVA vira etapa —
+// reformulação, sinônimo ou ordem diferente das mesmas frases NÃO conta.
+const BUILTIN_COMPARADOR_PROMPT: &str = "Você compara duas respostas para a MESMA pergunta, produzidas em ciclos diferentes. \
+Decida se a resposta de AGORA MUDA A PERSPECTIVA em relação à anterior. Mudança de perspectiva = número/fato diferente, conclusão \
+diferente, informação nova relevante, ou contradição. NÃO é mudança: reformulação, sinônimo, ordem das frases, detalhe irrelevante. \
+Responda APENAS JSON: {\"mudou\": true|false, \"o_que_mudou\": \"em uma frase, o que mudou (vazio se não mudou)\"}. Seja RIGOROSO: \
+na dúvida, mudou=false.";
 
 // [L3] O prompt do destilador de relações — a régua manda: MESMO objetivo do L2 (grafar
 // relações), mas 100% LLM. O trecho vem das cenas mais densas do censo (chunks onde mais
@@ -2437,6 +2738,13 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
             None => failed.push(coll.clone()),
         }
     }
+    // [L4] As perguntas cadastradas são GLOBAIS (cada uma declara seu próprio escopo), então
+    // rodam UMA vez por ciclo, fora do laço de coleções. Responde todas; só materializa etapa
+    // onde a perspectiva mudou.
+    let mut l4 = json!(null);
+    if level >= 4 && store == "clickhouse" {
+        l4 = mine_respostas(&api, &llm_url, &ch_url, &lib);
+    }
     // CacheDigest (#48): 3º pilar do nível 0, GLOBAL — UMA vez por ciclo, FORA do loop de
     // coleções (senão reescreveria N×). Cache vazio é válido; só não grava se o ragd caiu.
     let cache_queries = match mine_cachedigest(&api) {
@@ -2451,7 +2759,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
            "mined": mined, "skipped": skipped, "failed": failed,
-           "classified": classified, "extracted": extracted_ents,
+           "classified": classified, "extracted": extracted_ents, "l4": l4,
            "cache_digest_queries": if cache_queries == u64::MAX { Value::Null } else { json!(cache_queries) },
            "at": now_stamp()})
 }
@@ -2512,6 +2820,10 @@ rotas:
   GET  /api/nidhogg/collections     coleções do ragd + estado de digestão (liga/desliga por coleção)
   GET  /api/nidhogg/knowledge       conhecimento destilado (?collection=&type=&level=) — só leitura
   GET  /api/nidhogg/relacoes        relações destiladas pelo L3 (?collection=&n=) — só leitura
+  GET  /api/nidhogg/perguntas       cadastro de questões diretas do L4
+  POST /api/nidhogg/perguntas       {{\"perguntas\":[{{nome,texto,tipo:tabular|oneshot|vivo,escopo,ativa}}]}}
+  GET  /api/nidhogg/respostas       timeline de uma pergunta (?pergunta=nome)
+  POST /api/nidhogg/perguntar       {{\"pergunta\":\"nome\"}} responde AGORA (lento: analista + comparador)
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
   POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)

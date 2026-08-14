@@ -211,6 +211,38 @@ export interface RelacaoItem {
 }
 export interface NidhoggRelacoes { count: number; bases: number; relacoes: RelacaoItem[]; note?: string }
 
+// ── Nidhogg L4: perguntas cadastradas + timeline de respostas ──
+export type TipoResposta = 'tabular' | 'oneshot' | 'vivo'
+export interface Pergunta {
+  nome: string
+  texto: string
+  tipo: TipoResposta
+  escopo: string            // coleção ou '*'
+  ativa: boolean
+  pai?: string              // recursão declarada: filha de qual pergunta
+}
+export interface RespostaTabular { colunas: string[]; linhas: string[][]; nota?: string }
+export interface EtapaResposta {
+  seq: number | string
+  tipo: TipoResposta
+  resposta: string          // texto, ou JSON de RespostaTabular quando tipo=tabular
+  mudou: string             // o que mudou vs a etapa anterior
+  fontes: { base: string; trecho?: string }[]
+  proximas: string[]        // dimensões não exploradas propostas pela IA
+  ms: number | string
+  at: string
+}
+export interface TimelineResposta { pergunta: string; count: number; etapas: EtapaResposta[] }
+export interface RespondeuAgora {
+  ok: boolean
+  pergunta: string
+  nova_etapa: boolean
+  seq?: number
+  mudou?: string
+  note?: string
+  ms?: number
+}
+
 // ── Diário de mastigação do LLM (llm-ledger.jsonl do nidhoggd) ──
 export interface LlmLedgerEntry {
   ts: string
