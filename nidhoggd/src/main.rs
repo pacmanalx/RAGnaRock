@@ -450,8 +450,18 @@ fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
             i = j;
             // palavra única: rejeita se a forma minúscula domina (é palavra comum, não nome)
             if seq.len() == 1 {
-                let lf = lower_freq.get(&seq[0].to_lowercase()).copied().unwrap_or(0);
+                let low = seq[0].to_lowercase();
+                let lf = lower_freq.get(&low).copied().unwrap_or(0);
                 if lf >= 2 { continue; }
+                // [v10] VERBO capitalizado por POSIÇÃO (abre item de lista/frase). Caso real:
+                // "**Amplificar §3.7** — alavanca que o Arthur (CFO!) precisa" virou entidade,
+                // o L3 destilou "Arthur é CFO da Amplificar" e o L4 respondeu isso como fato.
+                // Infinitivo português (-ar/-er/-ir) que TAMBÉM aparece em minúscula no texto
+                // não é nome próprio. Piso de 1 só aqui: nome real (Xavier, Éder) nunca tem
+                // forma minúscula no corpo do texto; palavra comum inglesa (never, after) já
+                // cai no lf>=2 acima.
+                if lf >= 1 && low.chars().count() >= 5
+                    && (low.ends_with("ar") || low.ends_with("er") || low.ends_with("ir")) { continue; }
             }
             // poda ponto final de palavra NÃO-inicial ("Gandalf." → "Gandalf"; "G." fica)
             let nome = seq.iter().map(|w| {
@@ -473,7 +483,7 @@ fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
     // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
     // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
-    let ecfg = hash_hex("mencao|v9|lf-global|posicoes|miolo");
+    let ecfg = hash_hex("mencao|v10|verbo-infinitivo|lf-global|posicoes|miolo");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -710,7 +720,9 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
     if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 120) {
         let arr = rels["relacoes"].as_array().cloned().unwrap_or_default();
         if !arr.is_empty() {
-            ctx.push_str("\n== RELAÇÕES DESTILADAS (o que o sistema entendeu das cenas) ==\n");
+            // o rótulo carrega a hierarquia de confiança no PRÓPRIO contexto (não só no
+            // prompt): pista automática pode estar errada; o texto abaixo é que é prova.
+            ctx.push_str("\n== PISTAS: RELAÇÕES DESTILADAS AUTOMATICAMENTE (podem conter erro — direção A→B) ==\n");
             for r in &arr {
                 if ctx.len() > L4_CTX_MAX_CHARS * 5 / 6 { break; }
                 let d = &r["dado"];
@@ -728,7 +740,7 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
                      "k": L4_TRECHOS}).to_string();
     if let Some(resp) = http_post_t(&format!("{api}/search"), &req, 30) {
         if let Ok(v) = serde_json::from_str::<Value>(&resp) {
-            ctx.push_str("\n== TRECHOS DO CORPUS (busca do RAGnaRock pela pergunta) ==\n");
+            ctx.push_str("\n== PROVA: TRECHOS DO CORPUS (texto original — vence qualquer pista acima) ==\n");
             for h in v["hits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
                 if ctx.len() > L4_CTX_MAX_CHARS { break; }
                 // o snippet vem com os marcadores «» em volta de CADA sílaba casada
@@ -910,7 +922,22 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
     };
     let version = chdb::now_version();
     let at = now_stamp();
+    // [ÂNCORA do L3] O que o CENSO viu em cada base — os nomes que a contagem determinística
+    // confirma. As pontas das relações do LLM só viram NÓ se estiverem aqui: sem isso, frase
+    // solta no slot de entidade ("conduziu a mesa") criava vocabulário novo no grafo.
+    // A relação continua inteira no dump (a tela do L3 mostra tudo) — o que a âncora protege
+    // é o GRAFO, que é o que o Navigator e o L4 leem como conhecimento.
+    let mut confirmados: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for r in &regs {
+        if r["tipo"].as_str() != Some("mencao") { continue; }
+        let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+        let nome = dado.get("mencao").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if let Some(norm) = norm_valor("mencao", nome) {
+            confirmados.insert((r["base"].as_str().unwrap_or("").to_string(), norm));
+        }
+    }
     let mut rows: Vec<chdb::NoValorRow> = vec![];
+    let mut ancorados_fora = 0usize;
     for r in &regs {
         let dado: Value = serde_json::from_str(r["dado"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
         let obj = match dado.as_object() { Some(o) => o, None => continue };
@@ -944,6 +971,8 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
             for lado in ["a", "b"] {
                 let nome = obj.get(lado).and_then(|v| v.as_str()).unwrap_or("").trim();
                 if let Some(norm) = norm_valor("mencao", nome) {
+                    // ÂNCORA: só entra no grafo o que o censo determinístico confirmou na base
+                    if !confirmados.contains(&(base.clone(), norm.clone())) { ancorados_fora += 1; continue; }
                     rows.push(chdb::NoValorRow {
                         collection: coll.to_string(), valor_norm: norm, valor: nome.to_string(),
                         campo: "relacao".to_string(), tipo: "relacao".to_string(),
@@ -984,8 +1013,10 @@ fn mine_links(ch_url: &str, dir: &str, coll: &str) -> Value {
     let mut cur = read_knowledge(dir, coll);
     cur["link_src"] = json!(fp);
     write_knowledge(dir, coll, &cur);
-    nlog(&format!("L2 {coll}: {} nó(s) de valor ligados de {} registro(s)", rows.len(), regs.len()));
-    json!({"ok": true, "collection": coll, "linked": rows.len(), "registros": regs.len()})
+    nlog(&format!("L2 {coll}: {} nó(s) de valor ligados de {} registro(s){}", rows.len(), regs.len(),
+        if ancorados_fora > 0 { format!(" · {ancorados_fora} ponta(s) do L3 fora da âncora do censo") } else { String::new() }));
+    json!({"ok": true, "collection": coll, "linked": rows.len(), "registros": regs.len(),
+           "ancorados_fora": ancorados_fora})
 }
 
 /// Normalização Unicode NFC — mesmo fix do ragd: o macOS entrega nomes em NFD e o mesmo
@@ -2251,10 +2282,14 @@ Seja FIEL ao trecho: só atributos e relações que o texto afirma. Sem entidade
 // A regra do "não sei" é o que separa análise de invenção — e é o que torna a timeline
 // confiável (uma resposta que muda porque o dado chegou, não porque o modelo alucinou).
 const BUILTIN_ANALISTA_PROMPT: &str = "Você é o analista do RAGnaRock. Responde a PERGUNTA usando EXCLUSIVAMENTE o \
-CONTEXTO fornecido (agregados do dump, registros extraídos e trechos do corpus). Regras: (1) NUNCA invente número, nome ou fato \
-que não esteja no contexto — se o material não permite responder, diga exatamente o que falta; (2) quando somar ou contar, use os \
-REGISTROS DO DUMP e diga quantos registros entraram na conta; (3) cite as FONTES (base de onde veio cada afirmação); (4) em \
-\"proximas\", liste até 3 DIMENSÕES NÃO EXPLORADAS — ângulos que os dados permitem investigar e que esta resposta não cobriu. \
+CONTEXTO fornecido. \
+HIERARQUIA DE CONFIANÇA (a regra mais importante): os TRECHOS DO CORPUS são PROVA — texto original. As RELAÇÕES DESTILADAS são \
+apenas PISTAS de uma leitura automática anterior e PODEM ESTAR ERRADAS. Quando uma pista contradisser o texto, o TEXTO VENCE; \
+quando uma pista não tiver apoio no texto, NÃO a afirme como fato. \
+DIREÇÃO: a relação 'A —[laço]→ B' significa que A exerce o laço sobre B, nessa ordem. NUNCA inverta os lados. \
+Regras: (1) NUNCA invente número, nome ou fato fora do contexto — se o material não permite responder, diga exatamente o que falta; \
+(2) ao somar ou contar, use os REGISTROS DO DUMP e diga quantos registros entraram na conta; (3) cite as FONTES (base de cada \
+afirmação); (4) em \"proximas\", liste até 3 DIMENSÕES NÃO EXPLORADAS que os dados permitem investigar. \
 Responda APENAS o JSON pedido, em português.";
 
 // [L4] O comparador: o guardião da timeline. Só uma MUDANÇA DE PERSPECTIVA vira etapa —
