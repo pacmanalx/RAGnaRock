@@ -62,6 +62,11 @@ struct Config {
     cadence: u64,        // segundos entre ciclos
     cfg_path: String,
     cors_origin: String, // CORS: vazio = sem header (same-origin safe); senão ecoa o valor
+    // Rótulo do MODELO por trás do llm_url. Entra no ext_cfg_hash de TODA camada LLM, então
+    // trocar de modelo re-mastiga o corpus — sem isso o checkpoint acha que já processou tudo
+    // e o modelo novo fica ocioso (medido em 15/ago ao plugar o Kimi: zero chamadas). Também
+    // é carimbado na procedência de cada registro, pra saber qual modelo produziu o quê.
+    llm_tag: String,
     llm_url: String,     // endpoint OpenAI-compat da IA (nível >=1). ⚠️ APONTAR PRA IA DA FROTA:
                          // o nível 1 manda CONTEÚDO do corpus (ex. `real`, sensível) pro LLM —
                          // nuvem = conteúdo SAI da frota. Default = llama-server local (Aron).
@@ -74,6 +79,7 @@ impl Default for Config {
         Config { port: DEFAULT_PORT, ragd_api: DEFAULT_RAGD_API.to_string(), on: false, level: 0,
                  dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string(),
                  cors_origin: String::new(),
+                 llm_tag: "local".to_string(),
                  llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
                  store: "clickhouse".to_string(),
                  ch_url: "http://127.0.0.1:8123".to_string() }
@@ -96,6 +102,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "cadence"  => if let Ok(n) = v.parse() { cfg.cadence = n },
             "cors_origin" => cfg.cors_origin = v.to_string(),
             "llm_url"  => cfg.llm_url = v.to_string(),
+            "llm_tag"  => cfg.llm_tag = v.to_string(),
             "store"    => cfg.store = v.to_string(),
             "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
@@ -123,6 +130,7 @@ struct State {
     dir: String,
     cadence: u64,
     ragd_api: String,
+    llm_tag: String,       // rótulo do modelo — entra no checkpoint e na procedência
     llm_url: String,       // IA da frota p/ nível >=1 (ver comentário na Config)
     store: String,         // backend do acumulado: "clickhouse" | "sqlite"
     ch_url: String,        // endpoint HTTP do ClickHouse
@@ -725,10 +733,16 @@ const REL_LIGACAO: &[&str] = &[
     "não é", "nao e", "não são", "nao sao", "não tem", "nao tem", "existe", "existem",
 ];
 
+/// Rótulo do modelo em uso (do cfg `llm_tag`). Global porque TODA camada LLM precisa dele
+/// no checkpoint e na procedência — propagar por parâmetro tocaria uma dúzia de assinaturas
+/// sem ganho. Setado uma vez na subida.
+static LLM_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn llm_tag() -> &'static str { LLM_TAG.get().map(|s| s.as_str()).unwrap_or("local") }
+
 fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let (sys, max_tokens) = relacao_system(lib);
     // checkpoint ACOPLADO ao prompt E ao filtro: mudar qualquer um dos dois re-mastiga tudo
-    let ecfg = hash_hex(&format!("relacao|v3-subset|{}", hash_hex(&sys)));
+    let ecfg = hash_hex(&format!("relacao|v3-subset|{}|{}", llm_tag(), hash_hex(&sys)));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let (mut feitas, mut rel_total) = (0usize, 0usize);
@@ -836,7 +850,8 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                 rows.push(chdb::EntidadeRow {
                     collection: coll.to_string(), base: name.to_string(), tipo: "relacao".to_string(),
                     idx: *cid, dado: dado.to_string(), modo: "llm".to_string(), nqi: 0.8,
-                    prov: json!({"via": "relacao-llm", "chunk": cid, "presentes": presentes.len()}).to_string(),
+                    prov: json!({"via": "relacao-llm", "chunk": cid, "presentes": presentes.len(),
+                                 "llm": llm_tag()}).to_string(),
                     state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
                 });
             }
@@ -3147,9 +3162,11 @@ fn main() {
     // store do acumulado/classes: ClickHouse (default) ou SQLite (rollback via cfg store=sqlite)
     store_ensure(&cfg.store, &cfg.dir, &cfg.ch_url);
     ensure_prompt_templates(&cfg.dir);   // garante os templates classificador+extrator editáveis no ValHalla
+    let _ = LLM_TAG.set(cfg.llm_tag.clone());   // publica o rótulo do modelo pra todas as camadas
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(),
+        llm_tag: cfg.llm_tag.clone(),
         store: cfg.store.clone(), ch_url: cfg.ch_url.clone(), cfg_path: cfg.cfg_path.clone(),
         started: Instant::now(), last_cycle: String::new(),
         ragd_online: false, ragd_health: Value::Null, cycle_running: false,
@@ -3158,6 +3175,7 @@ fn main() {
     println!("🐉 Níðhöggr {VERSION} — camada de inteligência (daemon de módulos)");
     println!("   estado: {} · nível {} · cadência {}s · ragd {} · conhecimento em {:?}",
              if cfg.on {"LIGADO"} else {"desligado"}, level_name(cfg.level), cfg.cadence, cfg.ragd_api, cfg.dir);
+    println!("   IA: llm_tag={} · {}", cfg.llm_tag, cfg.llm_url);
 
     // keepalive (pinga o ragd a cada 15s, cacheia) + worker (cadência, mastiga)
     let kst = state.clone();
