@@ -67,6 +67,16 @@ struct Config {
     // e o modelo novo fica ocioso (medido em 15/ago ao plugar o Kimi: zero chamadas). Também
     // é carimbado na procedência de cada registro, pra saber qual modelo produziu o quê.
     llm_tag: String,
+    // Bearer do endpoint, quando o provedor exige autenticação (Kimi/Moonshot, OpenRouter…).
+    // Vazio = sem header, que é o caso do llama-server local. Existe pra que provedor
+    // autenticado NÃO precise de um processo shim só pra carimbar o Authorization —
+    // o shim se justifica quando o DIALETO é outro (Bedrock Converse), não a credencial.
+    // ⚠️ É segredo: mora no cfg (0600 no disco), nunca no git, e as rotas de leitura de
+    // config mascaram o valor.
+    llm_key: String,
+    llm_temp: f64,       // temperatura enviada a TODAS as camadas. 0 = determinístico (llama
+                         // local); 1 = obrigatório no Kimi K-series; -1 = omite o campo.
+    llm_extra: String,   // objeto JSON mesclado no corpo (campo específico do provedor)
     llm_url: String,     // endpoint OpenAI-compat da IA (nível >=1). ⚠️ APONTAR PRA IA DA FROTA:
                          // o nível 1 manda CONTEÚDO do corpus (ex. `real`, sensível) pro LLM —
                          // nuvem = conteúdo SAI da frota. Default = llama-server local (Aron).
@@ -80,6 +90,8 @@ impl Default for Config {
                  dir: DEFAULT_DIR.to_string(), cadence: DEFAULT_CADENCE, cfg_path: "nidhogg.cfg".to_string(),
                  cors_origin: String::new(),
                  llm_tag: "local".to_string(),
+                 llm_key: String::new(),   // vazio = sem Authorization (llama local)
+                 llm_temp: 0.0, llm_extra: String::new(),
                  llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
                  store: "clickhouse".to_string(),
                  ch_url: "http://127.0.0.1:8123".to_string() }
@@ -103,6 +115,9 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "cors_origin" => cfg.cors_origin = v.to_string(),
             "llm_url"  => cfg.llm_url = v.to_string(),
             "llm_tag"  => cfg.llm_tag = v.to_string(),
+            "llm_key"  => cfg.llm_key = v.to_string(),
+            "llm_temp" => if let Ok(n) = v.parse() { cfg.llm_temp = n },
+            "llm_extra" => cfg.llm_extra = v.to_string(),
             "store"    => cfg.store = v.to_string(),
             "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
@@ -190,11 +205,20 @@ fn http_get_t(url: &str, secs: u32) -> Option<String> {
 fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
     for tool in ["curl", "wget"] {
         let mut cmd = std::process::Command::new(tool);
+        // Bearer só quando há chave: provedor autenticado (Kimi/Moonshot) exige, llama local
+        // recusaria nada mas não precisa. Vai como argumento do processo filho, não em env —
+        // ⚠️ isso é visível num `ps` da máquina; aceitável porque a Aron é servidor de uso
+        // único, e o alternativo (env herdado) apareceria em /proc/<pid>/environ do mesmo jeito.
+        let auth = format!("Authorization: Bearer {}", llm_key());
         if tool == "curl" {
-            cmd.args(["-s", "-m", &secs.to_string(), "-H", "Content-Type: application/json", "-d", body, url]);
+            cmd.args(["-s", "-m", &secs.to_string(), "-H", "Content-Type: application/json"]);
+            if !llm_key().is_empty() { cmd.args(["-H", &auth]); }
+            cmd.args(["-d", body, url]);
         } else {
             cmd.args(["-q", "-O", "-", "--tries=1", &format!("--timeout={secs}"),
-                      "--header=Content-Type: application/json", &format!("--post-data={body}"), url]);
+                      "--header=Content-Type: application/json"]);
+            if !llm_key().is_empty() { cmd.arg(format!("--header={auth}")); }
+            cmd.args([&format!("--post-data={body}"), url]);
         }
         if let Ok(out) = cmd.output() {
             if out.status.success() && !out.stdout.is_empty() { return Some(String::from_utf8_lossy(&out.stdout).to_string()); }
@@ -208,8 +232,36 @@ fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
 // entendimento ciclo a ciclo. Caminho: <dir>/llm-ledger.jsonl (setado no boot a partir do cfg).
 static LLM_LEDGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Ajusta o corpo ao DIALETO do provedor, num ponto só — todas as camadas (classificador,
+/// modelador, extrator, relacoes, analista, comparador) passam por aqui, então nenhuma delas
+/// precisa saber com quem está falando. Medido contra a API do Kimi em 15/ago:
+///   • `temperature` — o Kimi K-series recusa qualquer valor ≠1 ("only 1 is allowed for this
+///     model"); o llama local quer 0 pra ser determinístico. `llm_temp` no cfg escolhe, e
+///     `llm_temp = -1` OMITE o campo (provedor que não aceita o parâmetro de jeito nenhum).
+///   • `json_schema.name` — as camadas montam `{"schema": …}`; o llama.cpp aceita sem `name`,
+///     o Kimi devolve 400. Batizar aqui é inócuo pro llama (testado) e obrigatório pro Kimi.
+///   • `llm_extra` — objeto JSON do cfg mesclado no corpo, pra campo que só um provedor
+///     entende (ex.: `{"thinking":{"type":"disabled"}}`, que no Kimi zera os reasoning_tokens
+///     — 241 tokens e 7,3s viram 0 e 2,1s, e esses tokens saíam do MESMO `max_tokens`).
+fn ajusta_dialeto(body: &str) -> String {
+    let mut v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(_) => return body.to_string() };
+    let t = llm_temp();
+    if t < 0.0 { v.as_object_mut().map(|o| o.remove("temperature")); }
+    else { v["temperature"] = json!(t); }
+    if v["response_format"]["type"] == "json_schema" && v["response_format"]["json_schema"]["name"].is_null() {
+        v["response_format"]["json_schema"]["name"] = json!("resposta");
+    }
+    if let Ok(extra) = serde_json::from_str::<Value>(llm_extra()) {
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in e { o.insert(k.clone(), val.clone()); }
+        }
+    }
+    v.to_string()
+}
+
 fn llm_post(tag: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<String> {
     let t0 = std::time::Instant::now();
+    let body = &ajusta_dialeto(body);
     let resp = http_post_t(url, body, secs);
     let ms = t0.elapsed().as_millis() as u64;
     let (conteudo, finish) = match resp.as_deref() {
@@ -270,7 +322,16 @@ fn check_llm(llm_url: &str) -> (bool, String) {
             None => llm_url.to_string(),
         },
     };
-    match http_get_t(&base, 8) {
+    // GET COM Bearer, e só aqui: `http_get_t` também fala com o ragd, e mandar a credencial
+    // do provedor de LLM pro nosso próprio daemon seria espalhar segredo à toa.
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-m", "8"]);
+    if !llm_key().is_empty() { cmd.args(["-H", &format!("Authorization: Bearer {}", llm_key())]); }
+    cmd.arg(&base);
+    let sonda = cmd.output().ok().filter(|o| o.status.success() && !o.stdout.is_empty())
+                   .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                   .or_else(|| if llm_key().is_empty() { http_get_t(&base, 8) } else { None });
+    match sonda {
         Some(body) if !body.trim().is_empty() => {
             // 200 com corpo de erro também acontece (ex.: credencial expirada no shim)
             if body.contains("\"error\"") && !body.contains("\"data\"") && !body.contains("\"models\"") {
@@ -772,6 +833,16 @@ const REL_LIGACAO: &[&str] = &[
 /// sem ganho. Setado uma vez na subida.
 static LLM_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 fn llm_tag() -> &'static str { LLM_TAG.get().map(|s| s.as_str()).unwrap_or("local") }
+
+// Credencial e dialeto do provedor — publicados no boot, lidos por http_post_t/ajusta_dialeto.
+// Globais pelo mesmo motivo do LLM_TAG: `llm_url` já viaja como parâmetro por meia dúzia de
+// assinaturas e enfiar mais três em cada uma só espalharia ruído.
+static LLM_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn llm_key() -> &'static str { LLM_KEY.get().map(|s| s.as_str()).unwrap_or("") }
+static LLM_TEMP: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+fn llm_temp() -> f64 { *LLM_TEMP.get().unwrap_or(&0.0) }
+static LLM_EXTRA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn llm_extra() -> &'static str { LLM_EXTRA.get().map(|s| s.as_str()).unwrap_or("") }
 
 fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let (sys, max_tokens) = relacao_system(lib);
@@ -1345,6 +1416,8 @@ fn status_json(st: &State) -> Value {
         "llm_online": st.llm_online,
         "llm_tag": st.llm_tag,
         "llm_url": st.llm_url,
+        // presença da credencial, NUNCA o valor — esta rota é lida pelo browser
+        "llm_auth": !llm_key().is_empty(),
         "llm_erro": st.llm_erro,
         "llm_checked": st.llm_checked,
         "ragd": st.ragd_health.clone(),
@@ -3205,6 +3278,9 @@ fn main() {
     store_ensure(&cfg.store, &cfg.dir, &cfg.ch_url);
     ensure_prompt_templates(&cfg.dir);   // garante os templates classificador+extrator editáveis no ValHalla
     let _ = LLM_TAG.set(cfg.llm_tag.clone());   // publica o rótulo do modelo pra todas as camadas
+    let _ = LLM_KEY.set(cfg.llm_key.clone());   // idem credencial e dialeto do provedor
+    let _ = LLM_TEMP.set(cfg.llm_temp);
+    let _ = LLM_EXTRA.set(cfg.llm_extra.clone());
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(),
