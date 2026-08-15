@@ -139,6 +139,18 @@ class Handler(BaseHTTPRequestHandler):
         if modelo in ("local", "default", ""):      # o cfg do nidhoggd manda rótulo, não id
             modelo = CFG["model"]
         system, msgs = openai_para_bedrock(req)
+        # COERÇÃO DE JSON — o llama.cpp honra `response_format`; o Bedrock Converse não tem
+        # equivalente direto. Sem traduzir isso o modelo responde em prosa e quem chamou
+        # quebra no parse (foi o 502 do L4 em 15/ago: resposta boa, formato errado).
+        rf = req.get("response_format") or {}
+        if isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema"):
+            regra = ("\n\nFORMATO DA SAÍDA: responda EXCLUSIVAMENTE com um objeto JSON válido. "
+                     "Sem texto antes ou depois, sem explicação, e SEM cerca de markdown "
+                     "(nada de ```json). A primeira letra da resposta deve ser '{'.")
+            esquema = (rf.get("json_schema") or {}).get("schema")
+            if esquema:
+                regra += f"\nO JSON deve obedecer a este schema:\n{json.dumps(esquema, ensure_ascii=False)}"
+            system = (system + regra) if system else regra.strip()
         max_tokens = int(req.get("max_tokens") or 2000)
         temp = req.get("temperature", 0)
         t0 = time.time()
@@ -155,6 +167,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         txt = "".join(c.get("text", "") for c in d["output"]["message"]["content"])
+        # cerca markdown: mesmo mandado, o modelo às vezes embrulha em ```json … ```
+        # (medido no Kimi K2.5). Quem consome espera JSON cru — desembrulha aqui.
+        if rf:
+            t = txt.strip()
+            if t.startswith("```"):
+                t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+                if t.rstrip().endswith("```"):
+                    t = t.rstrip()[:-3]
+                txt = t.strip()
         uso = d.get("usage", {})
         ms = int((time.time() - t0) * 1000)
         self._log(f"{modelo} · {ms}ms · in={uso.get('inputTokens')} out={uso.get('outputTokens')} "

@@ -76,6 +76,19 @@ export function NidhoggVisao() {
             {s.cycle_running && <span className="animate-pulse text-[var(--color-accent)]">· ⚙ ciclo rodando…</span>}
           </span>
         )}
+        {s?.needs_ia && (
+          <span
+            title={s.llm_online === false ? (s.llm_erro || 'endpoint não respondeu') : 'modelo respondendo'}
+            className={`flex items-center gap-1.5 rounded px-2 py-0.5 text-[12px] ${
+              s.llm_online === false
+                ? 'bg-[var(--color-crit)]/15 font-semibold text-[var(--color-crit)]'
+                : 'text-[var(--color-muted)]'}`}
+          >
+            <Dot on={s.llm_online !== false} />
+            IA: <b className={s.llm_online === false ? '' : 'text-[var(--color-fg)]'}>{s.llm_tag || '—'}</b>
+            {s.llm_online === false && ' · FORA DO AR'}
+          </span>
+        )}
         <div className="grow" />
         <Link to="/admin/servicos" className="text-[12px] text-[var(--color-accent)] hover:opacity-80">controlar em Serviços →</Link>
       </div>
@@ -103,6 +116,41 @@ export function NidhoggVisao() {
             <div className="h-full rounded-full" style={{ width: `${nqi * 100}%`, background: nqi >= 0.8 ? 'var(--color-ok)' : nqi >= 0.5 ? 'var(--color-warn)' : 'var(--color-crit)' }} />
           </div>
         </div>
+      )}
+
+      {/* ── o modelo: quem faz o trabalho dos níveis com IA ── */}
+      {s?.needs_ia && (
+        <Panel
+          title={<span className="flex items-center gap-2">
+            <Dot on={s.llm_online !== false} /> Modelo de IA
+            <span className="font-normal text-[var(--color-muted)]">
+              — do nível 1 pra cima o worm depende dele
+            </span>
+          </span>}
+          actions={<Link to="/admin/config" className="text-[12px] text-[var(--color-accent)] hover:opacity-80">configurar →</Link>}
+        >
+          {s.llm_online === false && (
+            <div className="mb-3 rounded-md border border-[var(--color-crit)] bg-[var(--color-crit)]/10 px-3 py-2 text-[13px] font-semibold text-[var(--color-crit)]">
+              ⛔ fora do ar — nada novo será produzido até o endpoint responder
+            </div>
+          )}
+          <div className="grid gap-x-6 gap-y-1.5 text-[13px] sm:grid-cols-[auto_1fr]">
+            <span className="text-[var(--color-muted)]">modelo</span>
+            <code className="font-medium">{s.llm_tag || '—'}</code>
+            <span className="text-[var(--color-muted)]">endpoint</span>
+            <code className="break-all text-[12px]">{s.llm_url || '—'}</code>
+            <span className="text-[var(--color-muted)]">estado</span>
+            <span className={s.llm_online === false ? 'font-semibold text-[var(--color-crit)]' : 'text-[var(--color-ok)]'}>
+              {s.llm_online === false ? 'não responde' : 'respondendo'}
+            </span>
+            {s.llm_erro && (<>
+              <span className="text-[var(--color-muted)]">motivo</span>
+              <span className="text-[var(--color-crit)]">{s.llm_erro}</span>
+            </>)}
+            <span className="text-[var(--color-muted)]">última sondagem</span>
+            <span className="tabular-nums text-[12px]">{s.llm_checked || '—'} <span className="text-[var(--color-muted)]">(a cada 15s)</span></span>
+          </div>
+        </Panel>
       )}
 
       {/* ── coleções: o que o worm pode comer ── */}

@@ -39,6 +39,7 @@ import { Config } from '@/pages/admin/Config'
 import { Drivers } from '@/pages/admin/Drivers'
 import { Logs } from '@/pages/admin/Logs'
 import { NidhoggVisao } from '@/pages/nidhogg/Visao'
+import { NidhoggLayout } from '@/pages/nidhogg/Layout'
 import { NidhoggMiner } from '@/pages/nidhogg/Miner'
 import { NidhoggSummary } from '@/pages/nidhogg/Summary'
 import { NidhoggTree } from '@/pages/nidhogg/Tree'
@@ -56,12 +57,18 @@ export const router = createBrowserRouter([
       { path: 'buscar', element: <Navigate to="/comando" replace /> }, // rota antiga
       { path: 'ingestao', element: <Ingestao /> },
       { path: 'performance', element: <Performance /> },
-      { path: 'nidhogg', element: <NidhoggVisao /> },
-      { path: 'nidhogg/miner', element: <NidhoggMiner /> },
-      { path: 'nidhogg/summary', element: <NidhoggSummary /> },
-      { path: 'nidhogg/tree', element: <NidhoggTree /> },
-      { path: 'nidhogg/llm', element: <NidhoggEstruturalLlm /> },
-      { path: 'nidhogg/gaps', element: <NidhoggGaps /> },
+      {
+        path: 'nidhogg',
+        element: <NidhoggLayout />,   // avisa em TODAS as telas quando o modelo cai
+        children: [
+          { index: true, element: <NidhoggVisao /> },
+          { path: 'miner', element: <NidhoggMiner /> },
+          { path: 'summary', element: <NidhoggSummary /> },
+          { path: 'tree', element: <NidhoggTree /> },
+          { path: 'llm', element: <NidhoggEstruturalLlm /> },
+          { path: 'gaps', element: <NidhoggGaps /> },
+        ],
+      },
       { path: 'admin/perfis', element: <Perfis /> },
       { path: 'admin/usuarios', element: <Usuarios /> },
       { path: 'admin/servicos', element: <Servicos /> },

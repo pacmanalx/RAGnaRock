@@ -132,6 +132,12 @@ export interface NidhoggStatus {
   cycle_running: boolean
   last_cycle?: string | null
   ragd_online: boolean
+  // saúde do modelo (sonda do keepalive a cada 15s)
+  llm_online?: boolean
+  llm_tag?: string
+  llm_url?: string
+  llm_erro?: string
+  llm_checked?: string
 }
 
 // ── Nidhogg: leituras da visão geral ──

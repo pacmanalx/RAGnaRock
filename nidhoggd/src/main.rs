@@ -137,7 +137,12 @@ struct State {
     cfg_path: String,
     started: Instant,
     last_cycle: String,
-    ragd_online: bool,     // cache do keepalive (atualizado por thread leve) — status NUNCA faz curl ao vivo
+    ragd_online: bool,
+    // saúde do MODELO (llm_url). O worm depende dele do nível 1 pra cima; sem isso a
+    // falha era SILENCIOSA — worm parava e a tela continuava verde.
+    llm_online: bool,
+    llm_erro: String,
+    llm_checked: String,     // cache do keepalive (atualizado por thread leve) — status NUNCA faz curl ao vivo
     ragd_health: Value,    // último /health do ragd
     cycle_running: bool,   // um ciclo em andamento? (worker OU /run async). Impede concorrência.
 }
@@ -240,13 +245,42 @@ fn fetch_ragd_health(api: &str) -> Option<Value> {
 /// Thread leve de keepalive: pinga o ragd periodicamente e cacheia no State.
 fn keepalive(state: Arc<Mutex<State>>) {
     loop {
-        let api = { state.lock().unwrap().ragd_api.clone() };
+        let (api, llm) = { let s = state.lock().unwrap(); (s.ragd_api.clone(), s.llm_url.clone()) };
         let health = fetch_ragd_health(&api);
+        let (llm_ok, llm_err) = check_llm(&llm);
         if let Ok(mut s) = state.lock() {
             s.ragd_online = health.is_some();
             s.ragd_health = health.unwrap_or(Value::Null);
+            s.llm_online = llm_ok;
+            s.llm_erro = llm_err;
+            s.llm_checked = now_stamp();
         }
         std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
+/// Sonda o endpoint do modelo. Usa `GET /v1/models` do próprio host do `llm_url` — é a rota
+/// que llama.cpp, o shim do Bedrock e qualquer OpenAI-compatible expõem, e não gasta token.
+/// Devolve (online, motivo) — o motivo vai pra tela, porque "fora do ar" sem porquê não ajuda.
+fn check_llm(llm_url: &str) -> (bool, String) {
+    let base = match llm_url.find("/v1/") {
+        Some(i) => format!("{}/v1/models", &llm_url[..i]),
+        None => match llm_url.rfind("/chat/completions") {
+            Some(i) => format!("{}/models", &llm_url[..i]),
+            None => llm_url.to_string(),
+        },
+    };
+    match http_get_t(&base, 8) {
+        Some(body) if !body.trim().is_empty() => {
+            // 200 com corpo de erro também acontece (ex.: credencial expirada no shim)
+            if body.contains("\"error\"") && !body.contains("\"data\"") && !body.contains("\"models\"") {
+                let m: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let msg = m["error"]["message"].as_str().unwrap_or("erro reportado pelo endpoint");
+                (false, msg.chars().take(200).collect())
+            } else { (true, String::new()) }
+        }
+        Some(_) => (false, "endpoint respondeu vazio".to_string()),
+        None => (false, format!("sem resposta de {base} (timeout ou conexão recusada)")),
     }
 }
 
@@ -1307,6 +1341,12 @@ fn status_json(st: &State) -> Value {
         "last_cycle": st.last_cycle,
         "ragd_api": st.ragd_api,
         "ragd_online": st.ragd_online,   // cache do keepalive (instantâneo)
+        // saúde do modelo — o front usa pra travar as telas L0-L4 quando cai
+        "llm_online": st.llm_online,
+        "llm_tag": st.llm_tag,
+        "llm_url": st.llm_url,
+        "llm_erro": st.llm_erro,
+        "llm_checked": st.llm_checked,
         "ragd": st.ragd_health.clone(),
     })
 }
@@ -1341,7 +1381,9 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
     match (method, path) {
         (Method::Get, "/health") => {
             let s = st.lock().unwrap();
-            (200, json!({"status":"ok","module":"nidhogg","version":VERSION,"on":s.on,"level":level_name(s.level)}).to_string())
+            (200, json!({"status":"ok","module":"nidhogg","version":VERSION,"on":s.on,
+                         "level":level_name(s.level),
+                         "llm_online":s.llm_online,"llm_tag":s.llm_tag}).to_string())
         }
         (Method::Get, "/api/nidhogg") => { let s = st.lock().unwrap(); (200, status_json(&s).to_string()) }
         (Method::Get, "/api/nidhogg/collections") => { let s = st.lock().unwrap(); (200, collections_json(&s).to_string()) }
@@ -3170,6 +3212,7 @@ fn main() {
         store: cfg.store.clone(), ch_url: cfg.ch_url.clone(), cfg_path: cfg.cfg_path.clone(),
         started: Instant::now(), last_cycle: String::new(),
         ragd_online: false, ragd_health: Value::Null, cycle_running: false,
+        llm_online: false, llm_erro: String::new(), llm_checked: String::new(),
     }));
 
     println!("🐉 Níðhöggr {VERSION} — camada de inteligência (daemon de módulos)");
