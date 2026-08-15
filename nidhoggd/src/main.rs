@@ -480,14 +480,103 @@ fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
     v
 }
 
+// ── [v11] TERMOS TÉCNICOS — a metade do censo que a capitalização não alcança ────────────
+// O censo de nome próprio é ótimo pra Tolkien e cego pra documento corporativo: achou 6
+// entidades no BRIEFING_INTEGRACAO_VTEX inteiro (22 KB). Com 3 nomes por chunk, o L3 recebia
+// matéria-prima insuficiente, inventava o `b` e a âncora vetava 47/49 — corretamente. O que
+// falta nesses textos não é nome, é TERMO COMPOSTO recorrente: "trade policy", "regra de
+// comissão", "custo atômico", "chão de fábrica", "torre de controle".
+// Determinístico como manda a doutrina do L2: n-gramas de 2 a 4 palavras, bordas que não são
+// stopword, miolo só com conector, piso de frequência. Zero IA.
+const TERMO_MIN_FREQ: u32 = 3;
+const TERMO_N_MIN: usize = 2;
+const TERMO_N_MAX: usize = 4;
+
+/// Stopwords de BORDA — n-grama não pode começar nem terminar com uma delas.
+fn termo_stop(w: &str) -> bool {
+    matches!(w,
+        "a"|"o"|"os"|"as"|"um"|"uma"|"uns"|"umas"|"de"|"da"|"do"|"dos"|"das"|"e"|"ou"|"mas"
+        |"que"|"se"|"por"|"para"|"com"|"sem"|"sob"|"sobre"|"no"|"na"|"nos"|"nas"|"ao"|"aos"
+        |"à"|"às"|"em"|"pelo"|"pela"|"pelos"|"pelas"|"este"|"esta"|"estes"|"estas"|"esse"
+        |"essa"|"esses"|"essas"|"isso"|"isto"|"aquilo"|"seu"|"sua"|"seus"|"suas"|"meu"|"minha"
+        |"nosso"|"nossa"|"dele"|"dela"|"deles"|"delas"|"lhe"|"lhes"|"é"|"são"|"foi"|"eram"
+        |"ser"|"sendo"|"ter"|"tem"|"têm"|"tinha"|"há"|"havia"|"está"|"estão"|"estava"|"estavam"
+        |"não"|"nao"|"sim"|"já"|"ainda"|"também"|"só"|"apenas"|"mais"|"menos"|"muito"|"pouco"
+        |"todo"|"toda"|"todos"|"todas"|"cada"|"qual"|"quais"|"como"|"quando"|"onde"|"porque"
+        |"pois"|"então"|"entao"|"assim"|"depois"|"antes"|"agora"|"aqui"|"ali"|"lá"|"the"|"of"
+        |"to"|"in"|"on"|"at"|"and"|"or"|"for"|"with"|"is"|"was"|"are"|"be"|"by"|"as"|"it"
+        |"that"|"this"|"from"|"você"|"eu"|"ele"|"ela"|"nós"|"eles"|"elas"|"quem"|"cujo"|"cuja"
+        |"fazer"|"pode"|"podem"|"deve"|"devem"|"vai"|"vão"|"ir")
+}
+/// Conectores tolerados NO MIOLO ("regra de comissão", "chão de fábrica").
+fn termo_conector(w: &str) -> bool {
+    matches!(w, "de"|"da"|"do"|"dos"|"das"|"por"|"com"|"em"|"no"|"na"|"a"|"ao"|"à")
+}
+
+/// N-gramas recorrentes de um texto. `nomes_norm` = o que o censo de nome próprio já pegou
+/// (dedup case-insensitive: "Master Data" e "master data" são a MESMA entidade, não duas).
+fn extract_termos(text: &str, min_freq: u32, nomes_norm: &std::collections::HashSet<String>)
+    -> Vec<(String, u32)> {
+    let ws: Vec<String> = text
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    // token válido = ao menos 2 LETRAS (mata "---", numeração solta, marcador de markdown)
+    let ok = |w: &String| w.chars().filter(|c| c.is_alphabetic()).count() >= 2;
+    let mut c: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for n in TERMO_N_MIN..=TERMO_N_MAX {
+        if ws.len() < n { break; }
+        for i in 0..=(ws.len() - n) {
+            let g = &ws[i..i + n];
+            if !g.iter().all(ok) { continue; }
+            if termo_stop(&g[0]) || termo_stop(&g[n - 1]) { continue; }
+            // miolo: só palavra de conteúdo ou conector
+            if g[1..n - 1].iter().any(|w| termo_stop(w) && !termo_conector(w)) { continue; }
+            *c.entry(g.join(" ")).or_insert(0) += 1;
+        }
+    }
+    let cand: std::collections::HashMap<String, u32> =
+        c.into_iter().filter(|(_, f)| *f >= min_freq).collect();
+    // plural: "trade policy" + "trade policies" são o mesmo termo — funde no singular
+    let mut fundido: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (g, f) in &cand {
+        let sing = plural_para_singular(g);
+        *fundido.entry(if cand.contains_key(&sing) || sing == *g { sing } else { g.clone() }).or_insert(0) += f;
+    }
+    // poda de subsumido: n-grama contido em outro MAIS LONGO e igualmente frequente não
+    // acrescenta nada ("regra de" morre pra "regra de comissão")
+    let mut v: Vec<(String, u32)> = fundido.iter()
+        .filter(|(g, f)| !fundido.iter().any(|(h, hf)| h != *g && h.contains(g.as_str()) && hf >= f))
+        .filter(|(g, _)| !nomes_norm.contains(*g))          // dedup contra o censo de nomes
+        .map(|(g, f)| (g.clone(), *f))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+/// Singular ingênuo pro casamento de plural — só o suficiente pra fundir "policies"/"policy"
+/// e "ordens"/"ordem" na ÚLTIMA palavra. Não é lematizador e não precisa ser.
+fn plural_para_singular(g: &str) -> String {
+    let mut p: Vec<&str> = g.split(' ').collect();
+    let last = match p.pop() { Some(l) => l, None => return g.to_string() };
+    let s = if let Some(r) = last.strip_suffix("ies") { format!("{r}y") }
+            else if let Some(r) = last.strip_suffix("ões") { format!("{r}ão") }
+            else if last.ends_with("s") && !last.ends_with("ss") && last.chars().count() > 3 {
+                last[..last.len() - 1].to_string()
+            } else { last.to_string() };
+    p.push(&s);
+    p.join(" ")
+}
+
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
     // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
     // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
-    let ecfg = hash_hex("mencao|v10|verbo-infinitivo|lf-global|posicoes|miolo");
+    let ecfg = hash_hex("mencao|v11|verbo-infinitivo|lf-global|posicoes|miolo|termos-ngrama");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
     let mut mencoes_total = 0usize;
+    let mut termos_total = 0usize;
     for b in &bases {
         if feitas >= MENCAO_BASES_PER_CYCLE { break; }
         if b["natureza"].as_str() != Some("narrativo") { continue; }
@@ -519,16 +608,37 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
             .filter(|(_, f, _)| *f >= MENCAO_MIN_FREQ).collect();
         mencoes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         mencoes.truncate(mencao_top(0));
+        // [v11] segunda passada: TERMOS técnicos, com as MESMAS posições por chunk (é o campo
+        // `chunks` que o L3 usa pra montar a cena — sem ele o termo existe no dump e nunca
+        // chega ao modelo). Marcados com kind="termo" pra que quem lê a âncora saiba o que é.
+        let nomes_norm: std::collections::HashSet<String> =
+            mencoes.iter().map(|(n, _, _)| n.to_lowercase()).collect();
+        let mut tacc: std::collections::BTreeMap<String, (String, u32, Vec<usize>)> = std::collections::BTreeMap::new();
+        for (cid, ctext) in &chunks[clo..chi.max(clo + 1).min(nch)] {
+            for (termo, f) in extract_termos(ctext, 1, &nomes_norm) {
+                let e = tacc.entry(termo.clone()).or_insert((termo, 0, vec![]));
+                e.1 += f;
+                if e.2.last() != Some(cid) && e.2.len() < 400 { e.2.push(*cid); }
+            }
+        }
+        let mut termos: Vec<(String, u32, Vec<usize>)> = tacc.into_values()
+            .filter(|(_, f, _)| *f >= TERMO_MIN_FREQ).collect();
+        termos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        termos.truncate(mencao_top(0));
+        let n_termos = termos.len();
         let version = chdb::now_version();
         let at = now_stamp();
-        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().enumerate().map(|(idx, (nome, freq, pos))| {
+        let rows: Vec<chdb::EntidadeRow> = mencoes.iter().map(|(n, f, p)| (n, f, p, "nome"))
+            .chain(termos.iter().map(|(n, f, p)| (n, f, p, "termo")))
+            .enumerate().map(|(idx, (nome, freq, pos, kind))| {
             let pos_s: Vec<String> = pos.iter().map(|p| p.to_string()).collect();
             chdb::EntidadeRow {
                 collection: coll.to_string(), base: name.to_string(), tipo: "mencao".to_string(),
                 idx: idx as u32,
-                dado: json!({"mencao": nome, "freq": freq.to_string(), "chunks": pos_s.join(",")}).to_string(),
+                dado: json!({"mencao": nome, "freq": freq.to_string(), "chunks": pos_s.join(","), "kind": kind}).to_string(),
                 modo: "mencao".to_string(), nqi: 1.0,
-                prov: json!({"via": "mencao-det", "freq": freq, "n_chunks": pos.len(), "scan": "por-chunk"}).to_string(),
+                prov: json!({"via": if kind == "termo" { "termo-ngrama" } else { "mencao-det" },
+                             "freq": freq, "n_chunks": pos.len(), "scan": "por-chunk", "kind": kind}).to_string(),
                 state_hash: sh.clone(), ext_cfg_hash: ecfg.clone(), version, extracted_at: at.clone(),
             }
         }).collect();
@@ -552,12 +662,14 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
             }]
         } else { rows };
         match chdb::insert_entities(ch_url, &rows) {
-            Ok(_) => { feitas += 1; mencoes_total += mencoes.len(); }
+            Ok(_) => { feitas += 1; mencoes_total += mencoes.len(); termos_total += n_termos; }
             Err(e) => nlog(&format!("mencoes {coll}/{name}: insert falhou ({e})")),
         }
     }
-    if feitas > 0 { nlog(&format!("mencões {coll}: {feitas} base(s) varridas, {mencoes_total} menção(ões)")); }
-    json!({"ok": true, "collection": coll, "bases": feitas, "mencoes": mencoes_total})
+    if feitas > 0 {
+        nlog(&format!("mencões {coll}: {feitas} base(s) varridas, {mencoes_total} nome(s) + {termos_total} termo(s)"));
+    }
+    json!({"ok": true, "collection": coll, "bases": feitas, "mencoes": mencoes_total, "termos": termos_total})
 }
 
 // [L3] Estrutural-LLM — a MESMA grafação do L2, mas 100% LLM-bound (régua 13/ago). Pega as
@@ -569,6 +681,7 @@ const RELACAO_BASES_PER_CYCLE: usize = 1;
 const RELACAO_JANELAS: usize = 4;          // cenas por base por passada
 const RELACAO_JANELA_MAX_CHARS: usize = 6_000;
 const RELACAO_TOP_MENCOES: usize = 40;     // entidades mais frequentes que definem "cena densa"
+const RELACAO_TOP_NOMES: usize = 25;       // [v11] cota mínima de NOME próprio dentro do teto
 
 /// Normaliza um nome para o casamento contra a lista de entidades (NFC + minúsculas +
 /// espaços colapsados). É a chave do veto determinístico do L3.
@@ -621,18 +734,32 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
         // pré-requisito: o censo do L2 (o L3 trabalha SOBRE o determinístico, nunca às cegas).
         // Sem menções ainda → NÃO checkpointa (volta quando o censo passar).
         let mencoes = chdb::mencoes_da_base(ch_url, coll, name).unwrap_or_default();
-        let mut top: Vec<(String, u32, Vec<u32>)> = mencoes.iter().filter_map(|m| {
+        let lidos: Vec<(String, u32, Vec<u32>, bool)> = mencoes.iter().filter_map(|m| {
             let d: Value = serde_json::from_str(m.as_str()?).ok()?;
             let nome = d["mencao"].as_str()?.trim().to_string();
             if nome.is_empty() { return None; }
             let freq: u32 = d["freq"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
             let poss: Vec<u32> = d["chunks"].as_str().unwrap_or("")
                 .split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            Some((nome, freq, poss))
+            // [v11] kind ausente = registro do censo antigo, que só tinha nome próprio
+            let termo = d["kind"].as_str() == Some("termo");
+            Some((nome, freq, poss, termo))
         }).collect();
-        if top.is_empty() { continue; }
+        if lidos.is_empty() { continue; }
+        // [v11] COTA por natureza, não uma ordenação só. Termo composto é frequente por
+        // construção ("trade policy" 12×) e, num ranking único, empurraria nome raro pra fora
+        // do teto — é o problema do Pônei Saltitante que a v7 do censo existiu pra resolver.
+        // Cada natureza disputa a própria cota; sobra de uma é cedida à outra.
+        let (mut nomes, mut termos): (Vec<_>, Vec<_>) = lidos.into_iter().partition(|(_, _, _, t)| !*t);
+        nomes.sort_by(|a, b| b.1.cmp(&a.1));
+        termos.sort_by(|a, b| b.1.cmp(&a.1));
+        let cota_n = RELACAO_TOP_NOMES.min(nomes.len()).max(RELACAO_TOP_MENCOES.saturating_sub(termos.len()));
+        let cota_t = RELACAO_TOP_MENCOES.saturating_sub(cota_n.min(nomes.len()));
+        nomes.truncate(cota_n);
+        termos.truncate(cota_t);
+        let mut top: Vec<(String, u32, Vec<u32>)> = nomes.into_iter().chain(termos)
+            .map(|(n, f, p, _)| (n, f, p)).collect();
         top.sort_by(|a, b| b.1.cmp(&a.1));
-        top.truncate(RELACAO_TOP_MENCOES);
         // cena densa = chunk com MAIS entidades do topo presentes
         let mut por_chunk: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for (_, _, poss) in &top { for p in poss { *por_chunk.entry(*p).or_insert(0) += 1; } }
