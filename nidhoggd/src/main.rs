@@ -515,8 +515,8 @@ fn termo_conector(w: &str) -> bool {
 
 /// N-gramas recorrentes de um texto. `nomes_norm` = o que o censo de nome próprio já pegou
 /// (dedup case-insensitive: "Master Data" e "master data" são a MESMA entidade, não duas).
-fn extract_termos(text: &str, min_freq: u32, nomes_norm: &std::collections::HashSet<String>)
-    -> Vec<(String, u32)> {
+fn extract_termos(text: &str, min_freq: u32, nomes_norm: &std::collections::HashSet<String>,
+                  podar: bool) -> Vec<(String, u32)> {
     let ws: Vec<String> = text
         .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '\''))
         .filter(|w| !w.is_empty())
@@ -547,7 +547,10 @@ fn extract_termos(text: &str, min_freq: u32, nomes_norm: &std::collections::Hash
     // poda de subsumido: n-grama contido em outro MAIS LONGO e igualmente frequente não
     // acrescenta nada ("regra de" morre pra "regra de comissão")
     let mut v: Vec<(String, u32)> = fundido.iter()
-        .filter(|(g, f)| !fundido.iter().any(|(h, hf)| h != *g && h.contains(g.as_str()) && hf >= f))
+        // a poda só faz sentido sobre o TOTAL: dentro de um chunk toda frequência tende a 1,
+        // aí todo n-grama curto é "igualmente frequente" a um longo que o contém e morreria
+        // à toa — foi o que sumiu com "regra de comissão" na primeira rodada da v11.
+        .filter(|(g, f)| !podar || !fundido.iter().any(|(h, hf)| h != *g && h.contains(g.as_str()) && hf >= f))
         .filter(|(g, _)| !nomes_norm.contains(*g))          // dedup contra o censo de nomes
         .map(|(g, f)| (g.clone(), *f))
         .collect();
@@ -571,7 +574,7 @@ fn plural_para_singular(g: &str) -> String {
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
     // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
     // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
-    let ecfg = hash_hex("mencao|v11|verbo-infinitivo|lf-global|posicoes|miolo|termos-ngrama");
+    let ecfg = hash_hex("mencao|v11b|verbo-infinitivo|lf-global|posicoes|miolo|termos-ngrama|poda-agregada");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -615,7 +618,7 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
             mencoes.iter().map(|(n, _, _)| n.to_lowercase()).collect();
         let mut tacc: std::collections::BTreeMap<String, (String, u32, Vec<usize>)> = std::collections::BTreeMap::new();
         for (cid, ctext) in &chunks[clo..chi.max(clo + 1).min(nch)] {
-            for (termo, f) in extract_termos(ctext, 1, &nomes_norm) {
+            for (termo, f) in extract_termos(ctext, 1, &nomes_norm, false) {
                 let e = tacc.entry(termo.clone()).or_insert((termo, 0, vec![]));
                 e.1 += f;
                 if e.2.last() != Some(cid) && e.2.len() < 400 { e.2.push(*cid); }
@@ -623,6 +626,10 @@ fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str
         }
         let mut termos: Vec<(String, u32, Vec<usize>)> = tacc.into_values()
             .filter(|(_, f, _)| *f >= TERMO_MIN_FREQ).collect();
+        // AGORA sim a poda de subsumido, com as frequências totais na mão
+        let freq_de: std::collections::HashMap<String, u32> =
+            termos.iter().map(|(t, f, _)| (t.clone(), *f)).collect();
+        termos.retain(|(t, f, _)| !freq_de.iter().any(|(h, hf)| h != t && h.contains(t.as_str()) && hf >= f));
         termos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         termos.truncate(mencao_top(0));
         let n_termos = termos.len();
