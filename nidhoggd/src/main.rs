@@ -1156,6 +1156,15 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
     (ctx, fp)
 }
 
+/// Último fingerprint JÁ PROCESSADO por pergunta. Vive em memória de propósito: a alternativa
+/// seria reinserir a etapa na tabela só pra atualizar o hash, e a timeline lista todas as
+/// linhas — duplicaria a etapa na tela do operador.
+static L4_VISTO: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>>
+    = std::sync::OnceLock::new();
+fn l4_visto() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    L4_VISTO.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Fingerprint das ENTRADAS de uma resposta do L4 — o que decide se vale gastar IA de novo.
 /// Guardado como `ctx_hash` na etapa; igual ao anterior ⇒ a resposta seria a mesma e o ciclo
 /// pula sem chamar o modelo.
@@ -1289,12 +1298,18 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
     //   analista · modelo. Editar a pergunta, editar o prompt na biblioteca ou trocar de
     //   modelo re-dispara, que é a mesma disciplina do `ext_cfg_hash` do L3.
     let fp = l4_fingerprint(api, ch_url, &coll, &texto, &tipo, lib);
-    if !forcar {
-        if let Some(a) = &anterior {
-            if a["ctx_hash"].as_str().unwrap_or("") == fp && !fp.is_empty() {
-                return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "saturado": true,
-                              "note": "nada mudou no escopo desde a última resposta — sem chamada de IA"});
-            }
+    if !forcar && !fp.is_empty() {
+        // duas fontes pro "já vi este escopo", e a segunda não é luxo: quando o comparador diz
+        // "mesma perspectiva" NADA é gravado, então o ctx_hash persistido continua velho e a
+        // pergunta recalcularia pra sempre — o gate só pegaria quem gerasse etapa nova (medido
+        // ao vivo: 1 saturada de 3). O cache em memória fecha esse buraco sem inventar linha na
+        // timeline (a tela lista TODAS as linhas da tabela: reinserir duplicaria a etapa).
+        // Custo de um restart do daemon = uma rodada a mais. Barato perto de mexer no schema.
+        let visto = l4_visto().lock().ok().and_then(|m| m.get(&nome).cloned()).unwrap_or_default();
+        let persistido = anterior.as_ref().and_then(|a| a["ctx_hash"].as_str()).unwrap_or("");
+        if visto == fp || persistido == fp {
+            return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "saturado": true,
+                          "note": "nada mudou no escopo desde a última resposta — sem chamada de IA"});
         }
     }
     let t0 = std::time::Instant::now();
@@ -1320,6 +1335,10 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
                 else if forcar { Some(l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s)
                                         .unwrap_or_else(|| "resposta forçada pelo operador".to_string())) }
                 else { l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s) };
+    // carimba o escopo como JÁ PROCESSADO — vale para os DOIS desfechos abaixo. É justamente o
+    // caminho "não mudou" que precisa disso: ele não grava linha nenhuma, e sem o carimbo a
+    // pergunta voltaria a gastar analista + comparador em todo ciclo, para sempre.
+    if let Ok(mut m) = l4_visto().lock() { m.insert(nome.clone(), fp.clone()); }
     let mudou = match mudou {
         Some(m) => m,
         None => return json!({"ok": true, "pergunta": nome, "nova_etapa": false,
