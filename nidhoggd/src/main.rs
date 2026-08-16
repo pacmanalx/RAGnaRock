@@ -1179,7 +1179,11 @@ fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo
         "fontes": {"type": "array", "items": {"type": "object", "properties": {
             "base": {"type": "string"}, "trecho": {"type": "string"}}, "required": ["base"]}},
         "proximas": {"type": "array", "items": {"type": "string"}}
-    }, "required": ["resposta"]});
+    // `fontes` OBRIGATÓRIA: o prompt já mandava citar, e o modelo devolvia `[]` assim mesmo —
+    // resposta certa e não-auditável. Medido em 15/ago com o MESMO contexto: schema pedindo só
+    // `resposta` → `fontes: []`; exigindo as duas → cita `PREP_CEO_SANDRO/real chunk 0` com o
+    // trecho verbatim. Instrução em prompt não segura o que o schema não exige.
+    }, "required": ["resposta", "fontes"]});
     let forma = if tipo == "tabular" {
         "A resposta DEVE ser uma TABELA (colunas + linhas). Some/conte a partir dos REGISTROS DO DUMP."
     } else {
