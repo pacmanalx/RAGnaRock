@@ -1156,6 +1156,37 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
     (ctx, fp)
 }
 
+/// Fingerprint das ENTRADAS de uma resposta do L4 — o que decide se vale gastar IA de novo.
+/// Guardado como `ctx_hash` na etapa; igual ao anterior ⇒ a resposta seria a mesma e o ciclo
+/// pula sem chamar o modelo.
+///
+/// Cobre as cinco coisas que mudam a resposta:
+///   1. o DUMP no escopo (contagem + version) — extração/censo/relação nova;
+///   2. o CORPUS no ragd — base ingerida que o `/search` já enxerga mas que o censo ainda não
+///      mastigou; sem isto o gate atrasaria a resposta em um ciclo. Se o ragd não responder,
+///      degrada pra string vazia em vez de travar: perder frescor é melhor que perder resposta;
+///   3. o TEXTO e o TIPO da pergunta — editar a pergunta tem que re-responder;
+///   4. o PROMPT do analista (editável na biblioteca do ValHalla);
+///   5. o MODELO (`llm_tag`) — trocar de modelo re-abre tudo, como no L3.
+fn l4_fingerprint(api: &str, ch_url: &str, coll: &str, texto: &str, tipo: &str, lib: &Value) -> String {
+    let dump = chdb::fingerprint_escopo(ch_url, coll).unwrap_or_default();
+    // pede TODAS as bases e filtra aqui: nome de coleção aceita espaço e acento, e montar
+    // querystring exigiria um percent-encode que este daemon não tem (o /bases é barato).
+    let corpus = http_get_t(&format!("{api}/bases"), 10)
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .map(|v| {
+            let vazio = vec![];
+            let bases = v["bases"].as_array().unwrap_or(&vazio).iter()
+                .filter(|b| coll == "*" || b["collection"].as_str() == Some(coll));
+            let (mut n, mut ch) = (0usize, 0u64);
+            for b in bases { n += 1; ch += b["n_chunks"].as_u64().unwrap_or(0); }
+            format!("{n}-{ch}")
+        })
+        .unwrap_or_default();
+    let sys = lib["templates"]["analista"]["system"].as_str().unwrap_or("");
+    hash_hex(&format!("l4|{dump}|{corpus}|{texto}|{tipo}|{}|{}", hash_hex(sys), llm_tag()))
+}
+
 /// Chama o analista (LLM) com a pergunta + contexto determinístico. `tabular` muda a forma da
 /// resposta (tabela em vez de texto). Devolve o JSON estruturado validado.
 fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo: &str, ctx: &str)
@@ -1247,8 +1278,27 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
     if tipo == "oneshot" && anterior.is_some() && !forcar {
         return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "note": "one-shot já respondida"});
     }
+    // ── SATURAÇÃO DO L4 (15/ago) — o freio que faltava ────────────────────────────────────
+    // As outras camadas já não repetem trabalho: a Fase 1 tem `needs_class`, o L1 e o L3 têm
+    // `needs_extract_tipo`. O L4 rodava TODAS as perguntas ativas a cada ciclo, e cada uma
+    // custa DUAS chamadas (analista + comparador). Medido com o corpus parado: 14 chamadas em
+    // 10 min, ~2.000/dia, pra reproduzir resposta idêntica.
+    // O contexto é DETERMINÍSTICO: mesmas entradas ⇒ mesma resposta. Então basta reconhecer as
+    // entradas. O fingerprint cobre TUDO que muda a resposta — não só o dump:
+    //   dump (contagem+version) · corpus no ragd · texto e tipo da pergunta · prompt do
+    //   analista · modelo. Editar a pergunta, editar o prompt na biblioteca ou trocar de
+    //   modelo re-dispara, que é a mesma disciplina do `ext_cfg_hash` do L3.
+    let fp = l4_fingerprint(api, ch_url, &coll, &texto, &tipo, lib);
+    if !forcar {
+        if let Some(a) = &anterior {
+            if a["ctx_hash"].as_str().unwrap_or("") == fp && !fp.is_empty() {
+                return json!({"ok": true, "pergunta": nome, "nova_etapa": false, "saturado": true,
+                              "note": "nada mudou no escopo desde a última resposta — sem chamada de IA"});
+            }
+        }
+    }
     let t0 = std::time::Instant::now();
-    let (ctx, fp) = l4_contexto(api, ch_url, &coll, &texto);
+    let (ctx, _fp_ctx) = l4_contexto(api, ch_url, &coll, &texto);
     if ctx.trim().is_empty() { return json!({"ok": false, "pergunta": nome, "error": "contexto vazio (nada acumulado no escopo)"}); }
     let ctxlabel = format!("L4 {nome} [{coll}]");
     let obj = match l4_responder(llm_url, lib, &ctxlabel, &texto, &tipo, &ctx) {
@@ -1295,17 +1345,24 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
 fn mine_respostas(api: &str, llm_url: &str, ch_url: &str, lib: &Value) -> Value {
     let ps = match chdb::perguntas(ch_url) { Ok(p) => p, Err(e) => return json!({"ok": false, "error": e}) };
     let lista = ps.as_array().cloned().unwrap_or_default();
-    let (mut respondidas, mut etapas) = (0usize, 0usize);
+    let (mut respondidas, mut etapas, mut saturadas) = (0usize, 0usize, 0usize);
     for p in &lista {
         if p["ativa"].as_bool() == Some(false) { continue; }
         let r = l4_processar(api, llm_url, ch_url, lib, p, false);
         if r["ok"].as_bool() == Some(true) {
+            // saturada = escopo intacto, NENHUMA chamada de IA. Contar junto com as respondidas
+            // faria o log dizer "3 respondidas" num ciclo que não gastou nada — e é justamente
+            // esse número que se olha pra saber se o freio está segurando.
+            if r["saturado"].as_bool() == Some(true) { saturadas += 1; continue; }
             respondidas += 1;
             if r["nova_etapa"].as_bool() == Some(true) { etapas += 1; }
         }
     }
-    if respondidas > 0 { nlog(&format!("L4: {respondidas} pergunta(s) respondida(s), {etapas} etapa(s) nova(s)")); }
-    json!({"ok": true, "perguntas": respondidas, "etapas": etapas})
+    if respondidas > 0 || saturadas > 0 {
+        nlog(&format!("L4: {respondidas} pergunta(s) respondida(s), {etapas} etapa(s) nova(s), \
+                       {saturadas} saturada(s) (escopo intacto, sem IA)"));
+    }
+    json!({"ok": true, "perguntas": respondidas, "etapas": etapas, "saturadas": saturadas})
 }
 
 /// [L2] Liga o dump denso de UMA coleção: cada valor-chave dos registros vira nó em
