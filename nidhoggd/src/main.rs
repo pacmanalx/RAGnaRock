@@ -511,7 +511,7 @@ fn lower_freq_de(text: &str) -> std::collections::HashMap<String, u32> {
 fn extract_mencoes_lf(text: &str, top: usize, min_freq: u32,
                       lf_ext: Option<&std::collections::HashMap<String, u32>>) -> Vec<(String, u32)> {
     const CONECTORES: &[&str] = &["de", "da", "do", "dos", "das", "van", "von", "del", "la", "e"];
-    let stop = |w: &str| matches!(w.to_lowercase().as_str(),
+    let stop = |w: &str| palavra_vazia(&w.to_lowercase()) || matches!(w.to_lowercase().as_str(),
         "the" | "a" | "o" | "os" | "as" | "um" | "uma" | "and" | "but" | "he" | "she" | "it"
         | "in" | "on" | "at" | "of" | "to" | "is" | "was" | "for" | "with" | "that" | "this"
         | "chapter" | "capitulo" | "capítulo" | "livro" | "book" | "parte" | "part"
@@ -596,7 +596,35 @@ const TERMO_N_MIN: usize = 2;
 const TERMO_N_MAX: usize = 4;
 
 /// Stopwords de BORDA — n-grama não pode começar nem terminar com uma delas.
+/// [v12] Palavra que NUNCA carrega identidade: quantificador, indefinido, numeral por extenso.
+/// Nasceu da inspeção das relações do corpus corporativo (15/ago): o censo v11b pescava
+/// sintagma de prosa analítica como se fosse termo técnico — `metade de baixo`, `seis frentes`,
+/// `quarto das respostas`, `mesma instância` — e o L3 grafava aresta em cima disso. Vale para
+/// os DOIS lados do censo: borda de n-grama (aqui) e nome próprio de palavra única (`Nenhuma`,
+/// que em célula de tabela vem capitalizada e sem par minúsculo, escapando do teste de lf).
+/// Não confundir com termo técnico legítimo: `chão de fábrica`, `inferência em cpu` e
+/// `trade policy` seguem passando — nenhuma dessas começa ou termina em palavra funcional.
+fn palavra_vazia(w: &str) -> bool {
+    matches!(w,
+        // indefinidos e quantificadores
+        "nenhum"|"nenhuma"|"nenhuns"|"nenhumas"|"algum"|"alguma"|"alguns"|"algumas"
+        |"outro"|"outra"|"outros"|"outras"|"mesmo"|"mesma"|"mesmos"|"mesmas"
+        |"vário"|"vária"|"vários"|"várias"|"varios"|"varias"|"muitos"|"muitas"|"poucos"|"poucas"
+        |"ambos"|"ambas"|"qualquer"|"quaisquer"|"próprio"|"própria"|"próprios"|"próprias"
+        |"proprio"|"propria"|"tal"|"tais"|"demais"|"diversos"|"diversas"
+        // frações e porções (o caso "metade de baixo" / "quarto das respostas")
+        |"metade"|"metades"|"terço"|"terços"|"terco"|"tercos"|"quarto"|"quartos"
+        |"maioria"|"minoria"|"parcela"|"porção"|"porcao"|"trecho"|"pedaço"|"pedaco"
+        // numerais por extenso (o caso "seis frentes")
+        |"dois"|"duas"|"três"|"tres"|"quatro"|"cinco"|"seis"|"sete"|"oito"|"nove"|"dez"
+        |"onze"|"doze"|"vinte"|"trinta"|"cem"|"mil"|"primeiro"|"primeira"|"segundo"|"segunda"
+        |"terceiro"|"terceira"|"último"|"última"|"ultimo"|"ultima"
+        // dêiticos de posição que viram sintagma solto
+        |"cima"|"baixo"|"lado"|"frente"|"trás"|"tras"|"dentro"|"fora"|"meio")
+}
+
 fn termo_stop(w: &str) -> bool {
+    if palavra_vazia(w) { return true; }
     matches!(w,
         "a"|"o"|"os"|"as"|"um"|"uma"|"uns"|"umas"|"de"|"da"|"do"|"dos"|"das"|"e"|"ou"|"mas"
         |"que"|"se"|"por"|"para"|"com"|"sem"|"sob"|"sobre"|"no"|"na"|"nos"|"nas"|"ao"|"aos"
@@ -677,7 +705,7 @@ fn plural_para_singular(g: &str) -> String {
 fn mine_fichas(api: &str, _llm_url: &str, ch_url: &str, _lib: &Value, coll: &str) -> Value {
     // v9: por chunk COM anti-ruído global (lower_freq do livro inteiro) + teto 2500 —
     // a v8 inflava de "Então/Depois" por-chunk e cortava o Pônei no teto de 800.
-    let ecfg = hash_hex("mencao|v11b|verbo-infinitivo|lf-global|posicoes|miolo|termos-ngrama|poda-agregada");
+    let ecfg = hash_hex("mencao|v12|verbo-infinitivo|lf-global|posicoes|miolo|termos-ngrama|poda-agregada|palavra-vazia");
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let mut feitas = 0usize;
@@ -847,7 +875,7 @@ fn llm_extra() -> &'static str { LLM_EXTRA.get().map(|s| s.as_str()).unwrap_or("
 fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str) -> Value {
     let (sys, max_tokens) = relacao_system(lib);
     // checkpoint ACOPLADO ao prompt E ao filtro: mudar qualquer um dos dois re-mastiga tudo
-    let ecfg = hash_hex(&format!("relacao|v3-subset|{}|{}", llm_tag(), hash_hex(&sys)));
+    let ecfg = hash_hex(&format!("relacao|v4-censo-v12|{}|{}", llm_tag(), hash_hex(&sys)));
     let bases: Vec<Value> = chdb::classes_summary(ch_url, Some(coll)).ok()
         .and_then(|v| v["bases"].as_array().cloned()).unwrap_or_default();
     let (mut feitas, mut rel_total) = (0usize, 0usize);
