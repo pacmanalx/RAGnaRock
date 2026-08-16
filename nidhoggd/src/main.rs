@@ -1003,39 +1003,83 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
 const L4_CTX_MAX_CHARS: usize = 14_000;   // teto do contexto (a mesma disciplina do modelador)
 const L4_REGISTROS: usize = 150;          // registros do dump na amostra determinística
 const L4_TRECHOS: usize = 6;              // trechos do corpus trazidos pelo RAG
+// Fatia da PROVA no orçamento. Um chunk tem ~2000 chars, então isto compra ~4 passagens
+// INTEIRAS — contra os ~150 chars picados do snippet que a versão anterior mandava. É a
+// maior seção de propósito: o corpus é a única fonte que o analista pode citar como prova.
+const L4_PROVA_CHARS: usize = 8_000;
+const L4_PISTAS_CHARS: usize = 2_500;     // relações do L3 (pista, não prova)
 
 /// Monta o CONTEXTO — a metade determinística da L4. Nada aqui é decidido por IA: agregados
-/// do dump, amostra de registros e os trechos que o RAGnaRock casa com a pergunta.
+/// do dump, amostra de registros, as relações do L3 e os trechos que o RAGnaRock casa com a
+/// pergunta.
+///
+/// ORDEM DE CONSTRUÇÃO ≠ ORDEM DE APRESENTAÇÃO, e isso é deliberado (15/ago). A PROVA é
+/// montada PRIMEIRO, pra reservar o seu naco do orçamento, mas entra POR ÚLTIMO no texto —
+/// o rótulo dela diz "vence qualquer pista acima" e o prompt do analista se apoia nessa
+/// hierarquia de confiança, herdada do caso "Amplificar". Antes, o dump era escrito primeiro
+/// e comia 2/3 do teto; a PROVA ficava com as migalhas do fim. Foi o que fez o L4 responder
+/// "não sei quem é Sandro Rodrigues" com o PREP_CEO_SANDRO ingerido (diagnosticado 14/ago no
+/// ledger: 9,4k de fichas alfabéticas do dump contra ~1,1k de trechos picados).
 fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, String) {
-    let mut ctx = String::new();
-    // 1) o mapa do conhecimento no escopo (o que existe, por tipo)
     // o ClickHouse devolve contagem ora como número, ora como string (FORMAT JSON) — normaliza
     let num = |v: &Value| -> String {
         v.as_u64().map(|n| n.to_string())
             .or_else(|| v.as_str().map(String::from))
             .unwrap_or_else(|| "0".into())
     };
-    if let Ok(sum) = chdb::entities_summary(ch_url, Some(coll), None) {
-        ctx.push_str("== O QUE O SISTEMA ACUMULOU (por tipo de registro) ==\n");
-        for t in sum["por_tipo"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-            ctx.push_str(&format!("- tipo={} registros={} bases={} modo={}\n",
-                t["tipo"].as_str().unwrap_or("?"), num(&t["c"]),
-                num(&t["bases"]), t["modo"].as_str().unwrap_or("?")));
+    // orçamento em CARACTERES (não bytes): o corte final é `chars().take()`, e em português
+    // acentuado len() em bytes diverge ~5-10% — misturar as duas unidades erraria a conta.
+    let nchars = |s: &String| s.chars().count();
+
+    // ── 1) PROVA: o texto original. Construída primeiro pra garantir a fatia. ──────────────
+    let mut s_prova = String::new();
+    let req = json!({"query": pergunta, "base": "*",
+                     "collection": if coll == "*" { Value::Null } else { json!(coll) },
+                     "k": L4_TRECHOS}).to_string();
+    if let Some(resp) = http_post_t(&format!("{api}/search"), &req, 30) {
+        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+            let hits = v["hits"].as_array().cloned().unwrap_or_default();
+            let mut vistos: Vec<(String, u64)> = Vec::new();
+            let (mut usados, mut fora) = (0usize, 0usize);
+            for h in &hits {
+                let base = h["base"].as_str().unwrap_or("").to_string();
+                let hcoll = h["collection"].as_str().unwrap_or("default").to_string();
+                let id = h["chunk"].as_u64().unwrap_or(0);
+                // /search devolve mais de um hit do mesmo chunk (casamentos distintos)
+                if vistos.contains(&(base.clone(), id)) { continue; }
+                if nchars(&s_prova) >= L4_PROVA_CHARS { fora += 1; continue; }
+                vistos.push((base.clone(), id));
+                // CHUNK INTEIRO em vez do `snippet`: o snippet é uma janela de ~150 chars
+                // centrada no casamento — o `.take(900)` de antes era inócuo porque o texto
+                // já chegava cortado. Aqui vem a passagem que dá pra LER.
+                let creq = json!({"base": base, "collection": hcoll, "id": id}).to_string();
+                let inteiro = http_post_t(&format!("{api}/chunk"), &creq, 20)
+                    .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+                    .and_then(|cv| cv["chunks"][0]["text"].as_str().map(String::from));
+                // falha de fetch DEGRADA pro snippet, nunca descarta o trecho: um soluço do
+                // ragd esvaziaria a PROVA em silêncio e o "não sei" viraria caça ao prompt.
+                let texto = match inteiro {
+                    Some(t) if !t.trim().is_empty() => t,
+                    _ => h["snippet"].as_str().unwrap_or("").to_string(),
+                };
+                // os marcadores «» cercam CADA sílaba casada ("d«o»cum«e»nt«o»") — realce é
+                // pra tela, nunca pro modelo, que recebe a frase picada e não a lê.
+                let limpo: String = texto.chars().filter(|c| *c != '«' && *c != '»').collect();
+                let sobra = L4_PROVA_CHARS.saturating_sub(nchars(&s_prova));
+                s_prova.push_str(&format!("[{}/{} chunk {}] {}\n",
+                    base, hcoll, id, limpo.chars().take(sobra).collect::<String>()));
+                usados += 1;
+            }
+            if fora > 0 {
+                // sem isto, PROVA curta se confunde com "o corpus não tinha nada"
+                nlog(&format!("L4 contexto: {usados} trecho(s) inteiros na PROVA, {fora} hit(s) \
+                               fora do orçamento de {L4_PROVA_CHARS} chars"));
+            }
         }
     }
-    // 2) os registros crus (o dado que responde "quanto/quantos")
-    if let Ok(regs) = chdb::registros_escopo(ch_url, coll, L4_REGISTROS) {
-        ctx.push_str("\n== REGISTROS DO DUMP (dado extraído, o material da conta) ==\n");
-        for r in &regs {
-            if ctx.len() > L4_CTX_MAX_CHARS * 2 / 3 { break; }
-            ctx.push_str(&format!("[{} #{}] {} :: {}\n",
-                r["tipo"].as_str().unwrap_or("?"), r["idx"].as_u64().unwrap_or(0),
-                r["base"].as_str().unwrap_or(""), r["dado"].as_str().unwrap_or("{}")));
-        }
-    }
-    // 3) as RELAÇÕES destiladas pelo L3 — o conhecimento que o determinístico não alcançou.
-    // É a camada de cima alimentando a de baixo: sem isso o analista responde "quem é X" sem
-    // enxergar justamente o que o worm entendeu sobre X.
+
+    // ── 2) PISTAS: as relações destiladas pelo L3 ─────────────────────────────────────────
+    let mut s_pistas = String::new();
     if let Ok(rels) = chdb::relacoes_json(ch_url, Some(coll), 200) {
         // ÂNCORA também aqui: o L4 lê relação como CONHECIMENTO, então só entra a que tem as
         // duas pontas confirmadas pelo censo NA BASE. Foi o furo do caso "Amplificar" — o
@@ -1058,40 +1102,54 @@ fn l4_contexto(api: &str, ch_url: &str, coll: &str, pergunta: &str) -> (String, 
                     }
                 })
             }).collect();
-        if !arr.is_empty() {
-            // o rótulo carrega a hierarquia de confiança no PRÓPRIO contexto (não só no
-            // prompt): pista automática pode estar errada; o texto abaixo é que é prova.
-            ctx.push_str("\n== PISTAS: RELAÇÕES DESTILADAS AUTOMATICAMENTE (podem conter erro — direção A→B) ==\n");
-            for r in &arr {
-                if ctx.len() > L4_CTX_MAX_CHARS * 5 / 6 { break; }
-                let d = &r["dado"];
-                ctx.push_str(&format!("- {} —[{}]→ {}{}  ({})\n",
-                    d["a"].as_str().unwrap_or(""), d["rel"].as_str().unwrap_or(""),
-                    d["b"].as_str().unwrap_or(""),
-                    d["tema"].as_str().map(|t| format!(" [tema: {t}]")).unwrap_or_default(),
-                    r["base"].as_str().unwrap_or("")));
-            }
+        for r in &arr {
+            if nchars(&s_pistas) >= L4_PISTAS_CHARS { break; }
+            let d = &r["dado"];
+            s_pistas.push_str(&format!("- {} —[{}]→ {}{}  ({})\n",
+                d["a"].as_str().unwrap_or(""), d["rel"].as_str().unwrap_or(""),
+                d["b"].as_str().unwrap_or(""),
+                d["tema"].as_str().map(|t| format!(" [tema: {t}]")).unwrap_or_default(),
+                r["base"].as_str().unwrap_or("")));
         }
     }
-    // 4) trechos do CORPUS pela busca do RAGnaRock — a ponte entre as duas metades do produto
-    let req = json!({"query": pergunta, "base": "*",
-                     "collection": if coll == "*" { Value::Null } else { json!(coll) },
-                     "k": L4_TRECHOS}).to_string();
-    if let Some(resp) = http_post_t(&format!("{api}/search"), &req, 30) {
-        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
-            ctx.push_str("\n== PROVA: TRECHOS DO CORPUS (texto original — vence qualquer pista acima) ==\n");
-            for h in v["hits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-                if ctx.len() > L4_CTX_MAX_CHARS { break; }
-                // o snippet vem com os marcadores «» em volta de CADA sílaba casada
-                // ("d«o»cum«e»nt«o»") — texto assim chega picado no modelo e ele não lê a
-                // frase. Limpar é obrigatório: o realce é pra tela, não pro LLM.
-                let limpo: String = h["snippet"].as_str().unwrap_or("")
-                    .chars().filter(|c| *c != '«' && *c != '»').take(900).collect();
-                ctx.push_str(&format!("[{}/{} chunk {}] {}\n",
-                    h["base"].as_str().unwrap_or(""), h["collection"].as_str().unwrap_or(""),
-                    h["chunk"].as_u64().unwrap_or(0), limpo));
-            }
+
+    // ── 3) o mapa do acumulado + os registros crus, COM O QUE SOBRAR ──────────────────────
+    let mut s_topo = String::new();
+    if let Ok(sum) = chdb::entities_summary(ch_url, Some(coll), None) {
+        s_topo.push_str("== O QUE O SISTEMA ACUMULOU (por tipo de registro) ==\n");
+        for t in sum["por_tipo"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            s_topo.push_str(&format!("- tipo={} registros={} bases={} modo={}\n",
+                t["tipo"].as_str().unwrap_or("?"), num(&t["c"]),
+                num(&t["bases"]), t["modo"].as_str().unwrap_or("?")));
         }
+    }
+    let gasto = nchars(&s_prova) + nchars(&s_pistas) + nchars(&s_topo);
+    let teto_dump = L4_CTX_MAX_CHARS.saturating_sub(gasto + 400);   // 400 = rótulos das seções
+    let mut s_dump = String::new();
+    if let Ok(regs) = chdb::registros_escopo(ch_url, coll, L4_REGISTROS) {
+        for r in &regs {
+            if nchars(&s_dump) >= teto_dump { break; }
+            s_dump.push_str(&format!("[{} #{}] {} :: {}\n",
+                r["tipo"].as_str().unwrap_or("?"), r["idx"].as_u64().unwrap_or(0),
+                r["base"].as_str().unwrap_or(""), r["dado"].as_str().unwrap_or("{}")));
+        }
+    }
+
+    // ── montagem: a PROVA fecha o contexto (o rótulo dela fala das pistas "acima") ─────────
+    let mut ctx = s_topo;
+    if !s_dump.is_empty() {
+        ctx.push_str("\n== REGISTROS DO DUMP (dado extraído, o material da conta) ==\n");
+        ctx.push_str(&s_dump);
+    }
+    if !s_pistas.is_empty() {
+        // o rótulo carrega a hierarquia de confiança no PRÓPRIO contexto (não só no
+        // prompt): pista automática pode estar errada; o texto abaixo é que é prova.
+        ctx.push_str("\n== PISTAS: RELAÇÕES DESTILADAS AUTOMATICAMENTE (podem conter erro — direção A→B) ==\n");
+        ctx.push_str(&s_pistas);
+    }
+    if !s_prova.is_empty() {
+        ctx.push_str("\n== PROVA: TRECHOS DO CORPUS (texto original — vence qualquer pista acima) ==\n");
+        ctx.push_str(&s_prova);
     }
     let ctx: String = ctx.chars().take(L4_CTX_MAX_CHARS).collect();
     let fp = chdb::fingerprint_escopo(ch_url, coll).unwrap_or_default();
