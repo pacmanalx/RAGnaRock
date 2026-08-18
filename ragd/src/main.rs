@@ -22,6 +22,10 @@ const DEFAULT_DRIVERS_DIR: &str = "drivers";
 const DEFAULT_INGESTORS_DIR: &str = "ingestors";   // [#9] drivers de ingestão (scripts shell, pinagem stdin→stdout)
 const DEFAULT_WEB_DIR: &str = "web/dist";          // [#33] dist/ do frontend React servido na porta dash
 const INGESTOR_TIMEOUT_S: u32 = 120;               // teto por driver de ingestão (via `timeout` coreutil)
+/// [#41] Teto do /transcribe. Separado do teto de ingestão de propósito: transcrever fala roda
+/// a ~0,4x o tempo real na Aron (medido), então um recado de 10 minutos passa folgado dos 120s
+/// que bastam para abrir um PDF — e `exit 124` é indistinguível de driver quebrado.
+const DEFAULT_TRANSCRIBE_TIMEOUT_S: u32 = 900;
 const DEFAULT_THESAURUS_DIR: &str = "thesaurus";
 const DEFAULT_RAGFILES_DIR: &str = "ragfiles";
 const DEFAULT_MAX_UPLOAD: usize = 1024 * 1024 * 1024;   // 1 GB
@@ -68,6 +72,7 @@ struct State {
     bases: Bases,
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão (scripts via shell)
+    transcribe_timeout_s: u32,  // [#41] teto do /transcribe (áudio longo é lento por natureza)
     ragfiles_dir: String,
     web_dir: String,         // [#33] dist/ do frontend React (servido na porta dash)
     api_port: u16,           // [#33] porta da API pública (pra o dash proxiar /api/* → 127.0.0.1:api_port)
@@ -101,6 +106,7 @@ struct Config {
     dash_port: u16,
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão
+    transcribe_timeout_s: u32,  // [#41] teto do /transcribe em segundos
     ragfiles_dir: String,
     web_dir: String,   // [#33] dist/ do frontend React servido na porta dash (11498)
     max_upload: usize,
@@ -130,6 +136,7 @@ impl Default for Config {
             api_port: DEFAULT_PORT, dash_port: DEFAULT_DASH_PORT,
             drivers_dir: DEFAULT_DRIVERS_DIR.to_string(),
             ingestors_dir: DEFAULT_INGESTORS_DIR.to_string(),
+            transcribe_timeout_s: DEFAULT_TRANSCRIBE_TIMEOUT_S,
             ragfiles_dir: DEFAULT_RAGFILES_DIR.to_string(),
             web_dir: DEFAULT_WEB_DIR.to_string(),
             max_upload: DEFAULT_MAX_UPLOAD, workers: 0, autoload: true,
@@ -174,6 +181,7 @@ fn load_config_file(cfg: &mut Config, path: &str) {
             "dash_port"   => if let Ok(p) = v.parse() { cfg.dash_port = p },
             "drivers_dir" => cfg.drivers_dir = v.to_string(),
             "ingestors_dir" => cfg.ingestors_dir = v.to_string(),
+            "transcribe_timeout_s" => if let Ok(n) = v.parse() { cfg.transcribe_timeout_s = n },
             "web_dir"     => cfg.web_dir = v.to_string(),
             "ragfiles_dir"=> cfg.ragfiles_dir = v.to_string(),
             "max_upload"  => if let Ok(n) = v.parse() { cfg.max_upload = n },
@@ -613,6 +621,7 @@ fn main() {
             "--dash-port" => cfg.dash_port = it.next().expect("--dash-port N").parse().expect("porta inválida"),
             "--drivers-dir" => cfg.drivers_dir = it.next().expect("--drivers-dir <path>").clone(),
             "--ingestors-dir" => cfg.ingestors_dir = it.next().expect("--ingestors-dir <path>").clone(),
+            "--transcribe-timeout" => cfg.transcribe_timeout_s = it.next().expect("--transcribe-timeout <s>").parse().expect("segundos"),
             "--web-dir" => cfg.web_dir = it.next().expect("--web-dir <path>").clone(),
             "--ragfiles-dir" => cfg.ragfiles_dir = it.next().expect("--ragfiles-dir <path>").clone(),
             "--max-upload" => cfg.max_upload = it.next().expect("--max-upload N").parse().expect("--max-upload N"),
@@ -655,6 +664,7 @@ fn main() {
     let max_upload = cfg.max_upload;   // local p/ limitar leitura sem travar o Mutex
     let state = Arc::new(RwLock::new(State {
         bases, drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
+        transcribe_timeout_s: cfg.transcribe_timeout_s,
         ragfiles_dir: cfg.ragfiles_dir.clone(),
         web_dir: cfg.web_dir.clone(), api_port: cfg.api_port,
         max_upload, started: Instant::now(),
@@ -722,7 +732,7 @@ fn main() {
     } else {
         (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16), "auto")
     };
-    println!("🤘 API em http://{api_addr}/  · {n_workers} worker(s) [{workers_src}] · /health /bases /collections /drivers /search /chunk /ingest* /ingest_any");
+    println!("🤘 API em http://{api_addr}/  · {n_workers} worker(s) [{workers_src}] · /health /bases /collections /drivers /search /chunk /ingest* /ingest_any /transcribe");
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
         let server = server.clone();
@@ -758,7 +768,13 @@ fn handle_api(mut req: Request, state: &Arc<RwLock<State>>, max_upload: usize) {
     }
     let t0 = Instant::now();
     let is_upload = method == Method::Post && (path == "/ingest_upload" || path == "/ingest_any");
-    let (code, payload) = if is_upload {
+    // [#41] /transcribe também roda FORA do lock — é o passo mais lento do daemon (minutos, em
+    // áudio longo) e não escreve base nenhuma. Segurar o write lock aqui pararia o motor inteiro.
+    let is_transcribe = method == Method::Post && path == "/transcribe";
+    let (code, payload) = if is_transcribe {
+        let (ing, teto) = { let st = state.read(); (st.ingestors_dir.clone(), st.transcribe_timeout_s) };
+        transcrever(&query, &headers, &body_bytes, &ing, teto, max_upload)
+    } else if is_upload {
         // driver FORA do lock (é o passo lento); store_upload pega write() só pra tokenizar/gravar.
         let use_drivers = path == "/ingest_any";
         let ing = { state.read().ingestors_dir.clone() };
@@ -2076,6 +2092,120 @@ fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Ba
     }
 }
 
+/// [#41] POST /transcribe — áudio ENTRA, texto SAI. Não ingere, não grava base, não guarda o
+/// áudio.
+///
+/// É o `ragd` servindo de TOOLKIT: quem chama (hoje o Odin) recebe a fala virada texto e faz o
+/// que quiser com ele — no caso, põe na caixa de conteúdo para uma pessoa ler e corrigir antes
+/// de registrar. Transcrição é interpretação de máquina, e no Odin interpretação passa por
+/// gente antes de virar histórico.
+///
+/// Mesma entrada do `/ingest_upload` (multipart com campo `file`, ou corpo cru com
+/// `?filename=recado.opus`), e o mesmo driver de ingestão que o `/ingest_any` usaria — só que o
+/// texto volta na resposta em vez de virar chunk. O `filename` importa: é dele que sai a
+/// extensão que escolhe o driver.
+fn transcrever(query: &str, headers: &[(String, String)], body: &[u8],
+               ingestors_dir: &str, teto_s: u32, max_upload: usize) -> (u16, String) {
+    let t0 = std::time::Instant::now();
+    if body.is_empty() {
+        return (400, json!({"error": "corpo vazio — mande o áudio no POST"}).to_string());
+    }
+    if body.len() > max_upload {
+        return (413, json!({"error": format!("áudio excede o limite de {max_upload} bytes")}).to_string());
+    }
+    let ct = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+        .map(|(_, v)| v.clone()).unwrap_or_default();
+
+    let (filename, bytes, _fields, via) = match partes_do_upload(query, &ct, body) {
+        Ok(t) => t, Err(e) => return e,
+    };
+    let bytes_len = bytes.len();
+    tlog("transcribe", &format!("┌─ transcribe via={via} filename={filename:?} bytes={bytes_len}"));
+
+    let driver = match resolve_ingestor(ingestors_dir, &ct, &filename) {
+        Some(d) => d,
+        None => {
+            tlog("transcribe", "   └─ sem driver para este formato");
+            return (415, json!({"error": format!(
+                "não sei ler {filename:?} — mande um arquivo de áudio (opus, ogg, m4a, mp3, wav, amr…) \
+                 e, no corpo cru, informe ?filename= com a extensão")}).to_string());
+        }
+    };
+    tlog("transcribe", &format!("   ├─ driver: {}", driver.display()));
+
+    match run_ingestor(&driver, &bytes, teto_s) {
+        Ok(out) => {
+            let texto = String::from_utf8_lossy(&out).trim().to_string();
+            let ms = t0.elapsed().as_millis() as u64;
+            if texto.is_empty() {
+                tlog("transcribe", "   └─ o driver não devolveu texto");
+                return (422, json!({"error": "o áudio não rendeu texto nenhum"}).to_string());
+            }
+            tlog("transcribe", &format!("   └─ {} caracteres em {} ms", texto.chars().count(), ms));
+            (200, json!({"ok": true, "text": texto, "chars": texto.chars().count(),
+                         "filename": filename, "bytes": bytes_len, "ms": ms,
+                         "driver": driver.file_name().and_then(|f| f.to_str()).unwrap_or("")}).to_string())
+        }
+        Err(e) => {
+            tlog("transcribe", &format!("   └─ driver FALHOU: {e}"));
+            // O timeout ganha frase própria: `exit 124` sozinho parece driver quebrado, e aqui
+            // ele quase sempre quer dizer "o áudio é longo demais para o teto configurado".
+            let msg = if e.contains("timeout") {
+                format!("a transcrição passou de {teto_s}s (áudio muito longo para o teto atual)")
+            } else { format!("a transcrição falhou: {e}") };
+            (500, json!({"error": msg}).to_string())
+        }
+    }
+}
+
+/// [#41] Lê o arquivo e os metadados de um POST — multipart com campo `file`, ou corpo cru com
+/// os metadados na query string. Saiu de dentro do `resolve_and_convert` quando o `/transcribe`
+/// passou a precisar exatamente da mesma leitura sem ingerir nada depois.
+fn partes_do_upload(query: &str, ct: &str, body: &[u8])
+    -> Result<(String, Vec<u8>, HashMap<String, String>, &'static str), (u16, String)> {
+    let is_multipart = ct.to_lowercase().starts_with("multipart/form-data");
+    let (filename, content, fields) = if is_multipart {
+        let boundary = match multipart::extract_boundary(&ct) {
+            Some(b) => b, None => return Err((400, json!({"error": "Content-Type multipart sem boundary"}).to_string())),
+        };
+        let parts = match multipart::parse(body, &boundary) {
+            Ok(p) => p,
+            Err(e) => return Err((400, json!({"error": format!("multipart inválido: {e}")}).to_string())),
+        };
+        let mut file_bytes: Option<Vec<u8>> = None;
+        let mut fname_from_part: Option<String> = None;
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for part in parts {
+            if part.name == "file" {
+                fname_from_part = part.filename.clone();
+                file_bytes = Some(part.bytes);
+            } else {
+                let v = String::from_utf8(part.bytes).unwrap_or_default();
+                fields.insert(part.name, v);
+            }
+        }
+        let content = match file_bytes {
+            Some(b) => b, None => return Err((400, json!({"error": "multipart sem campo 'file'"}).to_string())),
+        };
+        // filename: campo explicito > filename do part > erro
+        let filename = fields.get("filename").cloned()
+            .or(fname_from_part)
+            .unwrap_or_else(|| "upload.bin".to_string());
+        (filename, content, fields)
+    } else {
+        // raw body — pega metadados da query string
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for kv in query.split('&').filter(|s| !s.is_empty()) {
+            if let Some((k, v)) = kv.split_once('=') {
+                fields.insert(percent_decode(k), percent_decode(v));
+            }
+        }
+        let filename = fields.get("filename").cloned().unwrap_or_else(|| "upload.bin".to_string());
+        (filename, body.to_vec(), fields)
+    };
+    Ok((filename, content, fields, if is_multipart { "multipart" } else { "raw" }))
+}
+
 /// [#9] MIME → "kind" (extensão) pros formatos BINÁRIOS. text/plain (ou vazio/octet-stream)
 /// devolve None → o chamador cai na extensão do filename (a família texto — .csv/.mysql/.c é
 /// toda text/plain pro wire). Ver ingestors/README.md.
@@ -2088,8 +2218,23 @@ fn mime_to_kind(mime: &str) -> Option<&'static str> {
         "application/msword" => Some("doc"),
         "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
         "text/csv" | "application/csv" => Some("csv"),
+        // [#41] áudio é FAMÍLIA, não formato: quem decodifica opus, m4a, mp3 e amr é o mesmo
+        // ffmpeg, e um driver por contêiner seria repetir catorze vezes a mesma caixa-preta.
+        m if m.starts_with("audio/") => Some("audio"),
         _ => None,
     }
+}
+
+/// [#41] Reduz a extensão à FAMÍLIA quando existe uma. Hoje só áudio: recado de WhatsApp chega
+/// `.opus` no Android e `.m4a` no iOS, e o navegador manda os dois como `application/octet-stream`
+/// quando o arquivo veio de um backup — então a extensão precisa decidir sozinha.
+///
+/// Vídeo fica de fora de propósito. `.mp4` e `.3gp` têm faixa de áudio e o ffmpeg extrairia, mas
+/// quem solta um vídeo num acervo de texto provavelmente não queria só a fala dele.
+fn familia_do_kind(kind: &str) -> &str {
+    const AUDIO: &[&str] = &["opus", "ogg", "oga", "m4a", "mp3", "wav", "wave", "aac",
+                             "amr", "3ga", "flac", "wma", "caf", "aiff", "aif", "weba"];
+    if AUDIO.contains(&kind) { "audio" } else { kind }
 }
 
 /// [#9] Resolve o driver de ingestão: MIME primeiro (binário), senão a extensão do filename
@@ -2100,6 +2245,7 @@ fn resolve_ingestor(ingestors_dir: &str, mime: &str, filename: &str) -> Option<s
         Path::new(filename).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
     })?;
     if kind.is_empty() { return None; }
+    let kind = familia_do_kind(&kind);
     let p = Path::new(ingestors_dir).join(format!("{kind}.py"));
     if p.is_file() { Some(p) } else { None }
 }
@@ -2169,50 +2315,7 @@ fn resolve_and_convert(query: &str, headers: &[(String, String)], body: &[u8],
         headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
     };
     let ct = header("Content-Type").unwrap_or_default();
-    let is_multipart = ct.to_lowercase().starts_with("multipart/form-data");
-
-    // resolve content + metadados
-    let (filename, mut content_bytes, fields): (String, Vec<u8>, HashMap<String, String>) = if is_multipart {
-        let boundary = match multipart::extract_boundary(&ct) {
-            Some(b) => b, None => return Err((400, json!({"error": "Content-Type multipart sem boundary"}).to_string())),
-        };
-        let parts = match multipart::parse(body, &boundary) {
-            Ok(p) => p,
-            Err(e) => return Err((400, json!({"error": format!("multipart inválido: {e}")}).to_string())),
-        };
-        let mut file_bytes: Option<Vec<u8>> = None;
-        let mut fname_from_part: Option<String> = None;
-        let mut fields: HashMap<String, String> = HashMap::new();
-        for part in parts {
-            if part.name == "file" {
-                fname_from_part = part.filename.clone();
-                file_bytes = Some(part.bytes);
-            } else {
-                let v = String::from_utf8(part.bytes).unwrap_or_default();
-                fields.insert(part.name, v);
-            }
-        }
-        let content = match file_bytes {
-            Some(b) => b, None => return Err((400, json!({"error": "multipart sem campo 'file'"}).to_string())),
-        };
-        // filename: campo explicito > filename do part > erro
-        let filename = fields.get("filename").cloned()
-            .or(fname_from_part)
-            .unwrap_or_else(|| "upload.bin".to_string());
-        (filename, content, fields)
-    } else {
-        // raw body — pega metadados da query string
-        let mut fields: HashMap<String, String> = HashMap::new();
-        for kv in query.split('&').filter(|s| !s.is_empty()) {
-            if let Some((k, v)) = kv.split_once('=') {
-                fields.insert(percent_decode(k), percent_decode(v));
-            }
-        }
-        let filename = fields.get("filename").cloned().unwrap_or_else(|| "upload.bin".to_string());
-        (filename, body.to_vec(), fields)
-    };
-
-    let via = if is_multipart { "multipart" } else { "raw" };
+    let (filename, mut content_bytes, fields, via) = partes_do_upload(query, &ct, body)?;
     let orig_len = content_bytes.len();
     tlog("ingest", &format!("┌─ ingest via={via} filename={filename:?} bytes={orig_len} drivers={use_drivers}"));
 

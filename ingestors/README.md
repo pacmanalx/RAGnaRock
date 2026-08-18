@@ -83,6 +83,36 @@ Drivers de banco de rede precisam de um conector (`pymysql`, `psycopg2`, `pymssq
 stdlib**, então entram numa fase posterior, com a dependência declarada no cabeçalho do driver
 (ainda sem venv). A prova de pinagem stdlib é o `csv.py` (arquivo, via stdin) — não um banco.
 
+## Família: várias extensões, um driver (áudio)
+
+O roteamento normal é `(mime | ext) → <kind>.py`. Áudio quebraria isso em catorze drivers
+idênticos — recado de WhatsApp chega `.opus` no Android e `.m4a` no iOS, e um backup restaurado
+chega como `application/octet-stream` com a extensão sendo a única pista. Então `opus`, `ogg`,
+`oga`, `m4a`, `mp3`, `wav`, `aac`, `amr`, `3ga`, `flac`, `wma`, `caf`, `aiff` e `weba` reduzem
+todos a **`audio`**, e qualquer `audio/*` no MIME também. Um driver, `audio.py`, e quem
+decodifica os catorze é o mesmo ffmpeg.
+
+Vídeo fica de fora de propósito: `.mp4` tem faixa de áudio e o ffmpeg extrairia, mas quem solta
+um vídeo num acervo de texto provavelmente não queria só a fala dele.
+
+## POST /transcribe — o daemon como toolkit
+
+O `audio.py` serve a dois caminhos. Pelo `/ingest_any`, o áudio vira base como qualquer arquivo.
+Pelo **`/transcribe`**, o áudio entra e o **texto volta na resposta** — sem ingerir, sem gravar
+base, sem guardar o áudio:
+
+```bash
+  curl -X POST "http://aron:11499/transcribe?filename=recado.opus" --data-binary @recado.opus
+  curl -X POST "http://aron:11499/transcribe" -F "file=@recado.m4a"     # como o browser manda
+  → {"ok":true,"text":"...","chars":588,"ms":24186,"driver":"audio.py"}
+```
+
+Existe para quem precisa do texto ANTES de decidir o que fazer com ele. É o caso do Odin: a
+transcrição cai na caixa de conteúdo, uma pessoa lê e corrige, e só então vira registro —
+transcrição é interpretação de máquina, e interpretação não entra em histórico sem assinatura
+humana. O teto é o `transcribe_timeout_s` do cfg (900s), separado dos 120s da ingestão porque
+transcrever roda a ~0,4x o tempo real.
+
 ## Fronteira (não confundir)
 
 Isto é o **driver de ingestão** — dado entra, RAGnaRock é *cliente* da fonte. **Não** é a interface

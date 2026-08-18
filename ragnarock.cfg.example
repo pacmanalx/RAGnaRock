@@ -22,6 +22,7 @@ drivers_dir  = drivers     # language drivers (*.drv)
 ragfiles_dir = ragfiles    # tokenized bases; one subdir per collection (auto-loaded on boot)
 cache_dir    = cache       # thesaurus expansion cache
 thesaurus_dir = thesaurus  # multilingual dictionaries
+transcribe_timeout_s = 900   # teto do POST /transcribe (áudio longo é lento)
 max_upload   = 52428800    # max /ingest_upload body in bytes (50 MiB)
 autoload     = true        # scan ragfiles_dir on boot and load every base
 
