@@ -100,6 +100,11 @@ export const getTimeline = (pergunta: string) =>
 export const perguntarAgora = (pergunta: string) =>
   nidhogg.post<RespondeuAgora>('/api/nidhogg/perguntar', { pergunta })
 
+// apaga a TIMELINE de uma questão (o cadastro fica). A pergunta volta a responder do zero —
+// inclusive as one-shot, que só congelam enquanto existe etapa anterior.
+export const limparRespostas = (pergunta: string) =>
+  nidhogg.post<{ ok: boolean; pergunta: string; etapas_apagadas: number }>('/api/nidhogg/respostas/limpar', { pergunta })
+
 // ── L4 · cockpit de destrave: re-tipar (origem=humano, sticky) + molde dirigido ──
 export const postReclass = (collection: string, base: string, tipo: string) =>
   nidhogg.post<{ ok: boolean; tipo: string; natureza: string; csv: boolean; extraivel: boolean; nota: string; purgadas: number }>(

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { HelpCircle, Play, Plus, Table2, Timer, Trash2, Zap } from 'lucide-react'
+import { Eraser, HelpCircle, Pause, Play, Plus, Table2, Timer, Trash2, Zap } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
-import { getPerguntas, savePerguntas, getTimeline, perguntarAgora, getNidhoggCollections } from '@/api/ragnarock'
+import { getPerguntas, savePerguntas, getTimeline, perguntarAgora, limparRespostas, getNidhoggCollections } from '@/api/ragnarock'
 import type { Pergunta, TipoResposta, EtapaResposta, RespostaTabular } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
@@ -12,6 +12,16 @@ import { Panel, Spinner, ErrorBox } from '@/components/ui'
 // pro modelo é decidido por regra, só a resposta é inferida.
 // A TIMELINE é o histórico de MUDANÇAS DE PERSPECTIVA: o worm re-responde todo ciclo e um
 // comparador decide se virou etapa nova — repetição não polui a linha.
+//
+// CICLO DE VIDA de uma questão (o que esta tela precisa deixar achável):
+//   ativa   → entra em todo ciclo do nível 4
+//   pausada → fica no cadastro, fora do ciclo (não gasta IA). Reativar é um clique; as
+//             pausadas vivem numa seção própria pra não sumirem no meio das ativas.
+//   limpar  → apaga a timeline e devolve a questão ao estado "nunca respondida" (o cadastro
+//             continua). É o único jeito não-forçado de descongelar uma one-shot.
+//   excluir → tira do cadastro. A timeline é apagada JUNTO se você pedir — se não pedir, ela
+//             fica no dump e uma questão futura com o MESMO nome herda o histórico e continua
+//             a numeração das etapas.
 
 const TIPOS: { v: TipoResposta; label: string; hint: string; icon: typeof Table2 }[] = [
   { v: 'tabular', label: 'tabular cumulativa', hint: 'a resposta é uma tabela que soma/conta sobre o dump acumulado', icon: Table2 },
@@ -28,9 +38,13 @@ export function PerguntasPanel() {
   const [nova, setNova] = useState<Pergunta | null>(null)
   const [salvando, setSalvando] = useState(false)
   const [erro, setErro] = useState<string | null>(null)
+  const [confirmar, setConfirmar] = useState<string | null>(null)   // nome da questão em vias de exclusão
+  const [aviso, setAviso] = useState<string | null>(null)
 
   const lista = ps.data?.perguntas ?? []
   const ativa = lista.find((p) => p.nome === sel) ?? null
+  const ativas = lista.filter((p) => p.ativa)
+  const pausadas = lista.filter((p) => !p.ativa)
 
   useEffect(() => { if (!sel && lista.length > 0) setSel(lista[0].nome) }, [lista, sel])
 
@@ -41,13 +55,21 @@ export function PerguntasPanel() {
     finally { setSalvando(false) }
   }
 
-  function excluir(nome: string) {
-    if (!confirm(`Excluir a pergunta "${nome}"? (a timeline de respostas já gravada permanece no dump)`)) return
+  async function excluir(nome: string, purgar: boolean) {
+    setConfirmar(null); setAviso(null); setErro(null)
+    if (purgar) {
+      // purga ANTES de tirar do cadastro: se falhar, a questão continua listada e dá pra repetir
+      try { const r = await limparRespostas(nome); setAviso(`"${nome}" excluída — ${r.etapas_apagadas} etapa(s) apagada(s) do dump.`) }
+      catch (e) { setErro(`timeline não foi apagada: ${messageFromError(e)}`); return }
+    } else {
+      setAviso(`"${nome}" saiu do cadastro — a timeline dela continua no dump.`)
+    }
     if (sel === nome) setSel(null)
-    void persistir(lista.filter((p) => p.nome !== nome))
+    await persistir(lista.filter((p) => p.nome !== nome))
   }
 
   function alternarAtiva(p: Pergunta) {
+    setAviso(null)
     void persistir(lista.map((x) => (x.nome === p.nome ? { ...x, ativa: !x.ativa } : x)))
   }
 
@@ -70,36 +92,30 @@ export function PerguntasPanel() {
               <i> "qual o ROI mensurável do contrato X?"</i>
             </div>
           )}
-          <div className="space-y-1.5">
-            {lista.map((p) => {
-              const T = TIPOS.find((t) => t.v === p.tipo) ?? TIPOS[2]
-              return (
-                <div key={p.nome}
-                  className={`rounded-md border px-3 py-2 ${sel === p.nome
-                    ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/5'
-                    : 'border-[var(--color-border)] hover:border-[var(--color-muted)]'}`}>
-                  <button onClick={() => setSel(p.nome)} className="w-full text-left">
-                    <div className="flex items-center gap-1.5">
-                      <T.icon size={12} className="shrink-0 text-[var(--color-accent)]" />
-                      <span className="grow truncate text-[13px] font-medium">{p.nome}</span>
-                      {!p.ativa && <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] text-[var(--color-muted)]">pausada</span>}
-                    </div>
-                    <div className="mt-0.5 line-clamp-2 text-[11px] text-[var(--color-muted)]">{p.texto}</div>
-                  </button>
-                  <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[var(--color-muted)]">
-                    <span>{T.label}</span>
-                    <span>· escopo {p.escopo === '*' ? 'todas' : p.escopo}</span>
-                    {p.pai && <span title={`desdobrada de "${p.pai}"`}>· ↳ {p.pai}</span>}
-                    <div className="grow" />
-                    <button onClick={() => alternarAtiva(p)} className="hover:text-[var(--color-fg)]">
-                      {p.ativa ? 'pausar' : 'ativar'}
-                    </button>
-                    <button onClick={() => excluir(p.nome)} className="hover:text-[var(--color-crit)]"><Trash2 size={11} /></button>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
+          {ativas.length > 0 && (
+            <div className="space-y-1.5">
+              {ativas.map((p) => (
+                <Cartao key={p.nome} p={p} sel={sel === p.nome} onSel={setSel} onAlternar={alternarAtiva}
+                  confirmando={confirmar === p.nome} onPedirExcluir={() => setConfirmar(p.nome)}
+                  onCancelarExcluir={() => setConfirmar(null)} onExcluir={excluir} />
+              ))}
+            </div>
+          )}
+
+          {/* ── as PAUSADAS moram aqui: fora do ciclo, mas na cara do operador (é onde se reativa) ── */}
+          {pausadas.length > 0 && (
+            <div className="mt-3 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-[var(--color-muted)]">
+                <Pause size={11} /> pausadas ({pausadas.length}) · fora do ciclo do nível 4
+              </div>
+              {pausadas.map((p) => (
+                <Cartao key={p.nome} p={p} sel={sel === p.nome} onSel={setSel} onAlternar={alternarAtiva}
+                  confirmando={confirmar === p.nome} onPedirExcluir={() => setConfirmar(p.nome)}
+                  onCancelarExcluir={() => setConfirmar(null)} onExcluir={excluir} />
+              ))}
+            </div>
+          )}
+          {aviso && <div className="mt-2 text-[12px] text-[var(--color-muted)]">{aviso}</div>}
           {erro && <div className="mt-2 text-[12px] text-[var(--color-crit)]">{erro}</div>}
         </Panel>
 
@@ -118,10 +134,71 @@ export function PerguntasPanel() {
 
       {/* ── coluna da resposta + timeline ── */}
       {ativa
-        ? <Respostas pergunta={ativa} onDesdobrar={(texto) => {
+        ? <Respostas pergunta={ativa} onReativar={() => alternarAtiva(ativa)} onDesdobrar={(texto) => {
             setNova({ nome: '', texto, tipo: 'vivo', escopo: ativa.escopo, ativa: true, pai: ativa.nome })
           }} />
         : <Panel title="Resposta"><div className="text-[13px] text-[var(--color-muted)]">selecione uma questão à esquerda.</div></Panel>}
+    </div>
+  )
+}
+
+// Um cartão da lista. Concentra o ciclo de vida da questão: selecionar, pausar/reativar e
+// excluir — a exclusão pergunta, ali mesmo, o que fazer com o que ela já gerou.
+function Cartao({ p, sel, onSel, onAlternar, confirmando, onPedirExcluir, onCancelarExcluir, onExcluir }: {
+  p: Pergunta; sel: boolean; onSel: (n: string) => void; onAlternar: (p: Pergunta) => void
+  confirmando: boolean; onPedirExcluir: () => void; onCancelarExcluir: () => void
+  onExcluir: (nome: string, purgar: boolean) => void
+}) {
+  const T = TIPOS.find((t) => t.v === p.tipo) ?? TIPOS[2]
+  return (
+    <div className={`rounded-md border px-3 py-2 ${sel
+      ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/5'
+      : 'border-[var(--color-border)] hover:border-[var(--color-muted)]'} ${p.ativa ? '' : 'opacity-70'}`}>
+      <button onClick={() => onSel(p.nome)} className="w-full text-left">
+        <div className="flex items-center gap-1.5">
+          <T.icon size={12} className="shrink-0 text-[var(--color-accent)]" />
+          <span className="grow truncate text-[13px] font-medium">{p.nome}</span>
+          {!p.ativa && <span className="rounded bg-[var(--color-panel-2)] px-1.5 text-[10px] text-[var(--color-muted)]">pausada</span>}
+        </div>
+        <div className="mt-0.5 line-clamp-2 text-[11px] text-[var(--color-muted)]">{p.texto}</div>
+      </button>
+      <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[var(--color-muted)]">
+        <span>{T.label}</span>
+        <span>· escopo {p.escopo === '*' ? 'todas' : p.escopo}</span>
+        {p.pai && <span title={`desdobrada de "${p.pai}"`}>· ↳ {p.pai}</span>}
+        <div className="grow" />
+        <button onClick={() => onAlternar(p)}
+          title={p.ativa ? 'tira do ciclo: fica no cadastro, mas não gasta IA' : 'devolve ao ciclo do nível 4'}
+          className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${p.ativa
+            ? 'border-[var(--color-border)] hover:text-[var(--color-fg)]'
+            : 'border-[var(--color-accent)] text-[var(--color-accent)]'}`}>
+          {p.ativa ? <><Pause size={10} /> pausar</> : <><Play size={10} /> reativar</>}
+        </button>
+        <button onClick={onPedirExcluir} title="excluir do cadastro"
+          className="hover:text-[var(--color-crit)]"><Trash2 size={11} /></button>
+      </div>
+
+      {confirmando && (
+        <div className="mt-2 rounded-md border border-[var(--color-crit)]/40 bg-[var(--color-crit)]/5 px-2.5 py-2">
+          <div className="text-[11px]">
+            Excluir <b>{p.nome}</b> do cadastro. E o que ela já respondeu?
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <button onClick={() => onExcluir(p.nome, true)}
+              className="rounded-md bg-[var(--color-crit)] px-2.5 py-1 text-[11px] font-medium text-white">
+              excluir e apagar a timeline
+            </button>
+            <button onClick={() => onExcluir(p.nome, false)}
+              className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-[11px]">
+              excluir e guardar a timeline
+            </button>
+            <button onClick={onCancelarExcluir} className="px-2 py-1 text-[11px] text-[var(--color-muted)]">cancelar</button>
+          </div>
+          <div className="mt-1.5 text-[10px] text-[var(--color-muted)]">
+            guardando: uma questão futura com o mesmo nome herda o histórico e continua a numeração das etapas.
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -183,11 +260,14 @@ function EditorPergunta({ valor, setValor, onSave, onCancel, salvando, colecoes 
 }
 
 // ── a resposta corrente (cabeça da timeline) + as etapas anteriores ──
-function Respostas({ pergunta, onDesdobrar }: { pergunta: Pergunta; onDesdobrar: (texto: string) => void }) {
+function Respostas({ pergunta, onDesdobrar, onReativar }: {
+  pergunta: Pergunta; onDesdobrar: (texto: string) => void; onReativar: () => void
+}) {
   const tl = useAsync(() => getTimeline(pergunta.nome), [pergunta.nome])
   const [busy, setBusy] = useState(false)
   const [nota, setNota] = useState<string | null>(null)
   const [erro, setErro] = useState<string | null>(null)
+  const [limpando, setLimpando] = useState(false)
 
   const etapas = tl.data?.etapas ?? []
   const cabeca = etapas.length > 0 ? etapas[etapas.length - 1] : null
@@ -203,15 +283,46 @@ function Respostas({ pergunta, onDesdobrar }: { pergunta: Pergunta; onDesdobrar:
     finally { setBusy(false) }
   }
 
+  // apaga tudo que a questão gerou. O cadastro fica: é "recomeçar", não "excluir".
+  async function limpar() {
+    if (!confirm(`Apagar as ${etapas.length} etapa(s) de "${pergunta.nome}"? A questão continua cadastrada e responde do zero.`)) return
+    setLimpando(true); setErro(null); setNota(null)
+    try {
+      const r = await limparRespostas(pergunta.nome)
+      setNota(`${r.etapas_apagadas} etapa(s) apagada(s) — a questão volta ao estado de quem nunca respondeu.`)
+      tl.reload()
+    } catch (e) { setErro(messageFromError(e)) }
+    finally { setLimpando(false) }
+  }
+
   return (
     <div className="space-y-3">
       <Panel title={`❓ ${pergunta.texto}`}
         actions={
-          <button onClick={responder} disabled={busy}
-            className="flex items-center gap-1 rounded-md bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-accent-fg)] disabled:opacity-50">
-            <Play size={11} /> {busy ? 'analisando…' : 'responder agora'}
-          </button>
+          <div className="flex items-center gap-1.5">
+            {etapas.length > 0 && (
+              <button onClick={limpar} disabled={limpando || busy}
+                title="apaga a timeline inteira; o cadastro da questão permanece"
+                className="flex items-center gap-1 rounded-md border border-[var(--color-border)] px-2.5 py-1 text-[11px] hover:border-[var(--color-crit)] hover:text-[var(--color-crit)] disabled:opacity-50">
+                <Eraser size={11} /> {limpando ? 'limpando…' : 'limpar respostas'}
+              </button>
+            )}
+            <button onClick={responder} disabled={busy}
+              className="flex items-center gap-1 rounded-md bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-accent-fg)] disabled:opacity-50">
+              <Play size={11} /> {busy ? 'analisando…' : 'responder agora'}
+            </button>
+          </div>
         }>
+        {!pergunta.ativa && (
+          <div className="mb-2 flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-[12px]">
+            <Pause size={12} className="text-[var(--color-muted)]" />
+            <span className="grow">questão <b>pausada</b> — o ciclo do nível 4 não a responde. O que já foi respondido continua abaixo.</span>
+            <button onClick={onReativar}
+              className="flex items-center gap-1 rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-[var(--color-accent-fg)]">
+              <Play size={11} /> reativar
+            </button>
+          </div>
+        )}
         {busy && <div className="mb-2 text-[12px] text-[var(--color-muted)]">montando o contexto e chamando o analista — leva de 1 a 4 min; o diário 🐿️ registra cada passo.</div>}
         {nota && <div className="mb-2 rounded-md border border-[var(--color-ok)]/40 bg-[var(--color-ok)]/10 px-3 py-2 text-[12px]">{nota}</div>}
         {erro && <div className="mb-2 text-[12px] text-[var(--color-crit)]">{erro}</div>}

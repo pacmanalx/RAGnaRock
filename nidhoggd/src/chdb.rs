@@ -997,3 +997,29 @@ pub fn tipos_campos(url: &str, coll: &str) -> Result<Vec<(String, String)>, Stri
         .filter_map(|v| Some((v["tipo"].as_str()?.to_string(), v["campo"].as_str()?.to_string())))
         .collect())
 }
+
+/// Apaga a TIMELINE inteira de uma pergunta (mutation SÍNCRONA — `mutations_sync=1`, o mesmo
+/// contrato de `delete_entities`: sem isso o ALTER só é ENFILEIRADO e a tela recarregaria com
+/// as linhas ainda lá). É o "limpar o que foi gerado" do L4: a pergunta continua cadastrada,
+/// mas volta ao estado de quem nunca respondeu — `seq` reinicia em 1, e uma `oneshot`
+/// descongela (ela só re-responde quando não existe etapa anterior).
+pub fn delete_respostas(url: &str, pergunta: &str) -> Result<u64, String> {
+    ensure_pergunta_schema(url)?;
+    let cnt_body = ch_query_param(url,
+        "SELECT count() FROM nidhogg.resposta WHERE pergunta={p:String} FORMAT TabSeparated",
+        &[("p", pergunta)], 10)?;
+    let n: u64 = cnt_body.trim().parse().unwrap_or(0);
+    if n == 0 { return Ok(0); }
+    let full = format!("{url}?mutations_sync=1&param_p={}", urlencode(pergunta));
+    let sql = "ALTER TABLE nidhogg.resposta DELETE WHERE pergunta={p:String}";
+    let out = Command::new("curl")
+        .args(["-s", "-m", "30", &full, "--data-binary", sql])
+        .output()
+        .map_err(|e| format!("curl falhou: {e}"))?;
+    if !out.status.success() { return Err(format!("curl status {:?}", out.status.code())); }
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    if body.contains("DB::Exception") || body.starts_with("Code:") {
+        return Err(body.chars().take(200).collect());
+    }
+    Ok(n)
+}

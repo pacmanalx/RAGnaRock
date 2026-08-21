@@ -2082,6 +2082,27 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
+        // [L4] LIMPA o que uma pergunta gerou — apaga a timeline inteira e destrava a pergunta.
+        // POST (e não DELETE) porque o preflight CORS aqui só libera GET/POST, e a API do
+        // nidhoggd inteira é GET/POST. Duas coisas TÊM que andar juntas (senão a pergunta fica
+        // muda pra sempre): apagar as linhas E esquecer o fingerprint em memória — o gate de
+        // saturação compara `l4_visto[nome] == fp` e, sem a limpeza, ele diria "já vi este
+        // escopo" para uma pergunta que não tem mais resposta nenhuma.
+        (Method::Post, "/api/nidhogg/respostas/limpar") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let nome = nfc(v["pergunta"].as_str().unwrap_or("").trim());
+            if nome.is_empty() { return (400, json!({"error":"falta 'pergunta' (o nome cadastrado)"}).to_string()); }
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"L4 requer clickhouse"}).to_string()); }
+            match chdb::delete_respostas(&ch_url, &nome) {
+                Ok(n) => {
+                    if let Ok(mut m) = l4_visto().lock() { m.remove(&nome); }
+                    nlog(&format!("L4 {nome}: timeline limpa ({n} etapa(s) apagada(s)) — responde do zero no próximo ciclo"));
+                    (200, json!({"ok":true,"pergunta":nome,"etapas_apagadas":n}).to_string())
+                }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
         // [L4] responde UMA pergunta AGORA (o operador não espera o ciclo). LENTO: contexto +
         // analista + comparador. Grava etapa mesmo sem mudança (forcar=true) pra dar retorno visível.
         (Method::Post, "/api/nidhogg/perguntar") => {
@@ -3398,6 +3419,7 @@ rotas:
   GET  /api/nidhogg/perguntas       cadastro de questões diretas do L4
   POST /api/nidhogg/perguntas       {{\"perguntas\":[{{nome,texto,tipo:tabular|oneshot|vivo,escopo,ativa}}]}}
   GET  /api/nidhogg/respostas       timeline de uma pergunta (?pergunta=nome)
+  POST /api/nidhogg/respostas/limpar {{\"pergunta\":nome}} apaga a timeline (pergunta volta a responder do zero)
   POST /api/nidhogg/perguntar       {{\"pergunta\":\"nome\"}} responde AGORA (lento: analista + comparador)
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
