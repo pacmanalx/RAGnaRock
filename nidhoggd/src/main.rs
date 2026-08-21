@@ -1037,6 +1037,23 @@ const L4_TRECHOS: usize = 6;              // trechos do corpus trazidos pelo RAG
 const L4_PROVA_CHARS: usize = 8_000;
 const L4_PISTAS_CHARS: usize = 2_500;     // relações do L3 (pista, não prova)
 
+/// Saneia UMA questão vinda do cliente: nome e texto obrigatórios, tipo dentro do vocabulário,
+/// escopo default '*'. Devolve None pro que não é questão — o cadastro nunca guarda meia-linha.
+fn sanea_pergunta(p: &Value) -> Option<Value> {
+    let nome = p["nome"].as_str().unwrap_or("").trim().to_string();
+    let texto = p["texto"].as_str().unwrap_or("").trim().to_string();
+    if nome.is_empty() || texto.is_empty() { return None; }
+    let tipo = match p["tipo"].as_str().unwrap_or("vivo") {
+        t @ ("tabular" | "oneshot" | "vivo") => t, _ => "vivo",
+    };
+    Some(json!({
+        "nome": nome, "texto": texto, "tipo": tipo,
+        "escopo": nfc(p["escopo"].as_str().unwrap_or("*").trim()),
+        "ativa": p["ativa"].as_bool().unwrap_or(true),
+        "pai": p["pai"].as_str().unwrap_or(""),   // recursão declarada: filha de qual pergunta
+    }))
+}
+
 /// Monta o CONTEXTO — a metade determinística da L4. Nada aqui é decidido por IA: agregados
 /// do dump, amostra de registros, as relações do L3 e os trechos que o RAGnaRock casa com a
 /// pergunta.
@@ -2044,32 +2061,85 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
+        // Substitui o cadastro INTEIRO. É a única rota que consegue REMOVER em massa, e foi
+        // exatamente assim que 3 questões evaporaram (21/ago, 05:53): o front mandava a lista
+        // do navegador a cada clique — uma aba velha, um GET que falhou e voltou vazio, ou uma
+        // lixeira clicada por engano levavam tudo junto, sem aviso e sem histórico (o blob é
+        // ReplacingMergeTree ORDER BY tuple(): o merge colapsa as versões anteriores).
+        // Agora remover em massa exige INTENÇÃO declarada — quem só quer criar/editar/pausar
+        // uma questão usa /upsert, e quem quer tirar uma usa /remover.
         (Method::Post, "/api/nidhogg/perguntas") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let ps = match v["perguntas"].as_array() { Some(a) => a.clone(), None => return (400, json!({"error":"falta 'perguntas' (array)"}).to_string()) };
-            // saneia: nome e texto obrigatórios; tipo dentro do vocabulário; escopo default '*'
-            let mut limpo: Vec<Value> = vec![];
-            for p in &ps {
-                let nome = p["nome"].as_str().unwrap_or("").trim().to_string();
-                let texto = p["texto"].as_str().unwrap_or("").trim().to_string();
-                if nome.is_empty() || texto.is_empty() { continue; }
-                let tipo = match p["tipo"].as_str().unwrap_or("vivo") {
-                    t @ ("tabular" | "oneshot" | "vivo") => t, _ => "vivo",
-                };
-                limpo.push(json!({
-                    "nome": nome, "texto": texto, "tipo": tipo,
-                    "escopo": nfc(p["escopo"].as_str().unwrap_or("*").trim()),
-                    "ativa": p["ativa"].as_bool().unwrap_or(true),
-                    "pai": p["pai"].as_str().unwrap_or(""),   // recursão declarada: filha de qual pergunta
-                }));
-            }
+            let limpo: Vec<Value> = ps.iter().filter_map(sanea_pergunta).collect();
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
             if store != "clickhouse" { return (400, json!({"error":"perguntas requerem clickhouse"}).to_string()); }
+            let atual = chdb::perguntas(&ch_url).unwrap_or_else(|_| json!([]));
+            let novos: std::collections::HashSet<String> = limpo.iter()
+                .filter_map(|p| p["nome"].as_str().map(|s| s.to_string())).collect();
+            let sumiriam: Vec<String> = atual.as_array().cloned().unwrap_or_default().iter()
+                .filter_map(|p| p["nome"].as_str().map(|s| s.to_string()))
+                .filter(|n| !novos.contains(n)).collect();
+            if !sumiriam.is_empty() && v["substituir_tudo"].as_bool() != Some(true) {
+                return (409, json!({"error": "este cadastro removeria questões que existem hoje",
+                                    "sumiriam": sumiriam,
+                                    "dica": "use /perguntas/remover pra tirar uma, ou repita com \"substituir_tudo\": true"}).to_string());
+            }
             match chdb::write_perguntas(&ch_url, &json!(limpo)) {
-                Ok(_) => { nlog(&format!("L4: cadastro de perguntas atualizado ({} ativa(s))", limpo.len()));
+                Ok(_) => { nlog(&format!("L4: cadastro reescrito ({} questão(ões){})", limpo.len(),
+                                         if sumiriam.is_empty() { String::new() } else { format!(", {} removida(s): {}", sumiriam.len(), sumiriam.join(", ")) }));
                            (200, json!({"ok": true, "perguntas": limpo}).to_string()) }
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
+        }
+        // Cria OU edita UMA questão (inclui pausar/reativar: é o objeto inteiro com `ativa`).
+        // Lê o cadastro do disco e mexe só na dela — o que o navegador tem em tela não pode
+        // mais apagar o trabalho de outra aba.
+        (Method::Post, "/api/nidhogg/perguntas/upsert") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let nova = match sanea_pergunta(&v["pergunta"]) { Some(p) => p,
+                None => return (400, json!({"error":"falta 'pergunta' com 'nome' e 'texto'"}).to_string()) };
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"perguntas requerem clickhouse"}).to_string()); }
+            let nome = nova["nome"].as_str().unwrap_or("").to_string();
+            let mut lista = chdb::perguntas(&ch_url).unwrap_or_else(|_| json!([])).as_array().cloned().unwrap_or_default();
+            let criou = match lista.iter_mut().find(|p| p["nome"].as_str() == Some(&nome)) {
+                Some(slot) => { *slot = nova.clone(); false }
+                None => { lista.push(nova.clone()); true }
+            };
+            match chdb::write_perguntas(&ch_url, &json!(lista)) {
+                Ok(_) => { nlog(&format!("L4: questão {nome:?} {} ({} no cadastro)",
+                                         if criou {"cadastrada"} else {"atualizada"}, lista.len()));
+                           (200, json!({"ok": true, "criou": criou, "pergunta": nova, "perguntas": lista}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // Tira UMA questão do cadastro. `purgar: true` apaga a timeline dela no mesmo gesto —
+        // senão o histórico fica no dump e uma questão futura com o MESMO nome o herda (a
+        // chave é o nome), continuando a numeração das etapas de onde a anterior parou.
+        (Method::Post, "/api/nidhogg/perguntas/remover") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let nome = v["nome"].as_str().unwrap_or("").trim().to_string();
+            if nome.is_empty() { return (400, json!({"error":"falta 'nome'"}).to_string()); }
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error":"perguntas requerem clickhouse"}).to_string()); }
+            let lista = chdb::perguntas(&ch_url).unwrap_or_else(|_| json!([])).as_array().cloned().unwrap_or_default();
+            let restante: Vec<Value> = lista.iter().filter(|p| p["nome"].as_str() != Some(&nome)).cloned().collect();
+            if restante.len() == lista.len() { return (404, json!({"error": format!("questão {nome:?} não está no cadastro")}).to_string()); }
+            if let Err(e) = chdb::write_perguntas(&ch_url, &json!(restante)) {
+                return (500, json!({"error": format!("store: {e}")}).to_string());
+            }
+            let mut apagadas = 0u64;
+            if v["purgar"].as_bool() == Some(true) {
+                match chdb::delete_respostas(&ch_url, &nome) {
+                    Ok(n) => { apagadas = n; if let Ok(mut m) = l4_visto().lock() { m.remove(&nome); } }
+                    Err(e) => return (500, json!({"ok": false, "removida": true,
+                                                  "error": format!("cadastro saiu, mas a timeline ficou: {e}")}).to_string()),
+                }
+            }
+            nlog(&format!("L4: questão {nome:?} removida do cadastro ({} restante(s), {} etapa(s) apagada(s))",
+                          restante.len(), apagadas));
+            (200, json!({"ok": true, "nome": nome, "etapas_apagadas": apagadas, "perguntas": restante}).to_string())
         }
         // [L4] a TIMELINE de uma pergunta — as etapas em ordem cronológica
         (Method::Get, "/api/nidhogg/respostas") => {
@@ -3422,6 +3492,8 @@ rotas:
   GET  /api/nidhogg/relacoes        relações destiladas pelo L3 (?collection=&n=) — só leitura
   GET  /api/nidhogg/perguntas       cadastro de questões diretas do L4
   POST /api/nidhogg/perguntas       {{\"perguntas\":[{{nome,texto,tipo:tabular|oneshot|vivo,escopo,ativa}}]}}
+  POST /api/nidhogg/perguntas/upsert  {{\"pergunta\":{{...}}}} cria/edita/pausa UMA (não toca nas outras)
+  POST /api/nidhogg/perguntas/remover {{\"nome\":n,\"purgar\":bool}} tira UMA (e a timeline, se purgar)
   GET  /api/nidhogg/respostas       timeline de uma pergunta (?pergunta=nome)
   POST /api/nidhogg/respostas/limpar {{\"pergunta\":nome}} apaga a timeline (pergunta volta a responder do zero)
   POST /api/nidhogg/perguntar       {{\"pergunta\":\"nome\"}} responde AGORA (lento: analista + comparador)

@@ -92,8 +92,15 @@ export const getNidhoggRelacoes = (collection?: string, n = 300) =>
     `/api/nidhogg/relacoes?n=${n}${collection && collection !== '*' ? `&collection=${encodeURIComponent(collection)}` : ''}`)
 // ── [L4 · Perguntas] cadastro de questões diretas + timeline das respostas ──
 export const getPerguntas = () => nidhogg.get<{ perguntas: Pergunta[] }>('/api/nidhogg/perguntas')
-export const savePerguntas = (perguntas: Pergunta[]) =>
-  nidhogg.post<{ ok: boolean; perguntas: Pergunta[] }>('/api/nidhogg/perguntas', { perguntas })
+// GRANULAR de propósito: cada gesto mexe só na SUA questão. O antigo replace-all (mandar a
+// lista inteira do navegador a cada clique) apagou 3 questões em 21/ago — uma aba velha ou um
+// clique errado levavam o cadastro junto. Aquela rota continua existindo, mas hoje exige
+// `substituir_tudo` pra remover em massa, e a tela não a usa mais.
+export const upsertPergunta = (pergunta: Pergunta) =>
+  nidhogg.post<{ ok: boolean; criou: boolean; perguntas: Pergunta[] }>('/api/nidhogg/perguntas/upsert', { pergunta })
+export const removerPergunta = (nome: string, purgar: boolean) =>
+  nidhogg.post<{ ok: boolean; nome: string; etapas_apagadas: number; perguntas: Pergunta[] }>(
+    '/api/nidhogg/perguntas/remover', { nome, purgar })
 export const getTimeline = (pergunta: string) =>
   nidhogg.get<TimelineResposta>(`/api/nidhogg/respostas?pergunta=${encodeURIComponent(pergunta)}`)
 // responde AGORA (não espera o ciclo) — LENTO: monta contexto, analista e comparador

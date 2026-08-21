@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Eraser, HelpCircle, Pause, Play, Plus, Table2, Timer, Trash2, Zap } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
-import { getPerguntas, savePerguntas, getTimeline, perguntarAgora, limparRespostas, getNidhoggCollections } from '@/api/ragnarock'
+import { getPerguntas, upsertPergunta, removerPergunta, getTimeline, perguntarAgora, limparRespostas, getNidhoggCollections } from '@/api/ragnarock'
 import type { Pergunta, TipoResposta, EtapaResposta, RespostaTabular } from '@/api/types'
 import { messageFromError } from '@/api/client'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
@@ -48,29 +48,32 @@ export function PerguntasPanel() {
 
   useEffect(() => { if (!sel && lista.length > 0) setSel(lista[0].nome) }, [lista, sel])
 
-  async function persistir(novaLista: Pergunta[]) {
+  // Uma questão por vez, sempre — nunca a lista inteira. O servidor lê o cadastro do disco e
+  // mexe só nesta: o que está na tela não pode mais apagar o que não está.
+  async function salvar(p: Pergunta) {
     setSalvando(true); setErro(null)
-    try { await savePerguntas(novaLista); setNova(null); ps.reload() }
+    try { await upsertPergunta(p); setNova(null); ps.reload() }
     catch (e) { setErro(messageFromError(e)) }
     finally { setSalvando(false) }
   }
 
   async function excluir(nome: string, purgar: boolean) {
-    setConfirmar(null); setAviso(null); setErro(null)
-    if (purgar) {
-      // purga ANTES de tirar do cadastro: se falhar, a questão continua listada e dá pra repetir
-      try { const r = await limparRespostas(nome); setAviso(`"${nome}" excluída — ${r.etapas_apagadas} etapa(s) apagada(s) do dump.`) }
-      catch (e) { setErro(`timeline não foi apagada: ${messageFromError(e)}`); return }
-    } else {
-      setAviso(`"${nome}" saiu do cadastro — a timeline dela continua no dump.`)
-    }
-    if (sel === nome) setSel(null)
-    await persistir(lista.filter((p) => p.nome !== nome))
+    setConfirmar(null); setAviso(null); setErro(null); setSalvando(true)
+    try {
+      // um gesto só: sai do cadastro e, se pedido, leva a timeline junto
+      const r = await removerPergunta(nome, purgar)
+      setAviso(purgar
+        ? `"${nome}" excluída — ${r.etapas_apagadas} etapa(s) apagada(s) do dump.`
+        : `"${nome}" saiu do cadastro — a timeline dela continua no dump.`)
+      if (sel === nome) setSel(null)
+      ps.reload()
+    } catch (e) { setErro(messageFromError(e)) }
+    finally { setSalvando(false) }
   }
 
   function alternarAtiva(p: Pergunta) {
     setAviso(null)
-    void persistir(lista.map((x) => (x.nome === p.nome ? { ...x, ativa: !x.ativa } : x)))
+    void salvar({ ...p, ativa: !p.ativa })
   }
 
   return (
@@ -126,7 +129,7 @@ export function PerguntasPanel() {
             onCancel={() => setNova(null)}
             onSave={() => {
               if (lista.some((p) => p.nome === nova.nome.trim())) { setErro('já existe pergunta com esse nome'); return }
-              void persistir([...lista, { ...nova, nome: nova.nome.trim() }])
+              void salvar({ ...nova, nome: nova.nome.trim() })
             }}
           />
         )}
