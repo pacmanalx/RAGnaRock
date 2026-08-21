@@ -7,7 +7,7 @@ import type {
   NidhoggCollection, NidhoggClassesSummary, NidhoggEntitiesSummary, NidhoggRejeitados,
   KnowledgeResponse, CacheDigestResponse, NidhoggDoctypes, NidhoggPrompts, MoldeTemplate,
   TreeResponse, NavNode, Dimensao, DimValoresResponse, DimGap, LlmLedgerResponse,
-  NidhoggRelacoes, Pergunta, TimelineResposta, RespondeuAgora,
+  NidhoggRelacoes, Pergunta, TimelineResposta, RespondeuAgora, DoctypeUso,
 } from './types'
 
 export const getHealth = () => ragd.get<Health>('/health')
@@ -123,8 +123,12 @@ export const postMoldeDirigido = (tipo: string, collection: string, base: string
 
 // [L2 · Dimensões] eixos declarados: o humano diz o que importa, a navegação pivota por eles
 export const getDimensoes = () => nidhogg.get<{ dimensoes: Dimensao[] }>('/api/nidhogg/dimensoes')
-export const saveDimensoes = (dimensoes: Dimensao[]) =>
-  nidhogg.post<{ ok: boolean }>('/api/nidhogg/dimensoes', { dimensoes })
+// granular, como no cadastro do L4: um gesto mexe só no SEU eixo (o replace-all antigo
+// deixava uma aba velha apagar o que outra criou)
+export const upsertDimensao = (dimensao: Dimensao) =>
+  nidhogg.post<{ ok: boolean; criou: boolean; dimensoes: Dimensao[] }>('/api/nidhogg/dimensoes/upsert', { dimensao })
+export const removerDimensao = (nome: string) =>
+  nidhogg.post<{ ok: boolean; nome: string; dimensoes: Dimensao[] }>('/api/nidhogg/dimensoes/remover', { nome })
 export const getDimensaoValores = (nome: string, collection: string, q = '') =>
   nidhogg.get<DimValoresResponse>(
     `/api/nidhogg/dimensao/valores?nome=${encodeURIComponent(nome)}&collection=${encodeURIComponent(collection)}${q ? `&q=${encodeURIComponent(q)}` : ''}`)
@@ -133,6 +137,8 @@ export const getDimensoesGaps = (collection: string) =>
     `/api/nidhogg/dimensoes/gaps?collection=${encodeURIComponent(collection)}`)
 // vocabulário EDITÁVEL do classificador (Fase 1) — editar reclassifica no próximo ciclo
 export const getNidhoggDoctypes = () => nidhogg.get<NidhoggDoctypes>('/api/nidhogg/doctypes')
+// o que cada tipo do vocabulário carrega hoje — mostrado ANTES de remover um chip
+export const getDoctypesUso = () => nidhogg.get<{ uso: DoctypeUso[] }>('/api/nidhogg/doctypes/uso')
 export const setNidhoggDoctypes = (naturezas: string[], tipos: string[]) =>
   nidhogg.post<{ ok: boolean }>('/api/nidhogg/doctypes', { naturezas, tipos })
 // biblioteca de prompts nomeados (o que/como cada nível extrai)

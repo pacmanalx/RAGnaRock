@@ -1023,3 +1023,37 @@ pub fn delete_respostas(url: &str, pergunta: &str) -> Result<u64, String> {
     }
     Ok(n)
 }
+
+/// Quanto CUSTA tirar cada tipo do vocabulário do classificador. Não é estatística de vitrine:
+/// remover um tipo tem três desfechos diferentes e a tela precisa mostrá-los ANTES do clique.
+///   `bases`  — classificadas nele hoje; as de origem LLM voltam pro classificador (gasta IA)
+///   `humano` — re-tipadas à mão: `needs_class` curto-circuita em origem='humano', então elas
+///              NÃO são reclassificadas e ficariam apontando pra um tipo que não existe mais
+///   `moldes` — a tabela de templates é ORDER BY tipo: o molde do tipo removido fica órfão
+pub fn doctypes_uso(url: &str) -> Result<Value, String> {
+    let body = ch_exec(url,
+        "SELECT tipo, count() AS bases, countIf(origem='humano') AS humano \
+         FROM nidhogg.doc_class FINAL GROUP BY tipo FORMAT JSONEachRow", 20)?;
+    let mut uso: std::collections::HashMap<String, Value> = body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["tipo"].as_str()?.to_string(), v)))
+        .collect();
+    // o molde pode estar versionado como `tipo@hash` (molde dirigido) — o dono é o prefixo
+    let tpl = ch_exec(url, "SELECT tipo FROM nidhogg.template FINAL FORMAT TabSeparated", 20)
+        .unwrap_or_default();
+    let mut moldes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for t in tpl.lines().filter(|l| !l.trim().is_empty()) {
+        *moldes.entry(t.split('@').next().unwrap_or(t).to_string()).or_insert(0) += 1;
+    }
+    let mut out: Vec<Value> = vec![];
+    let tipos: std::collections::HashSet<String> = uso.keys().cloned().chain(moldes.keys().cloned()).collect();
+    for t in tipos {
+        let u = uso.remove(&t).unwrap_or_else(|| json!({}));
+        let n = |k: &str| u[k].as_u64().or_else(|| u[k].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+        out.push(json!({"tipo": t, "bases": n("bases"), "humano": n("humano"),
+                        "moldes": moldes.get(&t).copied().unwrap_or(0)}));
+    }
+    out.sort_by(|a, b| b["bases"].as_u64().unwrap_or(0).cmp(&a["bases"].as_u64().unwrap_or(0)));
+    Ok(json!(out))
+}

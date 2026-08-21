@@ -218,6 +218,9 @@ export interface RelacaoItem {
 export interface NidhoggRelacoes { count: number; bases: number; relacoes: RelacaoItem[]; note?: string }
 
 // ── Nidhogg L4: perguntas cadastradas + timeline de respostas ──
+// custo de tirar um tipo do vocabulário: bases classificadas nele, quantas foram fixadas à
+// mão (essas NÃO são reclassificadas — ficam apontando pro tipo que sumiu) e moldes órfãos
+export interface DoctypeUso { tipo: string; bases: number; humano: number; moldes: number }
 export type TipoResposta = 'tabular' | 'oneshot' | 'vivo'
 export interface Pergunta {
   nome: string

@@ -1037,6 +1037,22 @@ const L4_TRECHOS: usize = 6;              // trechos do corpus trazidos pelo RAG
 const L4_PROVA_CHARS: usize = 8_000;
 const L4_PISTAS_CHARS: usize = 2_500;     // relações do L3 (pista, não prova)
 
+/// Valida UM eixo de dimensão. Os padrões de campo viram LIKE de SQL lá na frente, então o
+/// alfabeto é restrito na porta de entrada (letras, dígitos, `_ . - *`) — não no meio do caminho.
+fn valida_dimensao(d: &Value) -> Result<(), String> {
+    let nome = d["nome"].as_str().unwrap_or("");
+    if nome.trim().is_empty() { return Err("dimensão sem 'nome'".into()); }
+    let campos = d["campos"].as_array().map(|a| a.len()).unwrap_or(0);
+    if campos == 0 { return Err(format!("dimensão '{nome}' sem 'campos'")); }
+    for c in d["campos"].as_array().unwrap() {
+        let cs = c.as_str().unwrap_or("");
+        if cs.is_empty() || !cs.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '*' | '.' | '-')) {
+            return Err(format!("padrão de campo inválido em '{nome}': {cs:?} (use letras, dígitos, _ . - e *)"));
+        }
+    }
+    Ok(())
+}
+
 /// Saneia UMA questão vinda do cliente: nome e texto obrigatórios, tipo dentro do vocabulário,
 /// escopo default '*'. Devolve None pro que não é questão — o cadastro nunca guarda meia-linha.
 fn sanea_pergunta(p: &Value) -> Option<Value> {
@@ -1778,26 +1794,67 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             }
             (200, json!({"dimensoes": dims}).to_string())
         }
+        // Substitui a lista INTEIRA de eixos. Mesma história do cadastro do L4 (21/ago): mandar
+        // a lista do navegador a cada clique deixa uma aba velha apagar o que outra criou. Aqui
+        // remover em massa exige intenção declarada; o caminho normal é /upsert e /remover.
         (Method::Post, "/api/nidhogg/dimensoes") => {
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
             if store != "clickhouse" { return (400, json!({"error": "requer clickhouse"}).to_string()); }
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()) };
             let dims = &v["dimensoes"];
             let arr = match dims.as_array() { Some(a) => a, None => return (400, json!({"error": "falta 'dimensoes' (array)"}).to_string()) };
-            for d in arr {
-                let nome = d["nome"].as_str().unwrap_or("");
-                if nome.trim().is_empty() { return (400, json!({"error": "dimensão sem 'nome'"}).to_string()); }
-                let campos = d["campos"].as_array().map(|a| a.len()).unwrap_or(0);
-                if campos == 0 { return (400, json!({"error": format!("dimensão '{nome}' sem 'campos'")}).to_string()); }
-                for c in d["campos"].as_array().unwrap() {
-                    let cs = c.as_str().unwrap_or("");
-                    if cs.is_empty() || !cs.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '*' | '.' | '-')) {
-                        return (400, json!({"error": format!("padrão de campo inválido em '{nome}': {cs:?} (use letras, dígitos, _ . - e *)")}).to_string());
-                    }
-                }
+            for d in arr { if let Err(e) = valida_dimensao(d) { return (400, json!({"error": e}).to_string()); } }
+            let atual = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([]));
+            let novos: std::collections::HashSet<String> = arr.iter()
+                .filter_map(|d| d["nome"].as_str().map(|s| s.to_string())).collect();
+            let sumiriam: Vec<String> = atual.as_array().cloned().unwrap_or_default().iter()
+                .filter_map(|d| d["nome"].as_str().map(|s| s.to_string()))
+                .filter(|n| !novos.contains(n)).collect();
+            if !sumiriam.is_empty() && v["substituir_tudo"].as_bool() != Some(true) {
+                return (409, json!({"error": "esta lista removeria eixos que existem hoje",
+                                    "sumiriam": sumiriam,
+                                    "dica": "use /dimensoes/remover pra tirar um, ou repita com \"substituir_tudo\": true"}).to_string());
             }
             match chdb::write_dimensoes(&ch_url, dims) {
-                Ok(_) => { nlog(&format!("dimensões salvas: {} eixo(s)", arr.len())); (200, json!({"ok": true, "dimensoes": dims}).to_string()) }
+                Ok(_) => { nlog(&format!("dimensões reescritas: {} eixo(s){}", arr.len(),
+                                         if sumiriam.is_empty() { String::new() } else { format!(", {} removido(s): {}", sumiriam.len(), sumiriam.join(", ")) }));
+                           (200, json!({"ok": true, "dimensoes": dims}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // Cria OU edita UM eixo — o servidor lê a lista do disco e mexe só nele.
+        (Method::Post, "/api/nidhogg/dimensoes/upsert") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error": "requer clickhouse"}).to_string()); }
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()) };
+            let nova = v["dimensao"].clone();
+            if let Err(e) = valida_dimensao(&nova) { return (400, json!({"error": e}).to_string()); }
+            let nome = nova["nome"].as_str().unwrap_or("").trim().to_string();
+            let mut lista = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([])).as_array().cloned().unwrap_or_default();
+            let criou = match lista.iter_mut().find(|d| d["nome"].as_str() == Some(&nome)) {
+                Some(slot) => { *slot = nova.clone(); false }
+                None => { lista.push(nova.clone()); true }
+            };
+            match chdb::write_dimensoes(&ch_url, &json!(lista)) {
+                Ok(_) => { nlog(&format!("dimensão {nome:?} {} ({} eixo(s))", if criou {"criada"} else {"atualizada"}, lista.len()));
+                           (200, json!({"ok": true, "criou": criou, "dimensoes": lista}).to_string()) }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
+        // Tira UM eixo. Só o eixo declarado sai — nenhum dado do dump é tocado (a dimensão é
+        // uma LENTE sobre o que já está lá, não um contêiner).
+        (Method::Post, "/api/nidhogg/dimensoes/remover") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (400, json!({"error": "requer clickhouse"}).to_string()); }
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()) };
+            let nome = v["nome"].as_str().unwrap_or("").trim().to_string();
+            if nome.is_empty() { return (400, json!({"error":"falta 'nome'"}).to_string()); }
+            let lista = chdb::dimensoes(&ch_url).unwrap_or_else(|_| json!([])).as_array().cloned().unwrap_or_default();
+            let restante: Vec<Value> = lista.iter().filter(|d| d["nome"].as_str() != Some(&nome)).cloned().collect();
+            if restante.len() == lista.len() { return (404, json!({"error": format!("eixo {nome:?} não está declarado")}).to_string()); }
+            match chdb::write_dimensoes(&ch_url, &json!(restante)) {
+                Ok(_) => { nlog(&format!("dimensão {nome:?} removida ({} restante(s))", restante.len()));
+                           (200, json!({"ok": true, "nome": nome, "dimensoes": restante}).to_string()) }
                 Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
             }
         }
@@ -1935,6 +1992,18 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let (store, dir, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
             let (nat, tip) = store_doctypes(&store, &dir, &ch_url);
             (200, json!({"naturezas": nat, "tipos": tip}).to_string())
+        }
+        // [doctypes] o CUSTO de tirar cada tipo do vocabulário — a tela mostra antes do clique.
+        // Remover um tipo não é editar texto: as bases de origem LLM voltam pro classificador
+        // (gasta IA), as re-tipadas à mão ficam PRESAS num tipo inexistente (needs_class
+        // curto-circuita em origem='humano') e o molde do tipo fica órfão.
+        (Method::Get, "/api/nidhogg/doctypes/uso") => {
+            let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
+            if store != "clickhouse" { return (200, json!({"uso": []}).to_string()); }
+            match chdb::doctypes_uso(&ch_url) {
+                Ok(u) => (200, json!({"uso": u}).to_string()),
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
         }
         (Method::Post, "/api/nidhogg/doctypes") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
@@ -3494,6 +3563,8 @@ rotas:
   POST /api/nidhogg/perguntas       {{\"perguntas\":[{{nome,texto,tipo:tabular|oneshot|vivo,escopo,ativa}}]}}
   POST /api/nidhogg/perguntas/upsert  {{\"pergunta\":{{...}}}} cria/edita/pausa UMA (não toca nas outras)
   POST /api/nidhogg/perguntas/remover {{\"nome\":n,\"purgar\":bool}} tira UMA (e a timeline, se purgar)
+  POST /api/nidhogg/dimensoes/upsert  {{\"dimensao\":{{...}}}} · /dimensoes/remover {{\"nome\":n}}
+  GET  /api/nidhogg/doctypes/uso    custo de tirar cada tipo (bases, fixadas por humano, moldes)
   GET  /api/nidhogg/respostas       timeline de uma pergunta (?pergunta=nome)
   POST /api/nidhogg/respostas/limpar {{\"pergunta\":nome}} apaga a timeline (pergunta volta a responder do zero)
   POST /api/nidhogg/perguntar       {{\"pergunta\":\"nome\"}} responde AGORA (lento: analista + comparador)

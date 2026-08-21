@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ChevronDown, ChevronRight, Plus, Save, X } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
 import {
-  getNidhoggCollections, getNidhoggClasses, getNidhoggDoctypes, setNidhoggDoctypes,
+  getNidhoggCollections, getNidhoggClasses, getNidhoggDoctypes, setNidhoggDoctypes, getDoctypesUso,
   getNidhoggTemplates, getNidhoggPrompts, saveNidhoggPrompt,
 } from '@/api/ragnarock'
 import type { PromptTemplate } from '@/api/types'
@@ -118,6 +118,10 @@ function ClassesDaColecao({ collection }: { collection: string }) {
 // ───────────────────────── doctypes: o vocabulário do classificador ─────────────────────────
 function Doctypes() {
   const dt = useAsync(getNidhoggDoctypes, [])
+  // o que cada tipo carrega HOJE. Remover um tipo não é editar texto: as bases de origem LLM
+  // voltam pro classificador (gasta IA), as re-tipadas à mão ficam PRESAS apontando pro tipo
+  // que sumiu (needs_class curto-circuita em origem='humano') e o molde do tipo fica órfão.
+  const uso = useAsync(getDoctypesUso, [])
   const [edit, setEdit] = useState<{ naturezas: string[]; tipos: string[] } | null>(null)
   const [novo, setNovo] = useState<{ nat: string; tip: string }>({ nat: '', tip: '' })
   const [busy, setBusy] = useState(false)
@@ -130,19 +134,41 @@ function Doctypes() {
   async function salvar() {
     if (!edit || busy) return
     setBusy(true); setError(null)
-    try { await setNidhoggDoctypes(edit.naturezas, edit.tipos); setEdit(null); setOk(true); setTimeout(() => setOk(false), 2500); dt.reload() }
+    try { await setNidhoggDoctypes(edit.naturezas, edit.tipos); setEdit(null); setOk(true); setTimeout(() => setOk(false), 2500); dt.reload(); uso.reload() }
     catch (e) { setError(messageFromError(e)) }
     finally { setBusy(false) }
   }
 
-  const chips = (lista: string[], onRemove: (v: string) => void) => (
+  const custo = (v: string) => (uso.data?.uso ?? []).find((u) => u.tipo === v)
+
+  // `comCusto` liga o aviso: nas naturezas não há o que medir (o uso é por TIPO), então a
+  // mesma função serve os dois blocos com o custo desligado no primeiro.
+  const chips = (lista: string[], onRemove: (v: string) => void, comCusto = false) => (
     <div className="flex flex-wrap gap-1.5">
-      {lista.map((v) => (
-        <span key={v} className="group flex items-center gap-1 rounded-full border border-[var(--color-border)] px-2.5 py-0.5 text-[12px]">
+      {lista.map((v) => {
+        const u = comCusto ? custo(v) : undefined
+        const emUso = (u?.bases ?? 0) + (u?.moldes ?? 0) > 0
+        return (
+        <span key={v} title={u ? `${u.bases} base(s) classificada(s)${u.humano ? `, ${u.humano} fixada(s) à mão` : ''}${u.moldes ? `, ${u.moldes} molde(s)` : ''}` : undefined}
+          className="group flex items-center gap-1 rounded-full border border-[var(--color-border)] px-2.5 py-0.5 text-[12px]">
           {v}
-          <button onClick={() => onRemove(v)} title="remover" className="hidden text-[var(--color-muted)] hover:text-[var(--color-crit)] group-hover:block"><X size={11} /></button>
+          {emUso && (
+            <span className={`font-mono text-[10px] ${u?.humano ? 'text-[var(--color-crit)]' : 'text-[var(--color-muted)]'}`}>
+              {u?.bases ?? 0}{u?.humano ? `·${u.humano}✋` : ''}{u?.moldes ? `·${u.moldes}⬚` : ''}
+            </span>
+          )}
+          <button onClick={() => {
+            if (u?.humano) {
+              // as fixadas à mão são o dano irreversível: ninguém as reclassifica depois
+              if (!confirm(`O tipo "${v}" tem ${u.humano} base(s) re-tipada(s) À MÃO. Elas NÃO são reclassificadas — vão continuar apontando para um tipo que não existe mais. Remover mesmo assim?`)) return
+            } else if (emUso) {
+              if (!confirm(`O tipo "${v}" tem ${u?.bases ?? 0} base(s) classificada(s)${u?.moldes ? ` e ${u.moldes} molde(s)` : ''}. Elas voltam para o classificador no próximo ciclo (gasta IA)${u?.moldes ? ' e o molde fica órfão' : ''}. Remover?`)) return
+            }
+            onRemove(v)
+          }} title="remover" className="hidden text-[var(--color-muted)] hover:text-[var(--color-crit)] group-hover:block"><X size={11} /></button>
         </span>
-      ))}
+        )
+      })}
     </div>
   )
 
@@ -180,7 +206,7 @@ function Doctypes() {
           </div>
           <div>
             <div className="mb-1.5 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">tipos ({atual.tipos.length})</div>
-            {chips(atual.tipos, (v) => setEdit({ ...atual, tipos: atual.tipos.filter((x) => x !== v) }))}
+            {chips(atual.tipos, (v) => setEdit({ ...atual, tipos: atual.tipos.filter((x) => x !== v) }), true)}
             <div className="mt-2 flex gap-2">
               <input value={novo.tip} onChange={(e) => setNovo({ ...novo, tip: e.target.value })} placeholder="novo tipo…" className={`w-[180px] ${inputCls}`} />
               <button
@@ -190,6 +216,8 @@ function Doctypes() {
             </div>
           </div>
           <div className="text-[11px] text-[var(--color-muted)]">
+            no chip do tipo: <b>nº de bases</b> classificadas nele · <b>✋</b> quantas foram fixadas à mão
+            (essas NÃO são reclassificadas — some com o tipo e elas ficam órfãs) · <b>⬚</b> moldes de extração.<br />
             editar esta lista muda o enum que o classificador enxerga — TODO o corpus reclassifica no próximo ciclo (checkpoint por hash).
           </div>
         </div>

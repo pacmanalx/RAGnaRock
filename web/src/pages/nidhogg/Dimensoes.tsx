@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Compass, Pencil, Plus, Search, Trash2 } from 'lucide-react'
 import { useAsync } from '@/hooks/useAsync'
-import { getDimensoes, saveDimensoes, getDimensaoValores, getDimensoesGaps, getNidhoggClasses } from '@/api/ragnarock'
+import { getDimensoes, upsertDimensao, removerDimensao, getDimensaoValores, getDimensoesGaps, getNidhoggClasses } from '@/api/ragnarock'
 import type { Dimensao, DimValorItem, DimGap } from '@/api/types'
 import { ModalDirigido, type AcaoDirigido } from './Gaps'
 import { messageFromError } from '@/api/client'
@@ -32,20 +32,30 @@ export function DimensoesPanel({ colecoes, onNavegar }: {
   const lista = dims.data?.dimensoes ?? []
   const ativa = lista.find((d) => d.nome === sel) ?? null
 
-  async function persistir(novaLista: Dimensao[]) {
+  // um eixo por vez, nunca a lista inteira: o servidor lê o que está no disco e mexe só neste.
+  // `anterior` cobre o RENOMEAR: o nome é a chave, então gravar com o nome novo cria um segundo
+  // eixo — o antigo precisa sair depois, e só depois que o novo já está no disco.
+  async function salvar(d: Dimensao, anterior?: string) {
     setSalvando(true); setErro(null)
     try {
-      await saveDimensoes(novaLista)
+      await upsertDimensao(d)
+      if (anterior && anterior !== d.nome) await removerDimensao(anterior)
       setEditando(null); setNovo(false)
+      if (sel === anterior) setSel(d.nome)
       dims.reload()
     } catch (e) { setErro(messageFromError(e)) }
     finally { setSalvando(false) }
   }
 
-  function excluir(nome: string) {
+  async function excluir(nome: string) {
     if (!confirm(`Excluir a dimensão "${nome}"? (só o eixo declarado — nenhum dado do dump é tocado)`)) return
-    if (sel === nome) setSel(null)
-    void persistir(lista.filter((d) => d.nome !== nome))
+    setSalvando(true); setErro(null)
+    try {
+      await removerDimensao(nome)
+      if (sel === nome) setSel(null)
+      dims.reload()
+    } catch (e) { setErro(messageFromError(e)) }
+    finally { setSalvando(false) }
   }
 
   return (
@@ -102,10 +112,7 @@ export function DimensoesPanel({ colecoes, onNavegar }: {
         {editando ? (
           <FormDimensao dim={editando} novo={novo} lista={lista} salvando={salvando}
             onCancel={() => { setEditando(null); setNovo(false) }}
-            onSave={(d) => {
-              const outros = lista.filter((x) => x.nome !== (novo ? d.nome : editando.nome))
-              void persistir([...outros, d].sort((a, b) => a.nome.localeCompare(b.nome)))
-            }} />
+            onSave={(d) => { void salvar(d, novo ? undefined : editando.nome) }} />
         ) : ativa ? (
           <ValoresDimensao dim={ativa} escopo={escopo} setEscopo={setEscopo} colecoes={colecoes} onNavegar={onNavegar} />
         ) : (
