@@ -162,7 +162,7 @@ function Cartao({ p, sel, onSel, onAlternar, confirmando, onPedirExcluir, onCanc
         </div>
         <div className="mt-0.5 line-clamp-2 text-[11px] text-[var(--color-muted)]">{p.texto}</div>
       </button>
-      <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[var(--color-muted)]">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[var(--color-muted)]">
         <span>{T.label}</span>
         <span>· escopo {p.escopo === '*' ? 'todas' : p.escopo}</span>
         {p.pai && <span title={`desdobrada de "${p.pai}"`}>· ↳ {p.pai}</span>}
@@ -223,14 +223,20 @@ function EditorPergunta({ valor, setValor, onSave, onCancel, salvando, colecoes 
         <div>
           <span className="text-[11px] text-[var(--color-muted)]">tipo de resposta</span>
           <div className="mt-1 grid gap-1.5">
+            {/* label e explicação EMPILHADOS. Na horizontal o `truncate` do hint não segurava:
+                num flex, o filho só encolhe com `min-w-0` — sem isso ele mantém a largura do
+                texto inteiro e o botão VAZA pra fora da coluna de 340px (era o que acontecia).
+                Empilhado, a explicação quebra em linha e ninguém precisa de reticências. */}
             {TIPOS.map((t) => (
               <button key={t.v} onClick={() => setValor({ ...valor, tipo: t.v })} title={t.hint}
-                className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-[12px] ${valor.tipo === t.v
+                className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-1.5 text-left text-[12px] ${valor.tipo === t.v
                   ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10'
                   : 'border-[var(--color-border)] hover:border-[var(--color-muted)]'}`}>
-                <t.icon size={13} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="font-medium">{t.label}</span>
-                <span className="truncate text-[10px] text-[var(--color-muted)]">{t.hint}</span>
+                <t.icon size={13} className="mt-0.5 shrink-0 text-[var(--color-accent)]" />
+                <span className="min-w-0">
+                  <span className="block font-medium">{t.label}</span>
+                  <span className="block text-[10px] leading-snug text-[var(--color-muted)]">{t.hint}</span>
+                </span>
               </button>
             ))}
           </div>
