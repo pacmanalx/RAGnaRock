@@ -2090,7 +2090,11 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // escopo" para uma pergunta que não tem mais resposta nenhuma.
         (Method::Post, "/api/nidhogg/respostas/limpar") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
-            let nome = nfc(v["pergunta"].as_str().unwrap_or("").trim());
+            // trim e mais nada: o nome tem que ser BYTE-IDÊNTICO ao que /perguntar casa e ao que
+            // `insert_resposta` gravou (ambos usam `p["nome"]` cru). Normalizar aqui (nfc) criaria
+            // uma segunda convenção — e o desencontro seria SILENCIOSO: a mutation casaria zero
+            // linhas e o `remove` do cache seria no-op, devolvendo ok com 0 etapas apagadas.
+            let nome = v["pergunta"].as_str().unwrap_or("").trim().to_string();
             if nome.is_empty() { return (400, json!({"error":"falta 'pergunta' (o nome cadastrado)"}).to_string()); }
             let (store, ch_url) = { let s = st.lock().unwrap(); (s.store.clone(), s.ch_url.clone()) };
             if store != "clickhouse" { return (400, json!({"error":"L4 requer clickhouse"}).to_string()); }

@@ -285,7 +285,7 @@ function Respostas({ pergunta, onDesdobrar, onReativar }: {
 
   // apaga tudo que a questão gerou. O cadastro fica: é "recomeçar", não "excluir".
   async function limpar() {
-    if (!confirm(`Apagar as ${etapas.length} etapa(s) de "${pergunta.nome}"? A questão continua cadastrada e responde do zero.`)) return
+    if (!confirm(`Apagar as ${etapas.length} etapa(s) de "${pergunta.nome}"? A questão continua cadastrada e responde do zero.`)) return  // 0 etapas: ainda destrava a saturação
     setLimpando(true); setErro(null); setNota(null)
     try {
       const r = await limparRespostas(pergunta.nome)
@@ -300,7 +300,10 @@ function Respostas({ pergunta, onDesdobrar, onReativar }: {
       <Panel title={`❓ ${pergunta.texto}`}
         actions={
           <div className="flex items-center gap-1.5">
-            {etapas.length > 0 && (
+            {/* sempre visível: parte do trabalho de "limpar" é derrubar o cache de saturação em
+                memória, que pode existir SEM nenhuma etapa gravada (insert que falhou) — e é
+                justamente aí que a questão fica muda. O handler devolve 0 sem drama. */}
+            {(
               <button onClick={limpar} disabled={limpando || busy}
                 title="apaga a timeline inteira; o cadastro da questão permanece"
                 className="flex items-center gap-1 rounded-md border border-[var(--color-border)] px-2.5 py-1 text-[11px] hover:border-[var(--color-crit)] hover:text-[var(--color-crit)] disabled:opacity-50">
