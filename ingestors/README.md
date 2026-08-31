@@ -2,7 +2,7 @@
 
 Um **ingestor** é uma caixa-preta com **pinagem fixa**: o daemon chama o script via shell, e o
 núcleo não quer saber o que tem dentro (Python, bash, um binário). É o mesmo caminho para
-**arquivos** (pdf/docx/xlsx) e para **bancos vivos** (mysql/postgres/sqlserver/oracle/mongo/sqlite,
+**arquivos** (pdf/docx/pptx/xlsx) e para **bancos vivos** (mysql/postgres/sqlserver/oracle/mongo/sqlite,
 via *receitas de ingestão*). Sidecar **opcional**: o binário de ~2 MB sozinho continua fazendo RAG
 de texto sem nenhum destes scripts.
 
@@ -112,6 +112,20 @@ transcrição cai na caixa de conteúdo, uma pessoa lê e corrige, e só então 
 transcrição é interpretação de máquina, e interpretação não entra em histórico sem assinatura
 humana. O teto é o `transcribe_timeout_s` do cfg (900s), separado dos 120s da ingestão porque
 transcrever roda a ~0,4x o tempo real.
+
+## O que cada driver de arquivo decide sozinho (e por quê)
+
+O contrato diz *texto no stdout* e nada sobre o que é texto — então cada driver toma uma
+decisão de conteúdo, e ela fica no cabeçalho dele:
+
+- **pdf.py** — páginas separadas por linha em branco; PDF de imagem é rejeitado, não devolvido
+  vazio.
+- **docx.py** — parágrafos um por linha; tabela vira linha com células por TAB.
+- **pptx.py** — slide faz o papel da página. Traz também as **notas do apresentador**: num deck
+  o slide carrega o título e a nota carrega o argumento, e descartá-la jogaria fora a parte
+  narrativa. A ordem é a do `sldIdLst`, não a dos nomes de arquivo — um deck reordenado mantém
+  `slide7.xml` na quarta posição, e ordenar por nome contaria a história na sequência errada.
+  Único driver de arquivo **sem dependência fora da stdlib** (`.pptx` é ZIP de XML).
 
 ## Fronteira (não confundir)
 
