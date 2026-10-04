@@ -119,7 +119,7 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
   | `ragfiles_dir` | `ragfiles` | bases tokenizadas (auto-load) |
   | `max_upload` | 1 GB | teto do `POST /ingest_upload` |
   | `autoload` | true | carregar bases no boot |
-  | `storage` | `memory` | `memory` (cacheia tokens) \| `hybrid` (recomputa) |
+  | `storage` | `memory` | `memory` (cacheia tokens) \| `hybrid` (recomputa) \| `disk` (texto via mmap, #41) |
   | `admin_user`/`admin_pass` | admin/admin | login do console — **[FUTURO] trocar fora do dev** |
   | `active_provider` | none | `none`\|`anthropic`\|`openai` (1 ativo; p/ query-expansion) |
   | `cache_dir` | `cache` | `thesaurus.json` / `expansions.json` |
@@ -191,12 +191,21 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
 |---|---|---|---|
 | `memory` (default) | `meta`+`idf`+`chunks` **com `words` cacheado** | busca mais rápida, +RAM | [FEITO] |
 | `hybrid` | idem **sem `words`** (recomputa só dos candidatos no rerank) | −66% RAM medido, busca ampla um pouco mais lenta | [FEITO] |
+| `disk` | idem `hybrid` **sem o texto dos chunks** — o texto fica em `<base>-tokenized.textblob` (ao lado do JSON, regravado a cada carga) e é lido por mmap | o texto sai do heap; mesmos resultados do `memory`; busca na velocidade do `hybrid` | [FEITO] #41 |
 
 - **Durabilidade:** a verdade está no disco (`ragfiles/`); RAM é cache → crash recupera no boot.
-- **`[FUTURO]` mmap/on-disk estilo Qdrant:** **não agora.** Kimi e Codex convergiram: o sistema é
-  **CPU-bound na silabificação**, não I/O-bound; mmap adiciona superfície de bug (corrupção, lock,
-  flush) e **trai o "roda em qualquer lugar"** (dependências nativas/FS). Só considerar se **corpus >
-  ~80% da RAM**, e mesmo assim **opt-in por build/config** (modular), nunca default.
+- **mmap — só do texto dos chunks, opt-in (`storage = disk`, #41):** o recall nunca toca texto (só
+  vetores/idf/índice), então o texto é a única coisa que sai da RAM sem mexer no caminho quente.
+  Segue **opt-in, nunca default**: o sistema é CPU-bound na silabificação, e o JSON continua a única
+  fonte da verdade — o `.textblob` é derivado, regerado a cada carga (sem defasagem nem migração) e
+  apagado junto com a base no `DELETE ?purge=1`. Os vetores ficam na RAM; índice inteiro em disco
+  (estilo Qdrant) segue fora de escopo.
+  Medido em 04/out/2026 com 335 livros (668 MB de JSON, Xeon E5-2680 v4): memória do processo após a
+  carga `memory` 9,2 GB → `hybrid` 794 MB → `disk` 559 MB (+246 MB de páginas do arquivo após buscas,
+  liberáveis pelo SO); 30 buscas: `memory` 7,1 s, `hybrid` 16,1 s, `disk` 16,3 s; resultados idênticos
+  (cos até 1e-10; a ordem só muda em empate exato no corte do k, como `memory`×`hybrid` já fazia).
+  Obs.: em `hybrid` e `disk`, a memória do processo cresce ~1,5 GB depois das primeiras buscas — não é
+  texto, e é o próximo alvo de RAM.
 - **Pressão de memória:** o console mede RSS (`/proc/self/statm`) + estimativa text/vec/words; medido:
   ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [FEITO]
 
@@ -584,7 +593,7 @@ inexistentes (confidence + auditoria humana).
 
 | decisão | gatilho | opções |
 |---|---|---|
-| mmap/on-disk | corpus > ~80% RAM | binário estruturado vs LMDB; **opt-in por build** |
+| mmap/on-disk | corpus > ~80% RAM | **texto: feito (#41, `storage = disk`)**; vetores/índice em disco seguem futuros |
 | `RwLock` + paralelismo inter-query | latência sob carga concorrente real | RwLock; depois lock por coleção |
 | base = repo (N arquivos) | usar como RAG de código a sério | `file`+`sha` no schema; `/sync` |
 | podar sinônimos idf-baixo no expand | expansão poluindo lookup | filtro por idf na cascata |
