@@ -116,7 +116,7 @@ struct Config {
     admin_pass: String,
     log_file: String,
     log_utc_offset: i64,
-    storage: String,   // "memory" (default) | "hybrid"
+    storage: String,   // "memory" (default) | "hybrid" | "disk" (#41: texto fora da RAM, via mmap)
     anthropic_key: String,
     openai_key: String,
     active_provider: String,
@@ -232,16 +232,20 @@ fn read_sys_mem_mb() -> (Option<f64>, Option<f64>) {
 /// RAG gasta RAM (texto dos chunks, vetores esparsos, tokens cacheados em `words`).
 fn mem_stats(b: &Bases) -> Value {
     let (mut text, mut vec_entries, mut word_tokens) = (0usize, 0usize, 0usize);
-    for m in b.values() { for base in m.values() { for c in &base.chunks {
-        text += c.text.as_ref().map(|t| t.len()).unwrap_or(0);
-        vec_entries += c.vec.len();
-        word_tokens += c.words.iter().map(|w| w.len()).sum::<usize>();
-    }}}
+    let mut text_disk = 0usize;   // [#41] bytes de texto mapeados do .textblob (fora do heap)
+    for m in b.values() { for base in m.values() {
+        text_disk += base.blob.as_ref().map(|m| m.len()).unwrap_or(0);
+        for c in &base.chunks {
+            text += c.text.as_ref().map(|t| t.len()).unwrap_or(0);
+            vec_entries += c.vec.len();
+            word_tokens += c.words.iter().map(|w| w.len()).sum::<usize>();
+        }
+    }}
     let mb = |bytes: usize| bytes as f64 / 1_048_576.0;
     let (sys_total, sys_avail) = read_sys_mem_mb();
-    let hybrid = !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed);
     json!({
-        "storage": if hybrid { "hybrid" } else { "memory" },
+        "storage": rag::storage_mode(),
+        "text_disk_mb": mb(text_disk),   // [#41] texto no .textblob (page-cache, não conta no heap)
         "rss_mb": read_rss_mb(),
         "sys_total_mb": sys_total,
         "sys_avail_mb": sys_avail,
@@ -628,7 +632,7 @@ fn main() {
             "--workers" => cfg.workers = it.next().expect("--workers N").parse().expect("--workers N"),
             "--no-autoload" => no_autoload = true,
             "--dev" => cfg.dev = true,
-            "--storage" => cfg.storage = it.next().expect("--storage memory|hybrid").clone(),
+            "--storage" => cfg.storage = it.next().expect("--storage memory|hybrid|disk").clone(),
             "--preload" => {
                 if let Some((n, p)) = it.next().expect("--preload nome=caminho").split_once('=') {
                     preload.push((n.to_string(), p.to_string()));
@@ -639,9 +643,15 @@ fn main() {
     }
 
     LOG_OFFSET.store(cfg.log_utc_offset, std::sync::atomic::Ordering::Relaxed);
-    let hybrid = cfg.storage.eq_ignore_ascii_case("hybrid");
-    rag::CACHE_WORDS.store(!hybrid, std::sync::atomic::Ordering::Relaxed);
-    println!("storage: {} (cache de tokens {})", cfg.storage, if hybrid { "DESLIGADO — recomputa candidatos" } else { "ligado" });
+    if !rag::set_storage_mode(&cfg.storage) {
+        eprintln!("aviso: storage {:?} desconhecido — usando memory", cfg.storage);
+        rag::set_storage_mode("memory");
+    }
+    println!("storage: {} ({})", rag::storage_mode(), match rag::storage_mode() {
+        "memory" => "texto e tokens na RAM",
+        "hybrid" => "texto na RAM, tokens recomputados por candidato",
+        _ => "texto em <base>-tokenized.textblob via mmap, tokens recomputados por candidato",
+    });
 
     // 3) bases: autoload (default) + preload aditivo
     let mut bases: Bases = HashMap::new();
@@ -1086,7 +1096,7 @@ fn scope_word_keys(bases: &Bases, coll: Option<&str>, base_pat: &str) -> HashSet
                     if budget == 0 { break 'scan; } budget -= 1;
                     if let Some(k) = word_key(w) { set.insert(k); }
                 }
-            } else if let Some(t) = &ch.text {
+            } else if let Some(t) = b.chunk_text(ch) {
                 for w in tokenizer::words(&t.to_lowercase()) {
                     if budget == 0 { break 'scan; } budget -= 1;
                     let syl: Vec<String> = tokenizer::syllabify(&w).iter()
@@ -1125,7 +1135,7 @@ fn suggest_terms(bases: &Bases, coll: Option<&str>, base_pat: &str, missing: &[S
     'scan: for (c, n) in resolve_scope(bases, coll, base_pat) {
         let b = match get_base(bases, &c, &n) { Some(b) => b, None => continue };
         for ch in &b.chunks {
-            let text = match &ch.text { Some(t) => t, None => continue };
+            let text = match b.chunk_text(ch) { Some(t) => t, None => continue };
             for w in tokenizer::words(&text.to_lowercase()) {
                 if budget == 0 { break 'scan; }
                 budget -= 1;
@@ -1208,7 +1218,7 @@ fn literal_fallback(needles: &[String], bases: &Bases, coll: Option<&str>, base_
         let b = match get_base(bases, &cn, &bn) { Some(b) => b, None => continue };
         if !b.has_text { continue; }
         for ch in &b.chunks {
-            let text = match &ch.text { Some(t) => t, None => continue };
+            let text = match b.chunk_text(ch) { Some(t) => t, None => continue };
             let lc = text.to_lowercase();
             let matched: Vec<&String> = needles.iter().filter(|n| lc.contains(n.as_str())).collect();
             if matched.is_empty() { continue; }
@@ -1530,9 +1540,8 @@ fn module_proxy(url: &str, post_body: Option<&str>, timeout_secs: u32) -> (u16, 
 /// GET /config — estado da configuração. Chaves SEMPRE mascaradas via mask_key (o valor cru nunca
 /// sai do daemon — o legado devolvia cru atrás do cookie; corrigido na promoção pra 11499).
 fn config_json(st: &State) -> String {
-    let hybrid = !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed);
     json!({
-        "storage": if hybrid { "hybrid" } else { "memory" },
+        "storage": rag::storage_mode(),
         "config_path": st.config_path,
         "drivers_dir": st.drivers_dir, "ingestors_dir": st.ingestors_dir, "ragfiles_dir": st.ragfiles_dir,
         "max_upload_mb": st.max_upload / (1024 * 1024),
@@ -1608,12 +1617,11 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
     }}
     if let Some(s) = v["storage"].as_str() {
         let s = s.to_lowercase();
-        if s != "memory" && s != "hybrid" {
-            return (400, json!({"error": "storage deve ser 'memory' ou 'hybrid'"}).to_string());
+        if s != "memory" && s != "hybrid" && s != "disk" {
+            return (400, json!({"error": "storage deve ser 'memory', 'hybrid' ou 'disk'"}).to_string());
         }
-        let want_hybrid = s == "hybrid";
-        if want_hybrid != !rag::CACHE_WORDS.load(std::sync::atomic::Ordering::Relaxed) {
-            rag::CACHE_WORDS.store(!want_hybrid, std::sync::atomic::Ordering::Relaxed);
+        if s != rag::storage_mode() {
+            rag::set_storage_mode(&s);   // a recarga abaixo relê do JSON; no disk, cada base gera seu .textblob
             set_cfg_key(&st.config_path, "storage", &s);
             reload = true;
             notes.push(format!("storage → {s} (recarregado)"));
@@ -1976,6 +1984,8 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
                         }
                         purged = true;
                     }
+                    // [#41] o .textblob é derivado do JSON — sai junto (ausente = nada a fazer)
+                    let _ = std::fs::remove_file(rag::blob_path_for(&f.to_string_lossy()));
                 }
                 (200, json!({"ok": true, "removed": name, "collection": coll, "purged": purged,
                              "bases": total_bases(&state.bases)}).to_string())
@@ -2024,6 +2034,7 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, 
     } else if let Some(p) = v["path"].as_str() {
         RagBase::load(p)
     } else if !v["data"].is_null() {
+        // [#41] modo data: a base não tem arquivo próprio → no disk, o texto fica na RAM até o próximo boot
         RagBase::from_str(&v["data"].to_string()).map(|mut b| { b.mtime = rag::now_secs(); b })
     } else {
         return (400, json!({"error": "forneça 'path', 'data' (JSON tokenizado) ou {path, raw:true} (arquivo bruto)"}).to_string());
@@ -2432,6 +2443,7 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
         Err(e) => { tlog("ingest", &format!("   └─ FALHOU ao carregar como RagBase: {e}"));
                     return (400, json!({"error": e}).to_string()); }
     };
+    base.spill_if_disk(&rag::blob_path_for(&out_path.to_string_lossy()));   // [#41]
     base.mtime = rag::now_secs();   // ingestão recém-feita → "agora" pra boost de recência
     let n = base.n_chunks;
     let corpus = base.corpus.clone();
@@ -2523,7 +2535,7 @@ fn ingest_raw_to_base(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string()));
     RagBase::from_str(&String::from_utf8(buf).unwrap_or_default())
-        .map(|mut b| { b.mtime = rag::now_secs(); b })
+        .map(|mut b| { b.spill_if_disk(&rag::blob_path_for(&out_path.to_string_lossy())); b.mtime = rag::now_secs(); b })   // [#41]
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -2908,7 +2920,7 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
             o.insert("cos".into(), json!(cos));
             o.insert("chunk".into(), json!(c.id));
             o.insert("start".into(), json!(c.start));
-            if let Some(t) = &c.text { o.insert("snippet".into(), json!(rag::snippet(t, query))); }
+            if let Some(t) = base.chunk_text(c) { o.insert("snippet".into(), json!(rag::snippet(t, query))); }
             // tuple: (coverage_honesta, mtime_base, neg_span, cos, hit). mtime entra pro boost
             // de recência no merge cross-base (sessão nova não perde pra antiga em quase-empate).
             local.push((coverage, base.mtime, -(sp as i64), cos, o));
@@ -3020,7 +3032,7 @@ fn fetch_chunk(body: &str, bases: &Bases) -> (u16, String) {
     };
     let chunks: Vec<Value> = ids.iter().filter_map(|&i| base.chunks.get(i).map(|c| json!({
         "id": c.id, "start": c.start, "len": c.len, "tokens": c.tokens, "oov": c.oov,
-        "norm": c.norm, "text": c.text
+        "norm": c.norm, "text": base.chunk_text(c)
     }))).collect();
     (200, json!({"collection": collection, "base": name, "corpus": base.corpus,
                  "n_chunks": base.n_chunks, "chunks": chunks}).to_string())
@@ -3313,10 +3325,12 @@ uso:
   ragd [--config <arq>] [--port {DEFAULT_PORT}] [--dash-port {DEFAULT_DASH_PORT}]
        [--drivers-dir {DEFAULT_DRIVERS_DIR}] [--ingestors-dir {DEFAULT_INGESTORS_DIR}] [--ragfiles-dir {DEFAULT_RAGFILES_DIR}]
        [--web-dir {DEFAULT_WEB_DIR}] [--max-upload {DEFAULT_MAX_UPLOAD}] [--workers N] [--no-autoload] [--dev]
-       [--preload nome=caminho.json ...]
+       [--storage memory|hybrid|disk] [--preload nome=caminho.json ...]
 
   config: --config <arq>, senao /etc/ragnarock/ragnarock.cfg, senao ./ragnarock.cfg, senao defaults.
-          (chaves: api_port, dash_port, drivers_dir, ragfiles_dir, max_upload, workers, autoload, admin_user, admin_pass)
+          (chaves: api_port, dash_port, drivers_dir, ragfiles_dir, max_upload, workers, autoload, storage, admin_user, admin_pass)
+  --storage memory (default: texto e tokens na RAM) | hybrid (tokens recomputados por candidato) |
+            disk (#41: texto dos chunks em <base>-tokenized.textblob via mmap; o JSON segue a fonte da verdade).
   --workers N fixa o tamanho do thread-pool da API (default 0 = auto: nº de CPUs, capado em 2..16).
   duas portas: API (default {DEFAULT_PORT}) + dashboard/supervisorio (default {DEFAULT_DASH_PORT}, login por sessao).
   seguranca: credenciais admin/admin sao recusadas a menos que --dev seja passado. Troque no .cfg ou pelo painel.

@@ -13,6 +13,36 @@ const PAR_RECALL_MIN: usize = 512;
 /// Modo de armazenamento: true = cacheia `words` no load (rápido, +RAM); false = híbrido
 /// (não cacheia; rerank recomputa só os candidatos). Setado no boot a partir do config.
 pub static CACHE_WORDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// [#41] modo "disk": o TEXTO dos chunks sai da RAM. Na carga, cada base grava o texto num
+/// `<base>-tokenized.textblob` ao lado do JSON e o lê por mmap (page-cache do SO). O recall
+/// (estágio 1) nunca toca texto — só vetores/idf/índice —, então o caminho quente não muda;
+/// texto só é lido no rerank dos candidatos, no snippet, no `/chunk` e no literal-fallback.
+/// Implica CACHE_WORDS=false (como o hybrid). O JSON segue sendo a fonte da verdade: o
+/// .textblob é regerado a cada carga e nunca é lido sem o JSON correspondente.
+pub static TEXT_ON_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Nome do modo vigente — "memory" | "hybrid" | "disk" — para /config, painel e logs.
+pub fn storage_mode() -> &'static str {
+    use std::sync::atomic::Ordering::Relaxed;
+    if TEXT_ON_DISK.load(Relaxed) { "disk" } else if CACHE_WORDS.load(Relaxed) { "memory" } else { "hybrid" }
+}
+
+/// Liga o modo pelo nome. Devolve false (e não mexe em nada) se o nome não existe.
+pub fn set_storage_mode(mode: &str) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (cache, disk) = match mode.to_lowercase().as_str() {
+        "memory" => (true, false), "hybrid" => (false, false), "disk" => (false, true), _ => return false,
+    };
+    CACHE_WORDS.store(cache, Relaxed);
+    TEXT_ON_DISK.store(disk, Relaxed);
+    true
+}
+
+/// `<x>-tokenized.json` -> `<x>-tokenized.textblob` (mesma pasta). Não termina em
+/// `-tokenized.json`, então o autoload nunca o confunde com uma base.
+pub fn blob_path_for(json_path: &str) -> String {
+    format!("{}.textblob", json_path.strip_suffix(".json").unwrap_or(json_path))
+}
 
 // ----------------------------- rerank (estagio 2) ----------------------------
 /// Codigo fonetico estilo SOUNDEX (1a letra + 3 digitos de grupos de consoantes).
@@ -220,6 +250,9 @@ pub struct Chunk {
     pub id: usize, pub start: usize, pub len: usize, pub tokens: usize, pub oov: usize,
     /// [#42] pares (dim, contagem) ORDENADOS por dim — ver `vector::SparseVec`.
     pub vec: SparseVec, pub norm: f64, pub text: Option<String>,
+    /// [#41] no modo disk: (offset, tamanho em bytes) do texto dentro do `.textblob` da base;
+    /// `text` fica None. Ler sempre por `RagBase::chunk_text`, nunca por `text` direto.
+    pub tref: Option<(u64, u32)>,
     /// cache: sílabas por palavra do chunk (pro rerank). Calculado 1× no load —
     /// antes era refeito (re-silabado) a CADA query. Vazio quando o chunk não tem texto.
     pub words: Vec<Vec<String>>,
@@ -238,6 +271,8 @@ pub struct RagBase {
     /// pra dar leve boost de recência (sessão nova não perde por empate p/ sessão antiga).
     /// 0 = desconhecido (sem boost; comportamento legado).
     pub mtime: u64,
+    /// [#41] texto dos chunks mapeado do `.textblob` (modo disk). None nos modos memory/hybrid.
+    pub blob: Option<std::sync::Arc<memmap2::Mmap>>,
 }
 
 pub struct Info {
@@ -283,7 +318,7 @@ impl RagBase {
                     tokens: c["tokens"].as_u64().unwrap_or(0) as usize,
                     oov: c["oov"].as_u64().unwrap_or(0) as usize,
                     vec, norm: c["norm"].as_f64().unwrap_or(1.0),
-                    text, words: Vec::new(),
+                    text, tref: None, words: Vec::new(),
                 }
             }).collect();
         // modo "memory" (default): tokeniza os chunks UMA vez no load (rápido, +RAM).
@@ -303,17 +338,77 @@ impl RagBase {
             has_text: meta["with_text"].as_bool().unwrap_or(false),
             chunks,
             mtime: 0,   // sem contexto de arquivo aqui; caller (load/ingest) seta depois.
+            blob: None,
         })
+    }
+
+    /// [#41] O texto do chunk, venha da RAM (memory/hybrid) ou do `.textblob` (disk).
+    /// Ponto ÚNICO de leitura de texto — nenhum call site lê `Chunk.text` direto.
+    pub fn chunk_text<'a>(&'a self, ch: &'a Chunk) -> Option<&'a str> {
+        if let Some(t) = &ch.text { return Some(t.as_str()); }
+        let (off, len) = ch.tref?;
+        let b = self.blob.as_ref()?;
+        let (a, z) = (off as usize, off as usize + len as usize);
+        if z > b.len() { return None; }
+        std::str::from_utf8(&b[a..z]).ok()
+    }
+
+    /// [#41] Tira o texto da RAM: grava todos os textos num `.textblob` (tmp + rename,
+    /// atômico), mapeia por mmap e troca cada `text` por `tref`. Base sem texto: no-op.
+    /// Erro de I/O devolve Err e a base fica INTACTA na RAM (o caller só avisa).
+    pub fn spill_text(&mut self, blob_path: &str) -> Result<(), String> {
+        use std::io::Write;
+        if !self.chunks.iter().any(|c| c.text.is_some()) { return Ok(()); }
+        let tmp = format!("{blob_path}.tmp");
+        let mut refs: Vec<Option<(u64, u32)>> = Vec::with_capacity(self.chunks.len());
+        {
+            let f = std::fs::File::create(&tmp).map_err(|e| format!("criar {tmp:?}: {e}"))?;
+            let mut w = std::io::BufWriter::new(f);
+            let mut off: u64 = 0;
+            for c in &self.chunks {
+                match &c.text {
+                    Some(t) => {
+                        let len = u32::try_from(t.len()).map_err(|_| format!("chunk {} > 4 GB", c.id))?;
+                        w.write_all(t.as_bytes()).map_err(|e| format!("gravar {tmp:?}: {e}"))?;
+                        refs.push(Some((off, len))); off += len as u64;
+                    }
+                    None => refs.push(None),
+                }
+            }
+            w.flush().map_err(|e| format!("gravar {tmp:?}: {e}"))?;
+        }
+        std::fs::rename(&tmp, blob_path).map_err(|e| format!("renomear para {blob_path:?}: {e}"))?;
+        let f = std::fs::File::open(blob_path).map_err(|e| format!("abrir {blob_path:?}: {e}"))?;
+        // SAFETY: o arquivo é nosso, recém-escrito e trocado por rename atômico; ninguém mais o
+        // altera enquanto o daemon roda. Se a base for re-ingerida, um NOVO arquivo substitui
+        // este por rename — o mapa antigo segue válido (inode antigo) até a base velha cair.
+        let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| format!("mmap {blob_path:?}: {e}"))?;
+        self.blob = Some(std::sync::Arc::new(map));
+        for (c, r) in self.chunks.iter_mut().zip(refs) {
+            if r.is_some() { c.tref = r; c.text = None; c.words = Vec::new(); }
+        }
+        Ok(())
     }
 
     pub fn load(path: &str) -> Result<RagBase, String> {
         let data = std::fs::read_to_string(path).map_err(|e| format!("erro lendo {path:?}: {e}"))?;
         let mut b = RagBase::from_str(&data)?;
+        drop(data);   // [#41] o JSON cru (que inclui o texto) não fica vivo durante o spill
+        b.spill_if_disk(&blob_path_for(path));
         b.mtime = std::fs::metadata(path).ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs()).unwrap_or(0);
         Ok(b)
+    }
+
+    /// [#41] No modo disk, manda o texto para o `.textblob`; nos outros modos, nada. Falha de
+    /// I/O NÃO derruba a base: ela segue com o texto na RAM e o aviso vai pro stderr.
+    pub fn spill_if_disk(&mut self, blob_path: &str) {
+        if !TEXT_ON_DISK.load(std::sync::atomic::Ordering::Relaxed) || !self.has_text { return; }
+        if let Err(e) = self.spill_text(blob_path) {
+            eprintln!("storage disk: {e} — base segue com o texto na RAM");
+        }
     }
 
     fn query_vec(&self, query: &str) -> (HashMap<usize, f64>, f64, Vec<String>, usize) {
@@ -392,7 +487,7 @@ impl RagBase {
                 let recomputed;
                 let words: &[Vec<String>] = if !ch.words.is_empty() {
                     &ch.words
-                } else if let Some(t) = &ch.text {
+                } else if let Some(t) = self.chunk_text(ch) {
                     recomputed = chunk_words(t); &recomputed
                 } else { &[] };
                 let (coverage, span) = rerank_score(qt, weights, words, phonetic);
@@ -418,7 +513,7 @@ impl RagBase {
         let recomputed;
         let words: &[Vec<String>] = if !ch.words.is_empty() {
             &ch.words
-        } else if let Some(t) = &ch.text {
+        } else if let Some(t) = self.chunk_text(ch) {
             recomputed = chunk_words(t); &recomputed
         } else { &[] };
         let owned = if weights.is_none() { Some(self.term_weights(qt)) } else { None };
@@ -507,7 +602,7 @@ impl RagBase {
         let recomputed;
         let words_ref: &[Vec<String>] = match self.chunks.get(cid) {
             Some(c) if !c.words.is_empty() => &c.words,
-            Some(c) => match &c.text { Some(t) => { recomputed = chunk_words(t); &recomputed } None => &[] },
+            Some(c) => match self.chunk_text(c) { Some(t) => { recomputed = chunk_words(t); &recomputed } None => &[] },
             None => &[],
         };
         let seq: Vec<&str> = words_ref.iter().flatten().map(|s| s.as_str()).collect();
@@ -674,13 +769,43 @@ mod tests {
         let chunks: Vec<Chunk> = chunks.iter().enumerate().map(|(i, dims)| Chunk {
             id: i, start: 0, len: 0, tokens: 0, oov: 0,
             vec: { let mut v: SparseVec = dims.iter().map(|&d| (d as u32, 1.0_f32)).collect(); v.sort_unstable_by_key(|&(d, _)| d); v },
-            norm: 1.0, text: None, words: Vec::new(),
+            norm: 1.0, text: None, tref: None, words: Vec::new(),
         }).collect();
         let n = chunks.len();
         RagBase { index, idf: HashMap::new(), chunks, has_text: false,
                   n_chunks: n, vocab_size: vocab.len(), corpus: "t".into(), generator: "t".into(),
-                  mtime: 0 }
+                  mtime: 0, blob: None }
     }
+    /// [#41] o texto lido do .textblob é byte a byte o original (acentos inclusos) e a RAM larga o texto.
+    #[test]
+    fn spill_text_roundtrip() {
+        let mut b = mk_base(&["a"], &[&[0], &[0], &[0]]);
+        let textos = [Some("Frodo Bolseiro saiu do Condado."), None, Some("Ação, ônibus e coração — çãõ!")];
+        for (c, t) in b.chunks.iter_mut().zip(textos) { c.text = t.map(String::from); }
+        b.has_text = true;
+        let dir = std::env::temp_dir().join(format!("ragd-41-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("x-tokenized.json");
+        let blob = blob_path_for(&json.to_string_lossy());
+        assert!(blob.ends_with("x-tokenized.textblob"));
+        b.spill_text(&blob).unwrap();
+        for (c, t) in b.chunks.iter().zip(textos) {
+            assert!(c.text.is_none(), "o texto deveria ter saído da RAM");
+            assert_eq!(b.chunk_text(c), t);
+        }
+        assert!(b.chunks[1].tref.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [#41] base sem texto não gera arquivo nenhum.
+    #[test]
+    fn spill_text_sem_texto_e_noop() {
+        let mut b = mk_base(&["a"], &[&[0]]);
+        let blob = std::env::temp_dir().join(format!("ragd-41-vazio-{}.textblob", std::process::id()));
+        b.spill_text(&blob.to_string_lossy()).unwrap();
+        assert!(!blob.exists() && b.blob.is_none());
+    }
+
     #[test]
     fn unifies_vocabs_across_different_drivers() {
         // base "a" (driver 1): vocab [fro, do]; base "b" (driver 2): vocab [do, ga].

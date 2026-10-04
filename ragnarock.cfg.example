@@ -29,13 +29,15 @@ autoload     = true        # scan ragfiles_dir on boot and load every base
 # storage mode:
 #   memory  — keep chunk text in RAM (fastest; default)
 #   hybrid  — drop cached tokens to cut RAM, re-read on demand
+#   disk    — also move chunk TEXT out of RAM: each base writes <base>-tokenized.textblob next to
+#             its JSON (regenerated on every load) and reads it via mmap (#41). Same search results.
 storage = memory
 
 # OOM guards (0 = unlimited). Ingestion is refused with a clear error when a cap
 # would be exceeded; boot auto-load is never capped (existing data always loads).
 #   max_bases            — max total bases across all collections
 #   max_chunks_per_base  — max chunks a single base may hold
-# In tight-RAM deployments, pair these with `storage = hybrid`.
+# In tight-RAM deployments, pair these with `storage = hybrid` (or `disk`).
 max_bases           = 0
 max_chunks_per_base = 0
 
