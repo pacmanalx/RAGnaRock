@@ -205,8 +205,8 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
   `memory` 9.2 GB → `hybrid` 794 MB → `disk` 559 MB (+246 MB of file-backed pages after searches,
   reclaimable by the OS); 30 queries: `memory` 7.1 s, `hybrid` 16.1 s, `disk` 16.3 s; results identical
   (cos to 1e-10; order only differs on exact ties at the k cut-off, as `memory`×`hybrid` already did).
-  Note: in `hybrid` and `disk` alike, process memory grows ~1.5 GB after the first searches — that is
-  not text, and is the next thing to chase for RAM.
+  The ~1.5 GB that used to stay after the first search (all modes) was the transient peak of building
+  the collection profile — gone since #57: after searches `hybrid` 853 MB, `disk` 618 MB.
 - **Memory pressure:** the console measures RSS (`/proc/self/statm`) + text/vec/words estimate; measured:
   ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [DONE]
 
