@@ -676,30 +676,45 @@ pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionP
         }
         remap.insert((*name).clone(), m);
     }
-    // tfs remapeados por base (pro idf de coleção e pras normas unificadas)
-    let mut flat: Vec<HashMap<usize, u32>> = Vec::new();
-    let mut per_base: Vec<(String, Vec<HashMap<usize, u32>>)> = Vec::new();
+    // [#57] idf e normas SEM materializar um HashMap por chunk. A versão anterior guardava duas
+    // cópias (`flat` e `per_base`, uma clone da outra) de um HashMap<usize,u32> por chunk só para
+    // estas duas contas: em 335 livros / 122 mil chunks o pico era +1,47 GB, e o glibc não devolvia
+    // ao SO — o RSS ficava ~1,5 GB acima depois da 1ª busca. Agora: df contado direto num vetor
+    // pela dim global (cada dim local mapeia para uma global distinta — o remap é injetivo) e a
+    // norma de cada chunk calculada em streaming sobre o próprio `vec` (já ordenado).
+    let mut df: Vec<u32> = vec![0; uvocab.len()];
+    let mut n_docs = 0usize;
     for name in &names {
-        let base = &bases[*name];
         let m = &remap[*name];
-        let mut bt: Vec<HashMap<usize, u32>> = Vec::with_capacity(base.chunks.len());
-        for ch in &base.chunks {
-            let mut tf: HashMap<usize, u32> = HashMap::with_capacity(ch.vec.len());
-            for &(ld, cnt) in &ch.vec {
-                let ld = ld as usize;
-                if ld < m.len() { tf.insert(m[ld], cnt as u32); }
+        for ch in &bases[*name].chunks {
+            n_docs += 1;
+            for &(ld, _) in &ch.vec {
+                if let Some(&gd) = m.get(ld as usize) { df[gd] += 1; }
             }
-            flat.push(tf.clone());
-            bt.push(tf);
         }
-        per_base.push(((*name).clone(), bt));
     }
-    let uidf = crate::vector::compute_idf(&flat, flat.len());
+    // mesma fórmula de vector::compute_idf: ln((n+1)/df), só para dims com df > 0
+    let n = if n_docs == 0 { 1.0 } else { n_docs as f64 };
+    let uidf: HashMap<usize, f64> = df.iter().enumerate()
+        .filter(|(_, &c)| c > 0).map(|(d, &c)| (d, ((n + 1.0) / c as f64).ln())).collect();
+    let idf_dense: Vec<f64> = df.iter().enumerate().map(|(d, _)| uidf.get(&d).copied().unwrap_or(0.0)).collect();
+    drop(df);
     // norma unificada (tf-idf no espaço global) por chunk — denominador do cosseno
     let mut unorms: HashMap<String, Vec<f64>> = HashMap::new();
-    for (name, bt) in &per_base {
-        let norms = bt.iter().map(|tf| crate::vector::tfidf_norm(tf, &uidf)).collect();
-        unorms.insert(name.clone(), norms);
+    for name in &names {
+        let m = &remap[*name];
+        let norms: Vec<f64> = bases[*name].chunks.iter().map(|ch| {
+            let mut s = 0.0;
+            for &(ld, cnt) in &ch.vec {
+                if let Some(&gd) = m.get(ld as usize) {
+                    let w = (cnt as u32) as f64 * idf_dense[gd];
+                    s += w * w;
+                }
+            }
+            let nrm = s.sqrt();
+            if nrm == 0.0 { 1.0 } else { nrm }
+        }).collect();
+        unorms.insert((*name).clone(), norms);
     }
     let fingerprint = collection_fingerprint(bases);
     CollectionProfile { uvocab, uidf, remap, unorms, fingerprint }
@@ -804,6 +819,56 @@ mod tests {
         let blob = std::env::temp_dir().join(format!("ragd-41-vazio-{}.textblob", std::process::id()));
         b.spill_text(&blob.to_string_lossy()).unwrap();
         assert!(!blob.exists() && b.blob.is_none());
+    }
+
+    /// [#57] a montagem ANTIGA do perfil (HashMap por chunk), mantida só como referência.
+    fn perfil_referencia(bases: &HashMap<String, RagBase>) -> (HashMap<usize, f64>, HashMap<String, Vec<f64>>) {
+        let p = build_collection_profile(bases);   // reaproveita uvocab/remap (não mudaram)
+        let mut names: Vec<&String> = bases.keys().collect(); names.sort();
+        // tfs remapeados por base (pro idf de coleção e pras normas unificadas)
+        let mut flat: Vec<HashMap<usize, u32>> = Vec::new();
+        let mut per_base: Vec<(String, Vec<HashMap<usize, u32>>)> = Vec::new();
+        for name in &names {
+            let base = &bases[*name];
+            let m = &p.remap[*name];
+            let mut bt: Vec<HashMap<usize, u32>> = Vec::with_capacity(base.chunks.len());
+            for ch in &base.chunks {
+                let mut tf: HashMap<usize, u32> = HashMap::with_capacity(ch.vec.len());
+                for &(ld, cnt) in &ch.vec {
+                    let ld = ld as usize;
+                    if ld < m.len() { tf.insert(m[ld], cnt as u32); }
+                }
+                flat.push(tf.clone());
+                bt.push(tf);
+            }
+            per_base.push(((*name).clone(), bt));
+        }
+        let uidf = crate::vector::compute_idf(&flat, flat.len());
+        // norma unificada (tf-idf no espaço global) por chunk — denominador do cosseno
+        let mut unorms: HashMap<String, Vec<f64>> = HashMap::new();
+        for (name, bt) in &per_base {
+            let norms = bt.iter().map(|tf| crate::vector::tfidf_norm(tf, &uidf)).collect();
+            unorms.insert(name.clone(), norms);
+        }
+        (uidf, unorms)
+    }
+
+    /// [#57] a montagem nova dá o MESMO idf (bit a bit) e as mesmas normas (só a ordem da soma muda).
+    #[test]
+    fn perfil_sem_hashmap_por_chunk_igual_ao_antigo() {
+        let mut bases = HashMap::new();
+        let mut a = mk_base(&["fro", "do", "bol"], &[&[0, 1], &[1, 2], &[0, 2]]);
+        a.chunks[0].vec = vec![(0, 3.0), (1, 1.0)];
+        let mut b = mk_base(&["do", "ga", "fro", "sei"], &[&[0, 1, 3], &[2], &[0, 3]]);
+        b.chunks[2].vec = vec![(0, 7.0), (3, 2.0)];
+        bases.insert("a".to_string(), a);
+        bases.insert("b".to_string(), b);
+        let p = build_collection_profile(&bases);
+        let (uidf_ref, unorms_ref) = perfil_referencia(&bases);
+        assert_eq!(p.uidf, uidf_ref);
+        for (nome, ns) in &unorms_ref {
+            for (x, y) in p.unorms[nome].iter().zip(ns) { assert!((x - y).abs() < 1e-12, "{nome}: {x} vs {y}"); }
+        }
     }
 
     #[test]

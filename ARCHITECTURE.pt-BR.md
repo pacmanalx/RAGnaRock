@@ -204,8 +204,8 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
   carga `memory` 9,2 GB → `hybrid` 794 MB → `disk` 559 MB (+246 MB de páginas do arquivo após buscas,
   liberáveis pelo SO); 30 buscas: `memory` 7,1 s, `hybrid` 16,1 s, `disk` 16,3 s; resultados idênticos
   (cos até 1e-10; a ordem só muda em empate exato no corte do k, como `memory`×`hybrid` já fazia).
-  Obs.: em `hybrid` e `disk`, a memória do processo cresce ~1,5 GB depois das primeiras buscas — não é
-  texto, e é o próximo alvo de RAM.
+  Os ~1,5 GB que ficavam depois da 1ª busca (em todos os modos) eram o pico transitório da montagem do
+  perfil da coleção — resolvido no #57: após as buscas `hybrid` 853 MB, `disk` 618 MB.
 - **Pressão de memória:** o console mede RSS (`/proc/self/statm`) + estimativa text/vec/words; medido:
   ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [FEITO]
 
