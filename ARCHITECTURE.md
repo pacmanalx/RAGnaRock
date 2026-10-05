@@ -308,6 +308,18 @@ TTL; **[FUTURE]** real password). Tabs:
   the same one N times). A keepalive pings `ragd` every 15s and caches it (status never does a live curl).
 - **Two orthogonal dials:** **level** (depth) + **cadence** (seconds between cycles = time budget).
 
+### 5.1.1 Digestion ledger (`llm-ledger.jsonl`) — retention and privacy (#15)
+Every AI call (classifier, template maker, relations, analyst, comparator) writes one line to
+`<dir>/llm-ledger.jsonl` with the **full** prompt and answer, i.e. corpus content. Therefore:
+- the file is created (and fixed at boot) with mode **0600**;
+- past `llm_ledger_max_mb` (default 20) it **rotates** to `llm-ledger-YYYYMMDD-HHMMSS.jsonl`, and only the
+  newest `llm_ledger_keep` (default 6) rotated files stay on disk;
+- `llm_ledger_meta = colA,colB` makes those collections write **metadata only**: role, collection,
+  latency, sizes and an FNV-1a fingerprint of prompt and answer, no text and no base name. L4 with a
+  broad scope (`*`) falls back to metadata if any collection is flagged;
+- `llm_ledger = full | meta | off` applies to everything (default `full`, the previous behavior).
+ValHalla (`/api/nidhogg/llm_ledger`) reads the current file; metadata-only entries show without text.
+
 ### 5.2 Nature & consumption — Nidhogg is AUTONOMOUS; the reader is HUMAN
 
 > **Decision (owner):** Nidhogg is an **autonomous project**, a **critical analyzer**. `ragd` **NEVER**
