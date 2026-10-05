@@ -94,7 +94,12 @@ Single search route (#39), with **opt-in** stages: the conservative default is p
   "phonetic": false,        // match by SOUND (SOUNDEX): "Aslan" finds "Aslam"
   "literal_fallback": true, // alphanumeric needles WITH a digit (OE-6016, M31May-23h28): literal grep,
                             // exact matches go first (#38); false turns it off
-  "expand": false           // true = dictionary → cache → AI cascade (same engine as /search_expand)
+  "expand": false,          // true = dictionary → cache → AI cascade (same engine as /search_expand)
+  "merge_adjacent": false,  // #44: consecutive candidate chunks of a base → ONE passage, coverage
+                            // recomputed over the joined text (needs rerank; not with expand)
+  "merge_max": 3,           // max chunks per passage (2–8)
+  "context": 0,             // #45: N (0–5) neighbouring chunks before/after each hit, inline
+  "context_max_chars": 20000// cap on the total context text; past it → "context_truncated": true
 }
 ```
 **Response** (`expand: false`):
@@ -120,7 +125,10 @@ Single search route (#39), with **opt-in** stages: the conservative default is p
 ```
 - Order: `coverage` ↓ · `span` ↑ · `cos` ↓ · recency (tie-break only); literal hits first, no repeated chunk.
 - `coverage`/`span` exist only with `rerank`. `recency` is a string, display only. Literal hits have `cos` 0.
-- With `expand: true`, the response is the `/search_expand` one (below), with `via`.
+- **Passages (#44):** a fused hit keeps `chunk` = first id and adds `chunks:[ids]`; `snippet` covers the joined text.
+- **Context (#45):** each hit gains `context:{before:[{id, text}], after:[{id, text}]}` (the passage's own chunks are
+  excluded); the response gains `context_truncated: true` when the cap cut it.
+- With `expand: true`, the response is the `/search_expand` one (below), with `via` (`merge_adjacent`/`context` don't apply).
 - 404 when no base matches the scope. Search is **deterministic**: same query, same response (#56).
 
 ### 1.4 Search with expansion — `POST /search_expand`

@@ -93,7 +93,12 @@ Rota única de busca (#39), com estágios **opt-in**: padrão conservador = busc
   "phonetic": false,        // casa pelo SOM (SOUNDEX): "Aslan" acha "Aslam"
   "literal_fallback": true, // needles alfanuméricos COM dígito (OE-6016, M31May-23h28): grep literal,
                             // achados exatos vêm na frente (#38); false desliga
-  "expand": false           // true = cascata dicionário → cache → IA (mesmo motor de /search_expand)
+  "expand": false,          // true = cascata dicionário → cache → IA (mesmo motor de /search_expand)
+  "merge_adjacent": false,  // #44: candidatos de trechos consecutivos de uma base → UMA passagem, cobertura
+                            // recalculada sobre o texto junto (exige rerank; não vale com expand)
+  "merge_max": 3,           // máximo de trechos por passagem (2–8)
+  "context": 0,             // #45: N (0–5) trechos vizinhos antes/depois de cada hit, na própria resposta
+  "context_max_chars": 20000// teto do texto de contexto; passou → "context_truncated": true
 }
 ```
 **Resposta** (`expand: false`):
@@ -119,7 +124,10 @@ Rota única de busca (#39), com estágios **opt-in**: padrão conservador = busc
 ```
 - Ordem: `coverage` ↓ · `span` ↑ · `cos` ↓ · recência (só desempata); hits literais na frente, sem repetir chunk.
 - `coverage`/`span` só existem com `rerank`. `recency` é texto, só para exibição. `cos` dos hits literais é 0.
-- Com `expand: true`, a resposta é a do `/search_expand` (abaixo), com `via`.
+- **Passagens (#44):** o hit fundido mantém `chunk` = primeiro id e ganha `chunks:[ids]`; o `snippet` cobre o texto junto.
+- **Contexto (#45):** cada hit ganha `context:{before:[{id, text}], after:[{id, text}]}` (os trechos da própria
+  passagem ficam de fora); a resposta ganha `context_truncated: true` quando o teto cortou.
+- Com `expand: true`, a resposta é a do `/search_expand` (abaixo), com `via` (`merge_adjacent`/`context` não se aplicam).
 - 404 quando nenhuma base casa com o escopo. A busca é **determinística**: mesma query, mesma resposta (#56).
 
 ### 1.4 Busca com expansão — `POST /search_expand`

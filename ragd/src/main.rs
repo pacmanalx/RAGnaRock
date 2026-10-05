@@ -2929,6 +2929,71 @@ fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
                  "collections": st.bases.snap().len()}).to_string())
 }
 
+/// [#44] Junta candidatos de trechos CONSECUTIVOS da mesma base em passagens (até `max_run`
+/// trechos), recalcula cobertura/span sobre o texto junto e devolve as `k` melhores. Hit isolado
+/// fica como está. A cobertura da passagem nunca é menor que a do melhor trecho dela (mais texto,
+/// mesmos termos) — é a co-ocorrência que cruza a fronteira do chunk que sobe.
+fn monta_passagens(base: &RagBase, hits: Vec<rag::Hit>, qt: &rag::QueryTerms, w: Option<&[f64]>,
+                   phonetic: bool, max_run: usize, k: usize)
+                   -> Vec<(Option<f64>, Option<f64>, Option<usize>, f64, Vec<usize>)> {
+    let mut por_id: Vec<rag::Hit> = hits;
+    por_id.sort_by_key(|h| h.4);
+    let mut grupos: Vec<Vec<rag::Hit>> = vec![];
+    for h in por_id {
+        match grupos.last_mut() {
+            Some(g) if g.len() < max_run && g.last().map(|u| u.4 + 1 == h.4).unwrap_or(false) => g.push(h),
+            _ => grupos.push(vec![h]),
+        }
+    }
+    let mut out: Vec<(Option<f64>, Option<f64>, Option<usize>, f64, Vec<usize>)> = grupos.into_iter().map(|g| {
+        let cos = g.iter().map(|h| h.3).fold(f64::MIN, f64::max);
+        if g.len() == 1 {
+            let (rr, cov, sp, cos, cid) = g[0];
+            return (rr, cov, sp, cos, vec![cid]);
+        }
+        let ids: Vec<usize> = g.iter().map(|h| h.4).collect();
+        let (c, sp) = base.score_passage(qt, w, &ids, phonetic);
+        (Some(c), Some(c), Some(sp), cos, ids)
+    }).collect();
+    // mesma ordem do rerank: cobertura ↓ · span ↑ · cos ↓
+    out.sort_by(|a, b| b.0.unwrap_or(b.3).partial_cmp(&a.0.unwrap_or(a.3)).unwrap()
+        .then(a.2.unwrap_or(0).cmp(&b.2.unwrap_or(0)))
+        .then(b.3.partial_cmp(&a.3).unwrap()));
+    out.truncate(k);
+    out
+}
+
+/// [#45] Anexa a cada hit `context: {before:[{id,text}], after:[{id,text}]}` com até `n` trechos de
+/// cada lado (os da própria passagem ficam de fora). Para quando o total passa de `max_chars` e
+/// devolve true (a resposta ganha `context_truncated`).
+fn anexa_contexto(hits: &mut [Value], bases: &Bases, n: usize, max_chars: usize) -> bool {
+    let mut total = 0usize;
+    for h in hits.iter_mut() {
+        let (coll, name) = (h["collection"].as_str().unwrap_or("").to_string(), h["base"].as_str().unwrap_or("").to_string());
+        let base = match get_base(bases, &coll, &name) { Some(b) => b, None => continue };
+        let ids: Vec<usize> = match h["chunks"].as_array() {
+            Some(a) => a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect(),
+            None => match h["chunk"].as_u64() { Some(c) => vec![c as usize], None => continue },
+        };
+        let (prim, ult) = (*ids.iter().min().unwrap_or(&0), *ids.iter().max().unwrap_or(&0));
+        let pega = |faixa: Vec<usize>, total: &mut usize| -> (Vec<Value>, bool) {
+            let mut v = vec![];
+            for i in faixa {
+                let t = match base.chunks.get(i).and_then(|c| base.chunk_text(c)) { Some(t) => t, None => continue };
+                if *total + t.len() > max_chars { return (v, true); }
+                *total += t.len();
+                v.push(json!({"id": i, "text": t}));
+            }
+            (v, false)
+        };
+        let (antes, c1) = pega((prim.saturating_sub(n)..prim).collect(), &mut total);
+        let (depois, c2) = if c1 { (vec![], true) } else { pega((ult + 1..=ult + n).collect(), &mut total) };
+        if let Some(o) = h.as_object_mut() { o.insert("context".into(), json!({"before": antes, "after": depois})); }
+        if c1 || c2 { return true; }
+    }
+    false
+}
+
 /// [#39] Corpo da busca silábica devolvendo o JSON como VALOR: quem precisa acrescentar campos
 /// (o `/search` com `via`) não relê o texto — o parser padrão do serde_json pode errar o último bit
 /// de um f64, e a busca deixaria de ser idêntica byte a byte (medido: 10/20 com cos diferente).
@@ -2951,6 +3016,14 @@ fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<V
     let recall_n = v["recall_n"].as_u64().unwrap_or(20) as usize;
     let rerank = v["rerank"].as_bool().unwrap_or(true);
     let phonetic = v["phonetic"].as_bool().unwrap_or(false);
+    // [#44] passagens: candidatos de trechos CONSECUTIVOS da mesma base viram um hit só, com a
+    // cobertura recalculada sobre o texto junto (fecha co-ocorrência entre chunks). Opt-in; exige rerank.
+    let merge_adjacent = rerank && v["merge_adjacent"].as_bool().unwrap_or(false);
+    let merge_max = v["merge_max"].as_u64().unwrap_or(3).clamp(2, 8) as usize;
+    // [#45] contexto: N trechos antes/depois de cada hit na própria resposta (sem 2ª chamada ao
+    // /chunk). Padrão 0 = resposta enxuta; teto de caracteres no total protege o contexto do agente.
+    let contexto = v["context"].as_u64().unwrap_or(0).min(5) as usize;
+    let contexto_max = v["context_max_chars"].as_u64().unwrap_or(20_000).min(200_000) as usize;
     // escopo: collection ausente ou "*" => todas
     let coll_pat = v["collection"].as_str();
 
@@ -3004,27 +3077,35 @@ fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<V
     let search_one = |coll: &String, name: &String| -> Option<BaseResult> {
         let base = get_base(bases, coll, name)?;
         let w = weightings.get(coll).map(|v| v.as_slice());   // peso unificado da coleção (ou None)
+        // [#44] com passagens, pede TODOS os candidatos reordenados (até recall_n) e corta depois
+        let k_base = if merge_adjacent { k.max(recall_n) } else { k };
         let (hits, info) = if unified {
             // perfil + query vetorizada da coleção + remap/normas desta base → recall unificado;
             // fallback pro recall local se faltar qualquer peça (robustez)
             match (profiles_ref.get(coll), qvecs.get(coll)) {
                 (Some(p), Some((qv, qn))) => match (p.remap.get(name), p.unorms.get(name)) {
                     (Some(remap), Some(unorms)) =>
-                        base.search_unified(query, k, rerank, recall_n, phonetic, qv, *qn, remap, unorms, w),
-                    _ => base.search(query, k, rerank, recall_n, phonetic, w),
+                        base.search_unified(query, k_base, rerank, recall_n, phonetic, qv, *qn, remap, unorms, w),
+                    _ => base.search(query, k_base, rerank, recall_n, phonetic, w),
                 },
-                _ => base.search(query, k, rerank, recall_n, phonetic, w),
+                _ => base.search(query, k_base, rerank, recall_n, phonetic, w),
             }
         } else {
-            base.search(query, k, rerank, recall_n, phonetic, w)
+            base.search(query, k_base, rerank, recall_n, phonetic, w)
+        };
+        // (rr, cov, span, cos, ids) — ids = trechos do hit (1, ou vários numa passagem)
+        let hits: Vec<(Option<f64>, Option<f64>, Option<usize>, f64, Vec<usize>)> = if merge_adjacent {
+            monta_passagens(base, hits, &qt, w, phonetic, merge_max, k)
+        } else {
+            hits.into_iter().map(|(rr, cov, sp, cos, cid)| (rr, cov, sp, cos, vec![cid])).collect()
         };
         let entry = json!({"collection": coll, "base": name,
                            "n_chunks": info.n_chunks, "n_converge": info.n_converge,
                            "dims": info.dims, "oov": info.oov,
                            "ms_recall": info.ms_recall, "ms_rerank": info.ms_rerank});
         let mut local: Vec<(f64, u64, i64, f64, Map<String, Value>)> = vec![];
-        for (rr, cov, span, cos, cid) in hits {
-            let c = &base.chunks[cid];
+        for (rr, cov, span, cos, ids) in hits {
+            let c = &base.chunks[ids[0]];
             let coverage = rr.unwrap_or(cos);
             let sp = span.unwrap_or(0);
             let mut o = Map::new();
@@ -3045,7 +3126,12 @@ fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<V
             o.insert("cos".into(), json!(cos));
             o.insert("chunk".into(), json!(c.id));
             o.insert("start".into(), json!(c.start));
-            if let Some(t) = base.chunk_text(c) { o.insert("snippet".into(), json!(rag::snippet(t, query))); }
+            if ids.len() > 1 {
+                // [#44] passagem: trechos que a compõem (para o /chunk) e snippet sobre o texto junto
+                o.insert("chunks".into(), json!(ids.iter().map(|&i| base.chunks[i].id).collect::<Vec<_>>()));
+                let junto: String = ids.iter().filter_map(|&i| base.chunk_text(&base.chunks[i])).collect::<Vec<_>>().join(" ");
+                if !junto.is_empty() { o.insert("snippet".into(), json!(rag::snippet(&junto, query))); }
+            } else if let Some(t) = base.chunk_text(c) { o.insert("snippet".into(), json!(rag::snippet(t, query))); }
             // tuple: (coverage_honesta, mtime_base, neg_span, cos, hit). mtime entra pro boost
             // de recência no merge cross-base (sessão nova não perde pra antiga em quase-empate).
             local.push((coverage, base.mtime, -(sp as i64), cos, o));
@@ -3118,6 +3204,7 @@ fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<V
     for (i, h) in hits.iter_mut().enumerate() {
         if let Some(o) = h.as_object_mut() { o.insert("rank".into(), json!(i + 1)); }
     }
+    let contexto_cortado = if contexto > 0 { anexa_contexto(&mut hits, bases, contexto, contexto_max) } else { false };
 
     let scope_label: Vec<Value> = pairs.iter().map(|(c, n)| json!(format!("{c}/{n}"))).collect();
     let mut resp = json!({
@@ -3125,6 +3212,7 @@ fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<V
         "scope": scope_label, "searched": searched, "hits": hits
     });
     if !needles.is_empty() { resp["needles"] = json!(needles); }
+    if contexto_cortado { resp["context_truncated"] = json!(true); }
     Ok(resp)
 }
 

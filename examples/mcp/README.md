@@ -9,7 +9,7 @@ and wire it into your client below.
 
 | tool | what it does | ragd endpoint |
 |---|---|---|
-| `ragnarock_search` | syllabic search (tf-idf recall + phonetic rerank); compact hits | `POST /search` · `/search_expand` |
+| `ragnarock_search` | syllabic search (tf-idf recall + phonetic rerank); compact hits; optional `context` (neighbour chunks inline) and `merge_adjacent` (passages) | `POST /search` (`expand` for the AI cascade) |
 | `ragnarock_chunk` | fetch whole chunk(s) by id, with `before`/`after` context | `POST /chunk` |
 | `ragnarock_list` | list loaded bases + collection summary | `GET /bases` · `/collections` |
 | `ragnarock_ingest` | ingest a raw **file** | `POST /ingest_file` |
