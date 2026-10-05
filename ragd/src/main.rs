@@ -132,7 +132,7 @@ struct State {
     cache_dir: String,          // pasta do cache por-QUERY (sinônimos consultados antes da IA)
     expansions: RwLock<HashMap<String, Vec<String>>>, // [#6] interior mut RW: search_expand cacheia sob outer-read; N readers
     thesaurus_dir: String,      // pasta dos dicionários por-PALAVRA (subdir/CODE com inuse.flag)
-    word_syn: HashMap<String, Vec<String>>,   // palavra -> sinônimos (união dos dicionários ATIVOS)
+    word_syn: HashMap<String, Vec<(bool, Vec<String>)>>,   // palavra -> (é tradução?, sinônimos) POR dicionário ativo
     nidhogg_url: String,        // URL do daemon de módulos (nidhoggd:11497) — só pro proxy do console
     sessions: HashMap<String, Instant>,   // token de sessão -> criado em (TTL via session_ttl)
     session_ttl: u64,                     // validade da sessão em segundos (configurável; default 12h)
@@ -1431,7 +1431,13 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     //   2) CACHE por-query (cache/expansions.json) — hit instantâneo.
     //   3) LLM ativo — só quando 1 e 2 não deram nada; grava no cache.
     let nkey = normalize_query(query);
-    let dict_exps = if st.word_syn.is_empty() { vec![] } else { expand_with_dicts(query, &st.word_syn) };
+    // [dict] o filtro do corpus vem ANTES do corte: vocabulário do escopo calculado aqui
+    let (dict_exps, dict_fora, dict_trad) = if st.word_syn.is_empty() { (vec![], vec![], HashMap::new()) } else {
+        let base_d = v["base"].as_str().unwrap_or("*").to_string();
+        let coll_d = v["collection"].as_str().map(|s| s.to_string());
+        let keys_d = scope_word_keys(&st.bases.snap(), coll_d.as_deref(), &base_d);
+        expand_with_dicts(query, &st.word_syn, &|e: &str| term_in_corpus(e, &keys_d))
+    };
     // [#6 fix] Extrai o cache hit pra um let ANTES do if/else: garante que o read lock de
     // `expansions` é dropado ANTES da arm `else` poder tentar `expansions.write()` (senão
     // mesmo-thread read+write deadlocka em parking_lot/std RwLock).
@@ -1502,6 +1508,8 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     for e in &exps {
         if term_in_corpus(e, &keys) { kept.push(e.clone()); } else { dropped.push(e.clone()); }
     }
+    // [dict] o dicionário já filtrou antes do corte; os que ele descartou entram aqui (transparência)
+    if source == "dict" { dropped.extend(dict_fora.iter().cloned()); }
     slog(&format!("   ├─ filtro vocab ({} chaves no escopo): original {} · {} mantida(s), {} cortada(s){}",
                   keys.len(), if orig_in { "ancora ✓" } else { "FORA ✗" }, kept.len(), dropped.len(),
                   if dropped.is_empty() { String::new() } else { format!(" → {dropped:?}") }));
@@ -1572,27 +1580,50 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
             let base_h = h["base"].as_str().unwrap_or("").to_string();
             let cid = h["chunk"].as_u64().unwrap_or(0) as usize;
             let w = exp_weightings.get(&coll_h).map(|v| v.as_slice());
-            let (orig_cov, orig_span) = st.bases.snap().get(&coll_h)
+            let (mut orig_cov, orig_span) = st.bases.snap().get(&coll_h)
                 .and_then(|m| m.get(&base_h))
                 .map(|b| b.score_chunk(&qt, w, cid, phon))
                 .unwrap_or((0.0, 0));
+            // [tradução] hit que entrou por uma TRADUÇÃO principal (dicionário cross) vale como o
+            // original: ganha a FRAÇÃO da query que a palavra traduzida representa (peso dela no
+            // rerank). "sword" sozinha → 1,0; "sword and shield" com só "espada" → a parte de
+            // "sword", e o trecho em inglês com as duas continua acima. Sinônimo da mesma língua
+            // segue a regra acima (só a cobertura original conta).
+            let mut traduzida = false;
+            if source == "dict" && via > 0 {
+                if let Some(origem) = dict_trad.get(&variants[via].to_lowercase()) {
+                    let fatia = st.bases.snap().get(&coll_h).and_then(|m| m.get(&base_h))
+                        .map(|b| b.term_share(&qt, w, origem)).unwrap_or(0.0);
+                    let c = (orig_cov + fatia).min(1.0);
+                    if c > orig_cov { orig_cov = c; traduzida = true; }
+                }
+            }
             if let Some(o) = h.as_object_mut() {
                 o.insert("matchpoint".into(), json!(orig_cov));
                 o.insert("coverage".into(), json!(orig_cov));
                 o.insert("span".into(), json!(orig_span));
                 o.insert("var_cov".into(), json!(var_cov));
+                if traduzida { o.insert("translated".into(), json!(true)); o.insert("via".into(), json!(variants[via].clone())); }
             }
-            (orig_cov, var_cov, -(orig_span as i64), via, h)
+            // tradução recebe o mesmo tratamento do original no desempate (mesma "cobertura de
+            // variante" do original, que leva +0,001) — senão empatada em 1,00 sempre perde
+            let var_cov = if traduzida { orig_cov + 0.001 } else { var_cov };
+            (orig_cov, var_cov, -(orig_span as i64), if traduzida { 0 } else { via }, h)
         }).collect();
     // cobertura ORIGINAL ↓ · cobertura de variante ↓ · span ↑ · original desempata
+    // cobertura ↓ · cobertura da variante ↓ · span ↑ · cos ↓ (mérito entre empatados: original e
+    // tradução na mesma escala) · original/tradução antes de sinônimo
+    let cos_de = |h: &Value| h["cos"].as_f64().unwrap_or(0.0);
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()
         .then(b.1.partial_cmp(&a.1).unwrap())
         .then(b.2.cmp(&a.2))
+        .then(cos_de(&b.4).partial_cmp(&cos_de(&a.4)).unwrap_or(std::cmp::Ordering::Equal))
         .then((b.3 == 0).cmp(&(a.3 == 0))));
     let hits: Vec<Value> = rows.into_iter().take(k).enumerate().map(|(i, (.., via, mut h))| {
         if let Some(o) = h.as_object_mut() {
             o.insert("rank".into(), json!(i + 1));
-            o.insert("via".into(), json!(if via == 0 { "original".to_string() } else { variants[via].clone() }));
+            let traduzido = o.get("translated").and_then(|t| t.as_bool()).unwrap_or(false);
+            if !traduzido { o.insert("via".into(), json!(if via == 0 { "original".to_string() } else { variants[via].clone() })); }
         }
         h
     }).collect();
@@ -3447,11 +3478,13 @@ fn list_dicts(_query: &str, dir: &str) -> (u16, String) {
 }
 
 /// Monta o mapa palavra->sinônimos da UNIÃO dos dicionários ATIVOS (com inuse.flag).
-fn load_active_dicts(dir: &str) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+fn load_active_dicts(dir: &str) -> HashMap<String, Vec<(bool, Vec<String>)>> {
+    let mut map: HashMap<String, Vec<(bool, Vec<String>)>> = HashMap::new();
     for p in dict_dirs(dir) {
         if !p.join("inuse.flag").exists() { continue; }
         let content = match std::fs::read_to_string(p.join("synonyms.jsonl")) { Ok(c) => c, Err(_) => continue };
+        // meta.kind: "cross" = dicionário de TRADUÇÃO (ENPT, PTEN…); "mono" = sinônimos da mesma língua
+        let traducao = read_dict_meta(&p)["kind"].as_str() == Some("cross");
         for (i, line) in content.lines().enumerate() {
             if i == 0 { continue; }                 // pula o meta
             let line = line.trim();
@@ -3463,7 +3496,8 @@ fn load_active_dicts(dir: &str) -> HashMap<String, Vec<String>> {
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 if syns.is_empty() { continue; }
-                map.entry(w).or_default().extend(syns);
+                // uma lista POR dicionário (não concatena): a expansão intercala as línguas
+                map.entry(w).or_default().push((traducao, syns));
             }
         }
     }
@@ -3505,8 +3539,19 @@ fn dict_toggle(body: &str, st: &mut State) -> (u16, String) {
 
 /// Expansão POR-PALAVRA: cada palavra da query vira suas variantes (sinônimos dos dicts ativos).
 /// O casamento real (e o corte de polissemia) acontece no search por sílaba + merge por cobertura.
-fn expand_with_dicts(query: &str, map: &HashMap<String, Vec<String>>) -> Vec<String> {
+/// Variantes de dicionário para a query. Duas regras (medidas com "sword", 05/out/2026):
+/// - INTERCALA os dicionários (1º sinônimo de cada um, depois o 2º…): antes a lista era a
+///   concatenação em ordem alfabética dos dicionários, e os ~50 sinônimos do ENEN ocupavam as
+///   vagas antes do "espada" do ENPT — a tradução nunca entrava;
+/// - FILTRA pelo corpus ANTES do corte (`no_corpus`): antes cortava em 12 e só depois descartava
+///   o que não existe no escopo (para "sword", 9 dos 12). Agora as vagas são de variantes úteis;
+///   as descartadas voltam em `descartadas` (até 12), para transparência.
+fn expand_with_dicts(query: &str, map: &HashMap<String, Vec<(bool, Vec<String>)>>, no_corpus: &dyn Fn(&str) -> bool)
+                     -> (Vec<String>, Vec<String>, HashMap<String, String>) {
+    const MAX: usize = 12;
     let mut out: Vec<String> = vec![];
+    let mut descartadas: Vec<String> = vec![];
+    let mut traducoes: HashMap<String, String> = HashMap::new();   // variante (minúscula) -> palavra traduzida
     let mut seen: HashSet<String> = HashSet::new();
     let lower = query.to_lowercase();
     let all: Vec<&str> = lower.split_whitespace().collect();
@@ -3520,18 +3565,28 @@ fn expand_with_dicts(query: &str, map: &HashMap<String, Vec<String>>) -> Vec<Str
     let content: Vec<&str> = all.iter().copied().filter(|w| is_content(w)).collect();
     let keys: &[&str] = if content.is_empty() { &all } else { &content };
     for &w in keys {
-        if let Some(syns) = map.get(w) {
-            for s in syns {
-                let s = s.trim();
+        let listas = match map.get(w) { Some(l) => l, None => continue };
+        let maior = listas.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+        'rodadas: for pos in 0..maior {
+            for (trad, l) in listas {
+                let s = match l.get(pos) { Some(s) => s.trim(), None => continue };
                 if s.is_empty() { continue; }
                 let low = s.to_lowercase();
-                if low == w { continue; }
-                if seen.insert(low) { out.push(s.to_string()); }
+                if low == w || !seen.insert(low.clone()) { continue; }
+                if no_corpus(s) {
+                    // só as 2 primeiras traduções de cada dicionário valem como o original (as
+                    // principais: sword → espada, gládio); as demais entram como sinônimo comum —
+                    // medido: "espada" → "righteousness" (PTEN) dominava pelo cosseno
+                    if *trad && pos < 2 { traducoes.insert(low, w.to_string()); }
+                    out.push(s.to_string());
+                    if out.len() >= MAX { break 'rodadas; }
+                }
+                else if descartadas.len() < MAX { descartadas.push(s.to_string()); }
             }
         }
+        if out.len() >= MAX { break; }
     }
-    out.truncate(12);
-    out
+    (out, descartadas, traducoes)
 }
 
 fn help() {
@@ -3572,4 +3627,27 @@ rotas:
   POST   /search    {{\"base\":\"sda\"|\"sd*\"|\"*\",\"query\":\"anel\",\"k\":5,\"rerank\":true}}
   POST   /chunk     {{\"base\":\"sda\",\"id\":87,\"before\":1,\"after\":1}}  ou  {{\"base\":\"sda\",\"ids\":[1,87]}}
   DELETE /bases/{{nome}}");
+}
+
+#[cfg(test)]
+mod testes_dicionario {
+    use super::*;
+
+    /// O caso "sword" (05/out/2026): o ENEN tem dezenas de sinônimos em inglês, quase todos fora
+    /// do corpus; o ENPT traz "espada". Intercalando os dicionários e filtrando pelo corpus antes
+    /// do corte, "espada" entra; os de fora vão para `descartadas`.
+    #[test]
+    fn dicionarios_intercalados_e_filtrados_pelo_corpus() {
+        let mut map: HashMap<String, Vec<(bool, Vec<String>)>> = HashMap::new();
+        let enen: Vec<String> = (0..40).map(|i| format!("inglesfora{i}")).chain(["blade".to_string()]).collect();
+        let enpt: Vec<String> = vec!["espada".into(), "gladio".into()];
+        map.insert("sword".into(), vec![(false, enen), (true, enpt)]);
+        let corpus = ["espada", "blade"];
+        let (out, fora, trad) = expand_with_dicts("sword", &map, &|e: &str| corpus.contains(&e));
+        assert_eq!(out, vec!["espada".to_string(), "blade".to_string()]);
+        assert!(fora.contains(&"inglesfora0".to_string()) && fora.len() <= 12);
+        // "espada" veio do dicionário de TRADUÇÃO (de "sword"); "blade" é sinônimo da mesma língua
+        assert_eq!(trad.get("espada").map(String::as_str), Some("sword"));
+        assert!(!trad.contains_key("blade"));
+    }
 }

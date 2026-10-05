@@ -149,6 +149,13 @@ busca original e, se o topo cobre a query inteira (≥ 0,999) com ≥ min(k,2) h
 
 **Resposta (normal):** `{via, query, provider, source, expansions:[…], absent:false, dropped:[…], hits}` —
 hits com os campos da busca silábica + `var_cov`; `via` do hit = `"original"` ou a variante que o trouxe.
+
+**Dicionários:** os dicionários ativos são **intercalados** (cada um contribui, na vez) e só variantes presentes no
+vocabulário do escopo ocupam as 12 vagas (as demais vão para `dropped`). Os hits são repontuados contra a pergunta
+ORIGINAL, exceto **traduções**: uma variante entre as 2 primeiras traduções de uma palavra num dicionário entre
+línguas (ENPT, PTEN, ESPT…) vale como o original e ganha a fração da pergunta que a palavra traduzida representa —
+`"sword"` → trechos com `"espada"` disputam pelo mérito; esses hits trazem `translated: true`. Sinônimos da mesma
+língua seguem a regra da pergunta original.
 **Ausente** (nem a query nem variante ancoram no vocabulário): `{…, absent:true, dropped, reason, did_you_mean, hits:[]}`.
 **Erros:** 400 sem dicionário, cache nem provider de IA (e o literal não achou) · 502 falha da IA.
 Estas respostas não trazem `query_syllables`, `scope` nem `searched`.

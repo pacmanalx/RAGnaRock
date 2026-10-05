@@ -150,6 +150,13 @@ without expanding (`two_phase: false` forces the cascade); (3) cascade active di
 
 **Response (normal):** `{via, query, provider, source, expansions:[…], absent:false, dropped:[…], hits}` —
 hits carry the syllabic fields + `var_cov`; the hit's `via` = `"original"` or the variant that brought it.
+
+**Dictionaries:** active dictionaries are **interleaved** (each one contributes, in turn) and only variants present
+in the scope's vocabulary take the 12 slots (the rest go to `dropped`). Hits are rescored against the ORIGINAL query,
+except **translations**: a variant among the first 2 translations of a word in a cross-language dictionary (ENPT,
+PTEN, ESPT…) counts as the original and earns the share of the query that the translated word represents —
+`"sword"` → chunks with `"espada"` compete on merit; such hits carry `translated: true`. Same-language synonyms keep
+the original-query rule.
 **Absent** (neither the query nor any variant anchors in the vocabulary): `{…, absent:true, dropped, reason, did_you_mean, hits:[]}`.
 **Errors:** 400 with no dictionary, cache or AI provider (and the literal found nothing) · 502 AI failure.
 These responses carry no `query_syllables`, `scope` or `searched`.
