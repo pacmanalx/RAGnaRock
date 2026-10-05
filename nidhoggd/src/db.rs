@@ -290,3 +290,28 @@ pub fn classes_summary(conn: &Connection, collection: Option<&str>) -> Result<Va
         "bases": bases,
     }))
 }
+
+/// [#14/#21] Nomes de base com classe numa coleção (o SQLite só guarda classes).
+pub fn known_names(conn: &Connection, collection: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM doc_class WHERE collection=?1 ORDER BY name")?;
+    let v = stmt.query_map([collection], |r| r.get::<_, String>(0))?.collect::<Result<_>>()?;
+    Ok(v)
+}
+
+/// [#14] Move a classe de `de` para `para` (com o state_hash da base nova). Devolve 1 se moveu.
+pub fn relink_class(conn: &Connection, collection: &str, de: &str, para: &str, state_hash: &str) -> Result<usize> {
+    conn.execute("DELETE FROM doc_class WHERE collection=?1 AND name=?2", params![collection, para])?;
+    let n = conn.execute(
+        "UPDATE doc_class SET name=?3, state_hash=?4 WHERE collection=?1 AND name=?2",
+        params![collection, de, para, state_hash])?;
+    Ok(n)
+}
+
+/// [#21] Apaga as classes das bases `nomes`. Devolve quantas linhas saíram.
+pub fn prune_names(conn: &Connection, collection: &str, nomes: &[String]) -> Result<usize> {
+    let mut n = 0;
+    for name in nomes {
+        n += conn.execute("DELETE FROM doc_class WHERE collection=?1 AND name=?2", params![collection, name])?;
+    }
+    Ok(n)
+}

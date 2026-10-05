@@ -89,6 +89,10 @@ struct Config {
     llm_ledger_meta: String,  // coleções sempre em metadados, separadas por vírgula ("*" = todas)
     llm_ledger_max_mb: u64,   // gira o arquivo ao passar disso (0 = nunca)
     llm_ledger_keep: usize,   // arquivos girados mantidos (os mais antigos são apagados)
+    // [#21] horas que uma base precisa ficar AUSENTE do ragd antes de o Nidhogg apagar o que sabe
+    // dela (classe, entidades, nós). A carência dá tempo de um rename ser casado (#14) ou de um
+    // ragd que subiu pela metade voltar. 0 = poda no mesmo ciclo; negativo = nunca poda.
+    prune_grace_h: i64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -102,7 +106,7 @@ impl Default for Config {
                  store: "clickhouse".to_string(),
                  ch_url: "http://127.0.0.1:8123".to_string(),
                  llm_ledger: "full".to_string(), llm_ledger_meta: String::new(),
-                 llm_ledger_max_mb: 20, llm_ledger_keep: 6 }
+                 llm_ledger_max_mb: 20, llm_ledger_keep: 6, prune_grace_h: 24 }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -130,6 +134,7 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "llm_ledger_meta" => cfg.llm_ledger_meta = v.to_string(),
             "llm_ledger_max_mb" => if let Ok(n) = v.parse() { cfg.llm_ledger_max_mb = n },
             "llm_ledger_keep" => if let Ok(n) = v.parse() { cfg.llm_ledger_keep = n },
+            "prune_grace_h" => if let Ok(n) = v.parse() { cfg.prune_grace_h = n },
             "store"    => cfg.store = v.to_string(),
             "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
@@ -2121,6 +2126,43 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
         // com origem='humano' → o LLM NUNCA sobrescreve (needs_class curto-circuita). natureza deriva do
         // tipo, csv é determinístico (tabular_spec no texto real). Re-extrai no próximo ciclo (o novo tipo
         // muda o ext_cfg → needs_extract dispara). Corrige os mal-tipados e o COMPARATIVO nqi-baixo.
+        // [#14] relink MANUAL: move classe (inclusive origem=humano), entidades e nós de uma base que
+        // não existe mais no ragd (`de`) para uma que existe (`para`). Cobre o que o casamento
+        // automático do ciclo não pega (conteúdo também mudou, ou mais de um candidato).
+        (Method::Post, "/api/nidhogg/relink") => {
+            let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
+            let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
+            let de = nfc(v["de"].as_str().unwrap_or("").trim());
+            let para = nfc(v["para"].as_str().unwrap_or("").trim());
+            if coll.is_empty() || de.is_empty() || para.is_empty() || de == para {
+                return (400, json!({"error":"faltam 'collection', 'de' e 'para' (diferentes)"}).to_string());
+            }
+            let (api, store, dir, ch_url) = { let s = st.lock().unwrap(); (s.ragd_api.clone(), s.store.clone(), s.dir.clone(), s.ch_url.clone()) };
+            let bases: Vec<Value> = match http_get_t(&format!("{api}/bases?collection={coll}"), 30)
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+                Some(b) => b["bases"].as_array().cloned().unwrap_or_default(),
+                None => return (502, json!({"error":"ragd /bases sem resposta"}).to_string()),
+            };
+            let achar = |n: &str| bases.iter().find(|b| nfc(b["name"].as_str().unwrap_or("")) == n).cloned();
+            if achar(&de).is_some() { return (409, json!({"error": format!("\"{de}\" ainda existe no ragd — relink é só de base que sumiu")}).to_string()); }
+            let alvo = match achar(&para) { Some(b) => b, None => return (404, json!({"error": format!("\"{para}\" não existe no ragd")}).to_string()) };
+            if !try_start_cycle(st) { return (409, json!({"error":"ciclo em andamento — tente de novo em instantes"}).to_string()); }
+            let r = store_relink(&store, &dir, &ch_url, &coll, &de, &para, &base_state_hash(&alvo));
+            if r.is_ok() {
+                let mut k = read_knowledge(&dir, &coll);
+                if let Some(a) = k["ausentes"].as_object_mut() { a.remove(&de); }
+                k["link_src"] = Value::Null;
+                write_knowledge(&dir, &coll, &k);
+            }
+            end_cycle(st);
+            match r {
+                Ok((c, e)) => {
+                    nlog(&format!("relink manual {coll}: \"{de}\" → \"{para}\" — {c} classe(s), {e} entidade(s)"));
+                    (200, json!({"ok": true, "collection": coll, "de": de, "para": para, "classes": c, "entidades": e}).to_string())
+                }
+                Err(e) => (500, json!({"error": format!("store: {e}")}).to_string()),
+            }
+        }
         (Method::Post, "/api/nidhogg/reclass") => {
             let v: Value = match serde_json::from_str(body) { Ok(v) => v, Err(e) => return (400, json!({"error":format!("JSON inválido: {e}")}).to_string()) };
             let coll = nfc(v["collection"].as_str().unwrap_or("").trim());
@@ -2434,7 +2476,7 @@ fn collection_source_hash(bases: &[Value]) -> String {
 /// (source_hash, pilares[], n_bases, total_chunks) — ou None se o ragd não responder
 /// (não grava dados parciais). Os pilares são DISTINTOS: RootIndex = identidade léxica
 /// (sílabas salientes), CorpusDict = anatomia (composição por base).
-fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)> {
+fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64, Vec<Value>)> {
     // 1) /bases?collection — meta por base (alimenta source_hash E o CorpusDict).
     let bases_resp: Value = serde_json::from_str(&http_get_t(&format!("{api}/bases?collection={coll}"), 30)?).ok()?;
     let bases = bases_resp["bases"].as_array()?.clone();
@@ -2490,7 +2532,8 @@ fn mine_level0(api: &str, coll: &str) -> Option<(String, Vec<Value>, usize, u64)
 
     // CacheDigest: ADIADO — exige um endpoint novo no ragd p/ ler o cache de expansão (o
     // invariante proíbe o nidhoggd ler disco da coleção). Registrado, não fingido.
-    Some((source_hash, vec![root_index, corpus_dict], bases.len(), total_chunks))
+    let n = bases.len();
+    Some((source_hash, vec![root_index, corpus_dict], n, total_chunks, bases))
 }
 
 // ───────────────────────────── CacheDigest (#48) — pilar GLOBAL do nível 0 ─────────────────────────────
@@ -3217,6 +3260,148 @@ fn store_classes_summary(store: &str, dir: &str, ch_url: &str, coll: Option<&str
     else { let conn = db::open(dir).map_err(|e| e.to_string())?; db::classes_summary(&conn, coll).map_err(|e| e.to_string()) }
 }
 
+// ───────────────────────── [#14/#21] reconciliação das bases da coleção ─────────────────────────
+// A cada ciclo, compara as bases que o ragd tem hoje com as que o Nidhogg viu no ciclo anterior
+// (`bases_vistas` no knowledge.json) e com o que ele guarda no store:
+//   • RENOMEADA (#14): some uma base e aparece outra com a MESMA assinatura de conteúdo
+//     (n_chunks, vocab_size, corpus), casamento único nos dois sentidos → relink automático:
+//     classe (inclusive origem=humano), entidades e nós passam para o nome novo, sem LLM.
+//   • REMOVIDA (#21): nome que o store conhece e o ragd não tem mais. Fica em `ausentes` com o
+//     instante em que sumiu; passada a carência (`prune_grace_h`), classe/entidades/nós são
+//     apagados em lote. Se a base volta antes disso, sai de `ausentes` e nada se perde.
+//   • O diff (novas/mudadas/removidas/renomeadas/podadas) fica em `l0_diff`, pra leitura.
+// O L0 em si (RootIndex/CorpusDict) continua sendo da coleção inteira: vocabulário unificado e
+// idf mudam com QUALQUER base, e custam 2 chamadas ao ragd. O trabalho caro (classificar,
+// extrair, recensear) já é por base, pelo state_hash.
+static PRUNE_GRACE_H: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Assinatura de CONTEÚDO de uma base (sem o nome): é o que casa "mesma base, nome novo".
+fn base_sig(b: &Value) -> String {
+    hash_hex(&format!("{}|{}|{}",
+        b["n_chunks"].as_u64().unwrap_or(0), b["vocab_size"].as_u64().unwrap_or(0), b["corpus"].as_str().unwrap_or("")))
+}
+
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Diff entre o ciclo anterior e o atual. Mapas nome → (assinatura, state_hash).
+/// Devolve (novas, mudadas, removidas, renomeadas[(de, para)]) — renomeadas saem de novas/removidas.
+fn diff_bases(prev: &std::collections::BTreeMap<String, (String, String)>,
+              cur: &std::collections::BTreeMap<String, (String, String)>)
+              -> (Vec<String>, Vec<String>, Vec<String>, Vec<(String, String)>) {
+    let mut novas: Vec<String> = cur.keys().filter(|n| !prev.contains_key(*n)).cloned().collect();
+    let mut removidas: Vec<String> = prev.keys().filter(|n| !cur.contains_key(*n)).cloned().collect();
+    let mudadas: Vec<String> = cur.iter().filter(|(n, (_, sh))| prev.get(*n).map(|(_, a)| a != sh).unwrap_or(false))
+        .map(|(n, _)| n.clone()).collect();
+    let mut renomeadas = vec![];
+    for de in removidas.clone() {
+        let sig = &prev[&de].0;
+        let cand: Vec<&String> = novas.iter().filter(|n| &cur[*n].0 == sig).collect();
+        let rivais = removidas.iter().filter(|r| &prev[*r].0 == sig).count();
+        if cand.len() == 1 && rivais == 1 { renomeadas.push((de.clone(), cand[0].clone())); }
+    }
+    for (de, para) in &renomeadas {
+        novas.retain(|n| n != para);
+        removidas.retain(|r| r != de);
+    }
+    (novas, mudadas, removidas, renomeadas)
+}
+
+/// Atualiza o relógio de ausência: quem o store conhece e o ragd não tem entra (com `agora`),
+/// quem voltou sai. Devolve (ausentes atualizados, nomes vencidos pela carência).
+fn ausencias(conhecidas: &[String], vivas: &std::collections::BTreeSet<String>,
+             antes: &serde_json::Map<String, Value>, agora: i64, carencia_h: i64)
+             -> (serde_json::Map<String, Value>, Vec<String>) {
+    let mut aus = serde_json::Map::new();
+    let mut vencidas = vec![];
+    for n in conhecidas {
+        if vivas.contains(n) { continue; }
+        let desde = antes.get(n).and_then(|v| v.as_i64()).unwrap_or(agora);
+        aus.insert(n.clone(), json!(desde));
+        if carencia_h >= 0 && agora - desde >= carencia_h * 3600 { vencidas.push(n.clone()); }
+    }
+    (aus, vencidas)
+}
+
+fn store_known_names(store: &str, dir: &str, ch_url: &str, coll: &str) -> Result<Vec<String>, String> {
+    if store == "clickhouse" { chdb::known_names(ch_url, coll) }
+    else { db::open(dir).and_then(|c| db::known_names(&c, coll)).map_err(|e| e.to_string()) }
+}
+fn store_relink(store: &str, dir: &str, ch_url: &str, coll: &str, de: &str, para: &str, sh: &str) -> Result<(u64, u64), String> {
+    if store == "clickhouse" { chdb::relink(ch_url, coll, de, para, sh) }
+    else { db::open(dir).and_then(|c| db::relink_class(&c, coll, de, para, sh)).map(|n| (n as u64, 0)).map_err(|e| e.to_string()) }
+}
+fn store_podar(store: &str, dir: &str, ch_url: &str, coll: &str, nomes: &[String]) -> Result<u64, String> {
+    if store == "clickhouse" { chdb::podar(ch_url, coll, nomes) }
+    else { db::open(dir).and_then(|c| db::prune_names(&c, coll, nomes)).map(|n| n as u64).map_err(|e| e.to_string()) }
+}
+
+/// Reconcilia as bases de UMA coleção (ver bloco acima). Mexe em `k` (o knowledge em memória do
+/// ciclo) E grava os mesmos campos no disco — o ciclo só reescreve o knowledge quando o L0 muda.
+fn reconcilia_bases(store: &str, dir: &str, ch_url: &str, coll: &str, bases: &[Value], k: &mut Value) -> Value {
+    use std::collections::{BTreeMap, BTreeSet};
+    let cur: BTreeMap<String, (String, String)> = bases.iter()
+        .map(|b| (nfc(b["name"].as_str().unwrap_or("")), (base_sig(b), base_state_hash(b))))
+        .filter(|(n, _)| !n.is_empty()).collect();
+    let prev: Option<BTreeMap<String, (String, String)>> = k["bases_vistas"].as_object().map(|o| o.iter()
+        .map(|(n, v)| (n.clone(), (v["sig"].as_str().unwrap_or("").to_string(), v["sh"].as_str().unwrap_or("").to_string())))
+        .collect());
+    let (novas, mudadas, removidas, renomeadas) = match &prev {
+        Some(p) => diff_bases(p, &cur),
+        None => (vec![], vec![], vec![], vec![]),   // 1º ciclo: vira só a linha de base
+    };
+    let mut relinkadas = vec![];
+    for (de, para) in &renomeadas {
+        match store_relink(store, dir, ch_url, coll, de, para, &cur[para].1) {
+            Ok((c, e)) => {
+                nlog(&format!("relink {coll}: \"{de}\" → \"{para}\" (mesmo conteúdo) — {c} classe(s), {e} entidade(s) preservadas"));
+                relinkadas.push(json!({"de": de, "para": para, "classes": c, "entidades": e}));
+            }
+            Err(e) => nlog(&format!("relink {coll}: \"{de}\" → \"{para}\" falhou ({e}) — a nova segue como base nova")),
+        }
+    }
+    // ausências e poda — contra o que o STORE conhece (pega também órfãs antigas)
+    let vivas: BTreeSet<String> = cur.keys().cloned().collect();
+    let carencia = *PRUNE_GRACE_H.get().unwrap_or(&24);
+    let mut podadas: Vec<String> = vec![];
+    let mut aus = k["ausentes"].as_object().cloned().unwrap_or_default();
+    match store_known_names(store, dir, ch_url, coll) {
+        Ok(conhecidas) => {
+            let (novo_aus, vencidas) = ausencias(&conhecidas, &vivas, &aus, epoch_secs(), carencia);
+            aus = novo_aus;
+            if !vencidas.is_empty() {
+                match store_podar(store, dir, ch_url, coll, &vencidas) {
+                    Ok(n) => {
+                        nlog(&format!("poda {coll}: {} base(s) ausente(s) há ≥{carencia}h — {n} linha(s) apagadas: {}",
+                            vencidas.len(), vencidas.join(", ")));
+                        for v in &vencidas { aus.remove(v); }
+                        podadas = vencidas;
+                    }
+                    Err(e) => nlog(&format!("poda {coll}: falhou ({e}) — tenta de novo no próximo ciclo")),
+                }
+            }
+        }
+        Err(e) => nlog(&format!("poda {coll}: não leu os nomes do store ({e}) — pulada")),
+    }
+    let vistas: serde_json::Map<String, Value> = cur.iter()
+        .map(|(n, (sig, sh))| (n.clone(), json!({"sig": sig, "sh": sh}))).collect();
+    let mexeu = !relinkadas.is_empty() || !podadas.is_empty();
+    let houve = mexeu || !novas.is_empty() || !mudadas.is_empty() || !removidas.is_empty();
+    let rel = json!({"at": now_stamp(), "novas": novas, "mudadas": mudadas, "removidas": removidas,
+                     "renomeadas": relinkadas, "podadas": podadas});
+    let mut disco = read_knowledge(dir, coll);
+    let grava = houve || disco["bases_vistas"] != json!(vistas) || disco["ausentes"] != json!(aus);
+    for alvo in [&mut *k, &mut disco] {
+        alvo["bases_vistas"] = json!(vistas);
+        alvo["ausentes"] = json!(aus);
+        if houve { alvo["l0_diff"] = rel.clone(); }
+        if mexeu { alvo["link_src"] = Value::Null; }   // os nós mudaram de dono → mine_links refaz
+    }
+    if grava { write_knowledge(dir, coll, &disco); }
+    rel
+}
+
 /// Ciclo de classificação de UMA coleção (Fase 1). Reconcilia /bases do ragd com o STORE:
 /// classifica só as bases NOVAS/mudadas (state_hash) ou afetadas por edição de vocabulário/prompt
 /// (cfg_hash). CLASSIFY_PER_CYCLE por ciclo; aborta em 2 falhas de LLM seguidas. As classes vão num
@@ -3229,7 +3414,7 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
     let (sys, _from) = classify_system(lib);
     // checkpoint = doctypes + prompt. Editar a lista OU o prompt reclassifica; state_hash cobre o
     // corpus. `force` re-minera L0/Summary, mas a classificação SEGUE o checkpoint (não refaz as
-    // provadas). Prune de fantasmas PULADO de propósito (mutation é caro no CH; ghosts são inócuos).
+    // provadas). Bases removidas/renomeadas são tratadas antes, em `reconcilia_bases` (#14/#21).
     let _ = force;
     let cfg_hash = hash_hex(&format!("{}|{}", store_doctypes_hash(store, dir, ch_url), sys));
 
@@ -3500,13 +3685,16 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
         match mine_level0(&api, coll) {
-            Some((src, pillars, n_bases, total_chunks)) => {
+            Some((src, pillars, n_bases, total_chunks, bases)) => {
                 let l0_same = k["source_hash"].as_str() == Some(src.as_str());
                 // saturação = fração do corpus com a digestão da camada ATIVA em dia.
                 // L0 digere tudo num passe (1.0 ao minerar); L1 mede pelo `pending` da
                 // classificação (a porta da consciência — extração vem atrás dela).
                 let mut sat: Option<f64> = if level >= 1 { None } else { Some(1.0) };
                 if level >= 1 {
+                    // [#14/#21] antes de classificar: casa renomeadas (relink, sem LLM) e poda as
+                    // removidas vencidas — senão a renomeada iria pro LLM como base nova.
+                    let _rc = reconcilia_bases(&store, &dir, &ch_url, coll, &bases, &mut k);
                     // Fase 1: classifica {natureza,tipo} das bases novas/mudadas (doc_class no ClickHouse).
                     let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
@@ -3667,6 +3855,7 @@ rotas:
   POST /api/nidhogg                 {{\"on\":bool,\"level\":\"minerador|...\",\"cadence\":secs}}
   POST /api/nidhogg/collection      {{\"collection\":\"x\",\"enabled\":bool}}
   POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)
+  POST /api/nidhogg/relink          base renomeada {{\"collection\",\"de\",\"para\"}}: move classe/entidades/nós
   POST /api/nidhogg/molde           molde dirigido {{\"tipo\",\"instrucao\",\"collection\",\"base\"}}
   POST /api/nidhogg/run             dispara um ciclo agora (stub)");
 }
@@ -3721,6 +3910,7 @@ fn main() {
     let _ = LLM_KEY.set(cfg.llm_key.clone());   // idem credencial e dialeto do provedor
     let _ = LLM_TEMP.set(cfg.llm_temp);
     let _ = LLM_EXTRA.set(cfg.llm_extra.clone());
+    let _ = PRUNE_GRACE_H.set(cfg.prune_grace_h);
     let state = Arc::new(Mutex::new(State {
         on: cfg.on, level: cfg.level, dir: cfg.dir.clone(), cadence: cfg.cadence,
         ragd_api: cfg.ragd_api.clone(), llm_url: cfg.llm_url.clone(),
@@ -3816,6 +4006,54 @@ mod tests {
         assert_eq!(e["user_len"], json!(22));
         assert_eq!(e["ok"], json!(false));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mapa(xs: &[(&str, &str, &str)]) -> std::collections::BTreeMap<String, (String, String)> {
+        xs.iter().map(|(n, sig, sh)| (n.to_string(), (sig.to_string(), sh.to_string()))).collect()
+    }
+
+    /// [#14/#21] diff entre ciclos: nova, mudada, removida e renomeada (casamento ÚNICO).
+    #[test]
+    fn diff_bases_casa_rename_unico() {
+        let prev = mapa(&[("a", "S1", "h1"), ("b", "S2", "h2"), ("c", "S3", "h3")]);
+        let cur = mapa(&[("a", "S1", "h1"), ("b", "S2", "h2x"), ("c2", "S3", "h9"), ("d", "S4", "h4")]);
+        let (novas, mudadas, removidas, ren) = diff_bases(&prev, &cur);
+        assert_eq!(ren, vec![("c".to_string(), "c2".to_string())]);
+        assert_eq!(novas, vec!["d".to_string()]);
+        assert_eq!(mudadas, vec!["b".to_string()]);
+        assert!(removidas.is_empty());
+    }
+
+    /// Duas candidatas com o mesmo conteúdo (ou duas removidas iguais): NÃO adivinha.
+    #[test]
+    fn diff_bases_ambiguo_nao_relinka() {
+        let prev = mapa(&[("x", "S", "h1")]);
+        let cur = mapa(&[("y", "S", "h2"), ("z", "S", "h3")]);
+        let (novas, _, removidas, ren) = diff_bases(&prev, &cur);
+        assert!(ren.is_empty());
+        assert_eq!(novas.len(), 2);
+        assert_eq!(removidas, vec!["x".to_string()]);
+        let prev = mapa(&[("x", "S", "h1"), ("w", "S", "h0")]);
+        let cur = mapa(&[("y", "S", "h2")]);
+        assert!(diff_bases(&prev, &cur).3.is_empty());
+    }
+
+    /// Relógio de ausência: entra com `agora`, mantém o instante original, vence pela carência,
+    /// sai se a base volta; carência negativa nunca poda.
+    #[test]
+    fn ausencias_carencia() {
+        let vivas: std::collections::BTreeSet<String> = ["a".to_string()].into_iter().collect();
+        let conhecidas = vec!["a".to_string(), "velha".to_string(), "recente".to_string()];
+        let mut antes = serde_json::Map::new();
+        antes.insert("velha".into(), json!(1_000));
+        antes.insert("voltou".into(), json!(1_000));
+        let agora = 1_000 + 25 * 3600;
+        let (aus, venc) = ausencias(&conhecidas, &vivas, &antes, agora, 24);
+        assert_eq!(venc, vec!["velha".to_string()]);
+        assert_eq!(aus["recente"], json!(agora));
+        assert!(!aus.contains_key("voltou") && !aus.contains_key("a"));
+        assert!(ausencias(&conhecidas, &vivas, &antes, agora, -1).1.is_empty());
+        assert_eq!(ausencias(&conhecidas, &vivas, &antes, agora, 0).1.len(), 2);
     }
 
     /// [#15] quem grava só metadados: coleção listada, "*", modo meta — e L4 de escopo amplo

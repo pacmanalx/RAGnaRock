@@ -321,6 +321,21 @@ Toda chamada de IA (classificador, modelador, relações, analista, comparador) 
 - `llm_ledger = full | meta | off` vale para tudo (padrão `full`, o comportamento anterior).
 O ValHalla (`/api/nidhogg/llm_ledger`) lê o arquivo corrente; as entradas só de metadados aparecem sem texto.
 
+### 5.1.2 Bases renomeadas e removidas (#14, #21)
+Classe, entidades e nós são guardados pelo **nome** da base. A cada ciclo (nível ≥ 1), antes de classificar,
+o Nidhogg compara as bases do `ragd` com as do ciclo anterior (`bases_vistas` no `knowledge.json`):
+- **Renomeada:** some uma base e aparece outra com o **mesmo conteúdo** (`n_chunks`, `vocab_size`, `corpus`),
+  com casamento único → relink automático: a classe (inclusive a re-tipagem humana), as entidades e os nós
+  passam para o nome novo, sem chamar IA. Fora disso (conteúdo também mudou, ou mais de um candidato):
+  `POST /api/nidhogg/relink {"collection","de","para"}`.
+- **Removida:** nome que o store conhece e o `ragd` não tem mais entra em `ausentes` com o instante em que sumiu.
+  Passada a carência `prune_grace_h` (padrão 24 h; `0` = no mesmo ciclo; negativo = nunca), classe, entidades
+  e nós dela são apagados em lote. Se a base voltar antes, nada se perde.
+- O diff do último ciclo com mudança (novas, mudadas, removidas, renomeadas, podadas) fica em `l0_diff`.
+
+O L0 (RootIndex/CorpusDict) continua sendo da coleção inteira: vocabulário unificado e idf mudam com qualquer
+base e custam duas chamadas ao `ragd`. O trabalho caro (classificar, extrair, recensear) já é por base, pelo `state_hash`.
+
 ### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
 
 > **Decisão (Pacman):** o Nidhogg é um **projeto autônomo**, um **analisador crítico**. O `ragd`

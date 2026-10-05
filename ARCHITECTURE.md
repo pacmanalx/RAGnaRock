@@ -319,6 +319,21 @@ Every AI call (classifier, template maker, relations, analyst, comparator) write
 - `llm_ledger = full | meta | off` applies to everything (default `full`, the previous behavior).
 ValHalla (`/api/nidhogg/llm_ledger`) reads the current file; metadata-only entries show without text.
 
+### 5.1.2 Renamed and removed bases (#14, #21)
+Class, entities and nodes are keyed by the base **name**. Every cycle (level ≥ 1), before classifying, Nidhogg
+compares the `ragd` bases with the previous cycle's (`bases_vistas` in `knowledge.json`):
+- **Renamed:** a base disappears and another appears with the **same content** (`n_chunks`, `vocab_size`,
+  `corpus`), uniquely matched → automatic relink: the class (including a human re-typing), entities and nodes
+  move to the new name, no AI call. Otherwise (content also changed, or more than one candidate):
+  `POST /api/nidhogg/relink {"collection","de","para"}`.
+- **Removed:** a name the store knows and `ragd` no longer has goes into `ausentes` with the time it vanished.
+  After the `prune_grace_h` grace period (default 24 h; `0` = same cycle; negative = never), its class,
+  entities and nodes are deleted in batch. If the base comes back first, nothing is lost.
+- The last cycle's diff (new, changed, removed, renamed, pruned) is kept in `l0_diff`.
+
+L0 itself (RootIndex/CorpusDict) stays collection-wide: the unified vocabulary and idf change with any base
+and cost two `ragd` calls. The expensive work (classify, extract, census) is already per base, via `state_hash`.
+
 ### 5.2 Nature & consumption — Nidhogg is AUTONOMOUS; the reader is HUMAN
 
 > **Decision (owner):** Nidhogg is an **autonomous project**, a **critical analyzer**. `ragd` **NEVER**
