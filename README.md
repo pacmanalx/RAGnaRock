@@ -113,9 +113,13 @@ the daemon refuses to open a session with them unless started with `--dev`.
 
 ## Daemon API (HTTP JSON)
 
-`GET /health · /bases · /collections · /drivers · /interpret` ·
-`POST /ingest · /ingest_file · /ingest_upload · /search · /search_expand · /chunk` ·
-`DELETE /bases/{name}`.
+Main routes: `GET /health · /bases · /collections · /profile · /stats` ·
+`POST /search · /chunk · /ingest · /ingest_file · /ingest_upload · /ingest_any · /transcribe` ·
+`DELETE /bases/{name} · /collections/{name}` — plus JWT login (`/login`) and admin routes.
+
+- **One search route (#39):** `POST /search` takes opt-in stages — `expand` (dictionary → cache → AI),
+  `phonetic`, `literal_fallback` (default on) — and every response says which ran in `via: [...]`.
+  *Migration:* `POST /search_expand` still works unchanged; it is now a preset for `/search` with `expand: true`.
 
 - Bases are organized as `collection/name`; search is **scatter-gather** with wildcards
   (`"sd*"`, `"*"`) and merge by relevance.

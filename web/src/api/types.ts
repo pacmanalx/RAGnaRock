@@ -368,6 +368,9 @@ export interface SearchResponse {
   query: string
   query_syllables?: string
   hits: Hit[]
+  // [#39] estágios efetivos: 'silabico' | 'phonetic' | 'literal' | 'literal_fallback' | 'dict' | 'cache' | 'llm'
+  via?: string[]
+  needles?: string[]
 }
 export interface Hit {
   collection: string

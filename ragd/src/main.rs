@@ -1308,6 +1308,53 @@ fn literal_fallback(needles: &[String], bases: &Bases, coll: Option<&str>, base_
 
 /// POST /api/search_expand — busca COM expansão por IA: expande a query, roda a busca léxica
 /// pra original + variantes, e mescla por (coleção,base,chunk) com peso maior no termo original.
+// ───────────────────────── [#39] busca numa rota só ─────────────────────────
+// `POST /search` com estágios OPT-IN (padrão conservador, o lookup preciso que é a tese do motor):
+//   expand           false — true = cascata dict → cache → IA (o mesmo motor do /search_expand)
+//   phonetic         false — matched-filter fonético
+//   literal_fallback true  — grep literal de needles alfanuméricos COM dígito (OE-6016, RFC1918,
+//                            M31May-23h28), onde o silábico é cego; achados exatos vêm na frente
+//                            (já era o comportamento do /search desde o #38 — agora desligável).
+// Toda resposta traz `via: [...]` com os estágios efetivos. `/search_expand` = preset expand=true.
+
+/// Estágios efetivos de uma resposta do motor de expansão, pelo `source` que ela já devolve.
+fn com_via((code, res): (u16, String), phonetic: bool) -> (u16, String) {
+    if code != 200 || !res.starts_with('{') { return (code, res); }
+    // lê só o `source`; a resposta sai com o texto ORIGINAL (sem reserializar os números)
+    let src = serde_json::from_str::<Value>(&res).ok().and_then(|v| v["source"].as_str().map(String::from)).unwrap_or_default();
+    let mut via: Vec<&str> = match src.as_str() {
+        "literal" => vec!["literal"],
+        "literal_fallback" => vec!["silabico", "literal_fallback"],
+        "dict" => vec!["silabico", "dict"],
+        "cache" => vec!["silabico", "cache"],
+        "llm" => vec!["silabico", "llm"],
+        _ => vec!["silabico"],   // phase1 (recall forte) e afins
+    };
+    if phonetic && via[0] == "silabico" { via.insert(1, "phonetic"); }
+    let resto = &res[1..];
+    (code, format!("{{\"via\":{}{}{}", json!(via), if resto.trim_start().starts_with('}') { "" } else { "," }, resto))
+}
+
+fn busca(body: &str, st: &State) -> (u16, String) {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()),
+    };
+    let phon = v["phonetic"].as_bool().unwrap_or(false);
+    if v["expand"].as_bool().unwrap_or(false) {
+        return com_via(search_expand(body, st), phon);
+    }
+    let bases = st.bases.snap();
+    let mut rv: Value = match search_val(body, &bases, &st.collection_profiles) { Ok(v) => v, Err(e) => return e };
+    let mut via = vec!["silabico"];
+    if phon { via.push("phonetic"); }
+    // o literal mora dentro da busca (search_val, #38): conta como estágio se algum hit veio dele
+    if rv["hits"].as_array().map(|a| a.iter().any(|h| h["via"] == "literal_fallback")).unwrap_or(false) {
+        via.push("literal_fallback");
+    }
+    rv["via"] = json!(via);
+    (200, rv.to_string())
+}
+
 fn search_expand(body: &str, st: &State) -> (u16, String) {
     // [#6] aceita &State (não mut) — os caches que precisa mutar (expansions, collection_profiles)
     // têm interior mutability (RwLock<>), o que permite search_expand rodar sob outer-read.
@@ -1324,7 +1371,9 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     // silábico é estruturalmente cego (ex "M31May-23h28" → só "m-may-h") e a expansão por IA é
     // INÚTIL (vira sinônimo de ruído). Grep literal ANTES da cascata, INDEPENDENTE de provider.
     // Acha → encerra aqui; não acha → segue a cascata normal (texto natural).
-    let needles_lit = extract_alnum_needles(query);
+    // [#39] `literal_fallback: false` desliga os dois estágios literais (padrão: ligado)
+    let lit_on = v["literal_fallback"].as_bool().unwrap_or(true);
+    let needles_lit = if lit_on { extract_alnum_needles(query) } else { vec![] };
     if !needles_lit.is_empty() {
         let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
         let base_lit = v["base"].as_str().unwrap_or("*").to_string();
@@ -1404,7 +1453,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
             // o motor silábico é cego mas o grep literal acha. Só dispara aqui,
             // depois que dict/cache/IA falharam — não substitui a busca silábica
             // pra texto natural, complementa onde ela é estruturalmente cega.
-            let needles = extract_alnum_needles(query);
+            let needles = if lit_on { extract_alnum_needles(query) } else { vec![] };
             if !needles.is_empty() {
                 let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
                 let base_lit = v["base"].as_str().unwrap_or("*").to_string();
@@ -1955,8 +2004,11 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
         (Method::Get, "/ingestors") => list_ingestors(&state.ingestors_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
-        (Method::Post, "/search") => search(body_str(), &state.bases.snap(), &state.collection_profiles),
-        (Method::Post, "/search_expand") => search_expand(body_str(), state),
+        (Method::Post, "/search") => busca(body_str(), state),   // [#39] rota única, estágios opt-in
+        (Method::Post, "/search_expand") => {   // [#39] preset: = /search com expand=true
+            let phon = serde_json::from_str::<Value>(body_str()).ok().and_then(|v| v["phonetic"].as_bool()).unwrap_or(false);
+            com_via(search_expand(body_str(), state), phon)
+        }
         (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases.snap()),
         // histograma do hit #1 (matched filter + embedding × query) — tela Performance do ValHalla
         (Method::Post, "/histogram") => histogram(body_str(), &state.bases.snap()),
@@ -2877,16 +2929,23 @@ fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
                  "collections": st.bases.snap().len()}).to_string())
 }
 
+/// [#39] Corpo da busca silábica devolvendo o JSON como VALOR: quem precisa acrescentar campos
+/// (o `/search` com `via`) não relê o texto — o parser padrão do serde_json pode errar o último bit
+/// de um f64, e a busca deixaria de ser idêntica byte a byte (medido: 10/20 com cos diferente).
 fn search(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String) {
+    match search_val(body, bases, profiles) { Ok(v) => (200, v.to_string()), Err(e) => e }
+}
+
+fn search_val(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> Result<Value, (u16, String)> {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
+        Err(e) => return Err((400, json!({"error": format!("body JSON inválido: {e}")}).to_string())),
     };
     let pattern = match v["base"].as_str() {
-        Some(n) => n, None => return (400, json!({"error": "falta 'base' (nome, 'pref*' ou '*')"}).to_string()),
+        Some(n) => n, None => return Err((400, json!({"error": "falta 'base' (nome, 'pref*' ou '*')"}).to_string())),
     };
     let query = match v["query"].as_str() {
-        Some(q) => q, None => return (400, json!({"error": "falta 'query'"}).to_string()),
+        Some(q) => q, None => return Err((400, json!({"error": "falta 'query'"}).to_string())),
     };
     let k = v["k"].as_u64().unwrap_or(5) as usize;
     let recall_n = v["recall_n"].as_u64().unwrap_or(20) as usize;
@@ -2897,8 +2956,8 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String
 
     let pairs = resolve_scope(bases, coll_pat, pattern);
     if pairs.is_empty() {
-        return (404, json!({"error": format!("nenhuma base casa com '{}/{pattern}'",
-            coll_pat.unwrap_or("*"))}).to_string());
+        return Err((404, json!({"error": format!("nenhuma base casa com '{}/{pattern}'",
+            coll_pat.unwrap_or("*"))}).to_string()));
     }
 
     // [#5] PESO unificado no rerank: coleção com >1 base NO ESCOPO ganha perfil (idf de coleção,
@@ -3036,7 +3095,8 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String
     // silábico é estruturalmente cego (ex "M31May-23h28" → só "m-may-h"); o grep literal acha.
     // Roda no /search direto (ValHalla usa /search puro), INDEPENDENTE de provider de IA. Match
     // exato manda → vem na frente; merge dedup por (collection,base,chunk) com os silábicos.
-    let needles = extract_alnum_needles(query);
+    // [#39] `"literal_fallback": false` desliga (padrão: ligado, o comportamento de sempre).
+    let needles = if v["literal_fallback"].as_bool().unwrap_or(true) { extract_alnum_needles(query) } else { vec![] };
     let mut hits: Vec<Value> = if needles.is_empty() {
         syllabic
     } else {
@@ -3065,7 +3125,7 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String
         "scope": scope_label, "searched": searched, "hits": hits
     });
     if !needles.is_empty() { resp["needles"] = json!(needles); }
-    (200, resp.to_string())
+    Ok(resp)
 }
 
 /// Retorna o(s) chunk(s) inteiro(s) por id — pra montar contexto (vizinhos, etc).
