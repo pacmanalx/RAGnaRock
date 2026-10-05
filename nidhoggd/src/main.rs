@@ -18,6 +18,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 mod db;
 mod chdb;
+mod porteira;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PORT: u16 = 11497;
@@ -93,6 +94,10 @@ struct Config {
     // dela (classe, entidades, nós). A carência dá tempo de um rename ser casado (#14) ou de um
     // ragd que subiu pela metade voltar. 0 = poda no mesmo ciclo; negativo = nunca poda.
     prune_grace_h: i64,
+    // [#53] porteira Laya do L1 (opcional; vazio = desligada, comportamento de antes).
+    laya_dir: String,      // diretório da campeã — normalmente <dir da rotina>/atual (symlink)
+    laya_ort_lib: String,  // libonnxruntime.so (a do ambiente de treino serve; nada é baixado)
+    laya_threads: usize,   // threads do ONNX Runtime
 }
 impl Default for Config {
     fn default() -> Self {
@@ -106,7 +111,8 @@ impl Default for Config {
                  store: "clickhouse".to_string(),
                  ch_url: "http://127.0.0.1:8123".to_string(),
                  llm_ledger: "full".to_string(), llm_ledger_meta: String::new(),
-                 llm_ledger_max_mb: 20, llm_ledger_keep: 6, prune_grace_h: 24 }
+                 llm_ledger_max_mb: 20, llm_ledger_keep: 6, prune_grace_h: 24,
+                 laya_dir: String::new(), laya_ort_lib: String::new(), laya_threads: 4 }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -135,6 +141,9 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "llm_ledger_max_mb" => if let Ok(n) = v.parse() { cfg.llm_ledger_max_mb = n },
             "llm_ledger_keep" => if let Ok(n) = v.parse() { cfg.llm_ledger_keep = n },
             "prune_grace_h" => if let Ok(n) = v.parse() { cfg.prune_grace_h = n },
+            "laya_dir" => cfg.laya_dir = v.to_string(),
+            "laya_ort_lib" => cfg.laya_ort_lib = v.to_string(),
+            "laya_threads" => if let Ok(n) = v.parse() { cfg.laya_threads = n },
             "store"    => cfg.store = v.to_string(),
             "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
@@ -3204,6 +3213,11 @@ fn llm_classify(llm_url: &str, coll: &str, ctx: &str, sys: &str, text: &str, nat
 fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
                  naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
     let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
+    classify_text(llm_url, sys, coll, name, &text, naturezas, tipos)
+}
+fn classify_text(llm_url: &str, sys: &str, coll: &str, name: &str, text: &str,
+                 naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
+    let text = text.to_string();
     let csv = tabular_spec(&text).is_some();
     let (nat, tip) = llm_classify(llm_url, coll, &format!("classe {coll}/{name}"), sys, &text, naturezas, tipos)?;
     Ok((nat, tip, csv))
@@ -3402,6 +3416,39 @@ fn reconcilia_bases(store: &str, dir: &str, ch_url: &str, coll: &str, bases: &[V
     rel
 }
 
+// ───────────────────────── [#53] porteira Laya do L1 ─────────────────────────
+struct LayaCfg { dir: String, ort_lib: String, threads: usize }
+static LAYA_CFG: std::sync::OnceLock<LayaCfg> = std::sync::OnceLock::new();
+static LAYA: Mutex<Option<porteira::Porteira>> = Mutex::new(None);
+static LAYA_ERRO: Mutex<String> = Mutex::new(String::new());
+
+/// A porteira pronta para uso, (re)carregada se a campeã mudou (o symlink `atual` aponta para
+/// outra versão). None = desligada ou indisponível — o chamador segue para o LLM como antes.
+fn laya_porteira() -> Option<std::sync::MutexGuard<'static, Option<porteira::Porteira>>> {
+    let c = LAYA_CFG.get()?;
+    if c.dir.is_empty() { return None; }
+    let alvo = std::fs::canonicalize(&c.dir).ok();
+    let mut g = LAYA.lock().unwrap_or_else(|e| e.into_inner());
+    let atual = g.as_ref().map(|p| p.dir.clone());
+    if alvo.is_some() && atual != alvo {
+        let r = porteira::inicia_ort(&c.ort_lib)
+            .and_then(|_| porteira::Porteira::carrega(Path::new(&c.dir), c.threads));
+        match r {
+            Ok(p) => {
+                nlog(&format!("🚪 porteira Laya {} carregada — liberados: {}", p.versao, p.liberados().join(", ")));
+                *LAYA_ERRO.lock().unwrap() = String::new();
+                *g = Some(p);
+            }
+            Err(e) => {
+                let mut ult = LAYA_ERRO.lock().unwrap();
+                if *ult != e { nlog(&format!("🚪 porteira Laya indisponível ({e}) — classificação segue só no LLM")); *ult = e; }
+                *g = None;
+            }
+        }
+    }
+    if g.is_some() { Some(g) } else { None }
+}
+
 /// Ciclo de classificação de UMA coleção (Fase 1). Reconcilia /bases do ragd com o STORE:
 /// classifica só as bases NOVAS/mudadas (state_hash) ou afetadas por edição de vocabulário/prompt
 /// (cfg_hash). CLASSIFY_PER_CYCLE por ciclo; aborta em 2 falhas de LLM seguidas. As classes vão num
@@ -3432,6 +3479,7 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
 
     let pending_before = queue.len();
     let (mut classified, mut no_text, mut fails_total) = (0usize, 0usize, 0usize);
+    let mut via_laya = 0usize;
     let mut consecutive_fails = 0usize;
     let at = now_stamp();
     let mut rows: Vec<chdb::ClassRow> = vec![];   // acumula o lote (1 INSERT no fim)
@@ -3445,16 +3493,39 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         let forma = if has_text {
             fetch_base_text(api, coll, name).map(|t| form_signature(&t)).unwrap_or_default()
         } else { String::new() };
-        let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| chdb::ClassRow {
+        let mkrow_o = |nat: &str, tip: &str, csv: bool, conf: f64, origem: &str| chdb::ClassRow {
             collection: coll.to_string(), name: name.to_string(), state_hash: sh.clone(),
             cfg_hash: cfg_hash.clone(), natureza: nat.to_string(), tipo: tip.to_string(),
-            forma: forma.clone(), csv, origem: "llm".to_string(),
+            forma: forma.clone(), csv, origem: origem.to_string(),
             confianca: conf, classified_at: at.clone(), version: chdb::now_version(),
         };
+        let mkrow = |nat: &str, tip: &str, csv: bool, conf: f64| mkrow_o(nat, tip, csv, conf, "llm");
         if !has_text {
             rows.push(mkrow("?", "sem-texto", false, 0.0)); no_text += 1; continue;
         }
-        match classify_base(api, llm_url, &sys, coll, name, &naturezas, &tipos) {
+        // o mesmo texto que o LLM veria (chunk 0, CLASSIFY_MAX_CHARS)
+        let texto = match fetch_chunk0(api, coll, name) {
+            Some(t) => t,
+            None => { rows.push(mkrow("?", "sem-texto", false, 0.0)); no_text += 1; consecutive_fails = 0; continue; }
+        };
+        // [#53] porteira Laya: decide sem LLM o que reconhece com segurança (tipo LIBERADO, confiança
+        // e "segue" acima dos limiares). Planilha não passa por ela. Qualquer dúvida → LLM, como antes.
+        if tabular_spec(&texto).is_none() {
+            if let Some(mut g) = laya_porteira() {
+                if let Some(p) = g.as_mut() {
+                    match p.decide(&texto) {
+                        Ok(d) if d.aceita && tipos.iter().any(|t| t == &d.tipo) => {
+                            rows.push(mkrow_o(natureza_do_tipo(&d.tipo), &d.tipo, false, d.confianca as f64, "laya"));
+                            classified += 1; via_laya += 1; consecutive_fails = 0;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => nlog(&format!("🚪 porteira {coll}/{name}: {e} — vai ao LLM")),
+                    }
+                }
+            }
+        }
+        match classify_text(llm_url, &sys, coll, name, &texto, &naturezas, &tipos) {
             // a natureza do LLM é IGNORADA — derivamos do tipo (89,5%) + csv (determinístico).
             // um CSV regular é sempre `tabela`; o resto cai por gravidade do tipo.
             Ok((_nat_llm, tip, csv)) => {
@@ -3477,7 +3548,8 @@ fn mine_classes(api: &str, llm_url: &str, store: &str, dir: &str, ch_url: &str, 
         return json!({"ok": false, "collection": coll, "error": format!("store: {e}")});
     }
     let pending = pending_before.saturating_sub(classified + no_text);
-    json!({"ok": true, "collection": coll, "classified": classified,
+    if via_laya > 0 { nlog(&format!("🚪 classify {coll}: {via_laya} de {classified} base(s) decididas pela porteira Laya (sem LLM)")); }
+    json!({"ok": true, "collection": coll, "classified": classified, "via_laya": via_laya,
            "no_text": no_text, "fails": fails_total, "pending": pending})
 }
 
@@ -3681,6 +3753,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     let mut classified: Vec<String> = vec![];
     let mut extracted_ents: Vec<String> = vec![];
     let mut det_total = 0u64;   // bases extraídas DETERMINISTICAMENTE (CSV, zero LLM) no ciclo
+    let mut laya_total = 0u64;  // [#53] bases classificadas pela porteira Laya (zero LLM) no ciclo
     for coll in &colls {
         let mut k = read_knowledge(&dir, coll);
         if !k["enabled"].as_bool().unwrap_or(false) { continue; }   // só coleções HABILITADAS
@@ -3697,6 +3770,7 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
                     let _rc = reconcilia_bases(&store, &dir, &ch_url, coll, &bases, &mut k);
                     // Fase 1: classifica {natureza,tipo} das bases novas/mudadas (doc_class no ClickHouse).
                     let cl = mine_classes(&api, &llm_url, &store, &dir, &ch_url, &lib, coll, force);
+                    laya_total += cl["via_laya"].as_u64().unwrap_or(0);
                     if cl["classified"].as_u64().unwrap_or(0) > 0 || cl["no_text"].as_u64().unwrap_or(0) > 0 {
                         classified.push(coll.clone());
                     }
@@ -3777,7 +3851,8 @@ fn run_cycle(state: &Arc<Mutex<State>>, force: bool) -> Value {
     if let Ok(mut s) = state.lock() {
         s.last_cycle = format!("{} · nível {} · minou {} · pulou {} · falhou {} · classificou {} · extraiu {}{}{}",
             now_stamp(), level_name(level), mined.len(), skipped.len(), failed.len(), classified.len(), extracted_ents.len(),
-            if det_total > 0 { format!(" · det {det_total}") } else { String::new() },
+            if det_total > 0 { format!(" · det {det_total}") } else { String::new() }
+                + &if laya_total > 0 { format!(" · laya {laya_total}") } else { String::new() },
             if force { " (forçado)" } else { "" });
     }
     json!({"ok": true, "level": level_name(level), "forced": force,
@@ -3857,7 +3932,7 @@ rotas:
   POST /api/nidhogg/reclass         re-tipa base à mão {{\"collection\",\"base\",\"tipo\"}} (origem=humano)
   POST /api/nidhogg/relink          base renomeada {{\"collection\",\"de\",\"para\"}}: move classe/entidades/nós
   POST /api/nidhogg/molde           molde dirigido {{\"tipo\",\"instrucao\",\"collection\",\"base\"}}
-  POST /api/nidhogg/run             dispara um ciclo agora (stub)");
+  POST /api/nidhogg/run             dispara um ciclo agora (stub)\n\nModo de checagem:\n  nidhoggd --laya-check <dir da versão> [--laya-ort-lib <libonnxruntime.so>]   paridade da porteira Laya (#53)");
 }
 
 fn main() {
@@ -3892,6 +3967,19 @@ fn main() {
             "--port" => if let Some(x) = it.next() { if let Ok(p) = x.parse() { cfg.port = p; } },
             "--ragd" => if let Some(x) = it.next() { cfg.ragd_api = x.clone(); },
             _ => {}
+        }
+    }
+
+    let _ = LAYA_CFG.set(LayaCfg { dir: cfg.laya_dir.clone(), ort_lib: cfg.laya_ort_lib.clone(), threads: cfg.laya_threads });
+    // [#53] paridade da porteira: o Rust tem de reproduzir o Laya oficial (tokens e decisões)
+    if let Some(pos) = args.iter().position(|a| a == "--laya-check") {
+        let dir = args.get(pos + 1).cloned().unwrap_or_else(|| cfg.laya_dir.clone());
+        let lib = args.iter().position(|a| a == "--laya-ort-lib").and_then(|i| args.get(i + 1).cloned())
+            .unwrap_or_else(|| cfg.laya_ort_lib.clone());
+        let r = porteira::inicia_ort(&lib).and_then(|_| porteira::checa_paridade(Path::new(&dir), cfg.laya_threads));
+        match r {
+            Ok((rel, ok)) => { println!("{rel}"); std::process::exit(if ok { 0 } else { 1 }); }
+            Err(e) => { eprintln!("laya-check: {e}"); std::process::exit(2); }
         }
     }
 

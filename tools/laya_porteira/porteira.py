@@ -71,7 +71,9 @@ def fonte_producao(ch_url, ragd):
     docs = []
     for l in corpo.splitlines():
         r = json.loads(l)
-        if r["tipo"] in FORA:
+        # FORA não é tipo; `laya` é a própria porteira — treinar nas próprias respostas a faria
+        # reforçar os próprios erros. Só LLM e humano ensinam.
+        if r["tipo"] in FORA or r["origem"] == "laya":
             continue
         req = json.dumps({"collection": r["collection"], "base": r["name"], "id": 0}).encode()
         try:
@@ -119,9 +121,10 @@ def impressao(d):
     return hashlib.sha1(f'{d["id"]}|{d["tipo"]}'.encode()).hexdigest()[:16]
 
 
-def separa(docs, min_por_tipo, frac_aval, rnd):
+def separa(docs, min_por_tipo, frac_aval, rnd, max_treino=10**9, max_aval=10**9):
     """Por tipo: elegível se >= min_por_tipo bases. Separa avaliação POR BASE em todos os tipos
-    (os não elegíveis viram órfãos de treino e de avaliação)."""
+    (os não elegíveis viram órfãos de treino e de avaliação). Teto por tipo no treino e na
+    avaliação (sorteio): classes equilibradas e tempo de treino previsível com o banco crescendo."""
     por = {}
     for d in docs:
         por.setdefault(d["tipo"], []).append(d)
@@ -131,8 +134,8 @@ def separa(docs, min_por_tipo, frac_aval, rnd):
         l = l[:]
         rnd.shuffle(l)
         n_av = max(3, round(len(l) * frac_aval)) if t in elegiveis else max(1, len(l) // 2)
-        aval += l[:n_av]
-        treino += l[n_av:]
+        aval += l[:n_av][:max_aval]
+        treino += l[n_av:][:max_treino]
     return elegiveis, treino, aval
 
 
@@ -146,12 +149,16 @@ def variacoes(txt, rnd):
     return [txt, "\n".join([ls[0]] + corpo), "\n".join(l.lower() for l in corpo)]
 
 
+PERGUNTA_CHOICE = "Que tipo de documento é este?"
+PERGUNTA_SEGUE = "Este documento é um(a) {desc}?"     # o nidhoggd lê as duas do manifest
+
+
 def q_choice(tipos, desc):
-    return {"type": "choice", "instructions": "Que tipo de documento é este?", "criteria": {t: desc[t] for t in tipos}}
+    return {"type": "choice", "instructions": PERGUNTA_CHOICE, "criteria": {t: desc[t] for t in tipos}}
 
 
 def q_segue(t, desc):
-    return {"type": "noul", "instructions": f"Este documento é um(a) {desc[t]}?"}
+    return {"type": "noul", "instructions": PERGUNTA_SEGUE.replace("{desc}", desc[t])}
 
 
 def monta_itens(treino, elegiveis, desc, base, rnd):
@@ -202,7 +209,11 @@ def decide(agent, docs, tipos, desc):
     return out
 
 
-def metricas(res, tipos):
+def metricas(res, tipos, aceitos=None):
+    """`aceitos` = tipos que o nidhoggd aceitaria (liberados); None = todos os `tipos`. Um tipo
+    escolhido fora de `aceitos` vai ao LLM — não conta como aceito, nem certo nem errado."""
+    aceitos = set(tipos if aceitos is None else aceitos)
+    res = [(d, t, c, s, a and t in aceitos) for d, t, c, s, a in res]
     conh = [r for r in res if r[0]["tipo"] in tipos]
     orf = [r for r in res if r[0]["tipo"] not in tipos]
     certo = sum(1 for d, t, c, s, a in conh if a and t == d["tipo"])
@@ -212,7 +223,9 @@ def metricas(res, tipos):
     for t in tipos:
         rt = [r for r in conh if r[0]["tipo"] == t]
         por_tipo[t] = {"n": len(rt), "aceito_certo": sum(1 for d, e, c, s, a in rt if a and e == t),
-                       "aceito_errado": sum(1 for d, e, c, s, a in rt if a and e != t)}
+                       "aceito_errado": sum(1 for d, e, c, s, a in rt if a and e != t),
+                       # o que PROÍBE liberar t: outro documento (conhecido ou órfão) aceito COMO t
+                       "invadido": sum(1 for d, e, c, s, a in res if a and e == t and d["tipo"] != t)}
         por_tipo[t]["cobertura"] = round(por_tipo[t]["aceito_certo"] / max(1, len(rt)), 3)
     return {"n_conhecidos": len(conh), "n_orfaos": len(orf),
             "cobertura": round(certo / max(1, len(conh)), 4), "aceito_errado": errado,
@@ -257,10 +270,10 @@ def ciclo(a):
     reg = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "rotulos": len(docs), "novos": novos,
            "humanos": sum(d["origem"] == "humano" for d in docs)}
     log(f"{len(docs)} rótulos ({reg['humanos']} humanos), {novos} novos desde o modelo atual")
-    if novos < a.min_novos and not a.forcar:
+    if novos < a.min_novos and not a.forcar and not a.reavaliar:
         reg["decisao"] = f"sem treino: {novos} novo(s) < {a.min_novos}"
         log(reg["decisao"]); historico(dirp, reg); return 0
-    elegiveis, treino, aval = separa(docs, a.min_por_tipo, a.frac_aval, rnd)
+    elegiveis, treino, aval = separa(docs, a.min_por_tipo, a.frac_aval, rnd, a.max_treino_tipo, a.max_aval_tipo)
     reg["elegiveis"] = elegiveis
     if not elegiveis:
         cont = {}
@@ -271,45 +284,74 @@ def ciclo(a):
         log(f'{reg["decisao"]} — {reg["por_tipo"]}'); historico(dirp, reg); return 0
 
     import laya, laya_ft
-    vid = time.strftime("v%Y%m%d-%H%M%S")
-    out = dirp / "versoes" / vid
-    itens = monta_itens(treino, elegiveis, desc, a.base, rnd)
-    itens_p = dirp / f"itens-{vid}.pt"
-    torch.save(itens, itens_p)
-    log(f"{vid}: tipos {elegiveis} · treino {len(treino)} bases → {len(itens)} exemplos · avaliação {len(aval)} bases")
-    t0 = time.time()
-    targs = argparse.Namespace(epochs=a.epocas, micro_batch=2, grad_accum=16, calib_max=400,
-                               output_dir=str(out), no_checkpointing=not a.checkpointing)
-    laya_ft.train(targs, str(a.base), str(itens_p), torch.device("cpu"))
-    shutil.rmtree(out / "checkpoint_latest", ignore_errors=True)
-    itens_p.unlink(missing_ok=True)
-    reg["treino_min"] = round((time.time() - t0) / 60, 1)
+    if a.reavaliar:   # reaplica avaliação/liberação/promoção a uma versão já treinada (sem treinar)
+        out = Path(a.reavaliar).resolve()
+        velho = le_manifest(out) or {}
+        vid = out.name
+        if velho.get("tipos") and velho["tipos"] != elegiveis:
+            log(f"aviso: tipos do treino {velho['tipos']} ≠ elegíveis hoje {elegiveis} — avaliando com os do treino")
+            elegiveis = velho["tipos"]
+        itens = [None] * velho.get("n_itens", 0)
+        reg["reavaliacao"] = True
+        log(f"{vid}: reavaliação · tipos {elegiveis} · avaliação {len(aval)} bases")
+    else:
+        vid = time.strftime("v%Y%m%d-%H%M%S")
+        out = dirp / "versoes" / vid
+        itens = monta_itens(treino, elegiveis, desc, a.base, rnd)
+        itens_p = dirp / f"itens-{vid}.pt"
+        torch.save(itens, itens_p)
+        log(f"{vid}: tipos {elegiveis} · treino {len(treino)} bases → {len(itens)} exemplos · avaliação {len(aval)} bases")
+        t0 = time.time()
+        targs = argparse.Namespace(epochs=a.epocas, micro_batch=2, grad_accum=16, calib_max=400,
+                                   output_dir=str(out), no_checkpointing=not a.checkpointing)
+        laya_ft.train(targs, str(a.base), str(itens_p), torch.device("cpu"))
+        shutil.rmtree(out / "checkpoint_latest", ignore_errors=True)
+        itens_p.unlink(missing_ok=True)
+        reg["treino_min"] = round((time.time() - t0) / 60, 1)
 
-    desafiante = metricas(decide(laya.load(str(out)), aval, elegiveis, desc), elegiveis)
-    log(f"{vid} avaliado: {json.dumps({k: v for k, v in desafiante.items() if k != 'por_tipo'})}")
+    res = decide(laya.load(str(out)), aval, elegiveis, desc)
+    bruto = metricas(res, elegiveis)
+    log(f"{vid} avaliado (todos os tipos): {json.dumps({k: v for k, v in bruto.items() if k != 'por_tipo'})}")
+    # libera só o tipo que ninguém invadiu: zero erro, zero órfão aceito COMO ele, cobertura mínima
+    liberados = [t for t, m in bruto["por_tipo"].items()
+                 if m["n"] >= 3 and m["aceito_errado"] == 0 and m["invadido"] == 0 and m["cobertura"] >= a.min_cobertura_tipo]
+    desafiante = metricas(res, elegiveis, liberados)
+    log(f"{vid} restrito aos liberados {liberados}: {json.dumps({k: v for k, v in desafiante.items() if k != 'por_tipo'})}")
     campea = None
     if atual:
-        campea = metricas(decide(laya.load(str((dirp / "atual").resolve())), aval, atual["liberados"] or atual["tipos"],
-                                 {**desc, **atual["descricoes"]}), atual["liberados"] or atual["tipos"])
+        campea = metricas(decide(laya.load(str((dirp / "atual").resolve())), aval, atual["tipos"],
+                                 {**desc, **atual["descricoes"]}), atual["tipos"], atual["liberados"])
         log(f"campeã atual ({atual['versao']}) no mesmo conjunto: cobertura {campea['cobertura']} · errado {campea['aceito_errado']} · órfãos aceitos {campea['orfaos_aceitos']}")
     seguro = desafiante["aceito_errado"] == 0 and desafiante["orfaos_aceitos"] == 0
     melhor = (campea is None or campea["aceito_errado"] > 0 or campea["orfaos_aceitos"] > 0
               or desafiante["cobertura"] >= campea["cobertura"])
-    liberados = [t for t, m in desafiante["por_tipo"].items()
-                 if m["n"] >= 3 and m["aceito_errado"] == 0 and m["cobertura"] >= a.min_cobertura_tipo]
     man = {"versao": vid, "criado": reg["at"], "base": str(a.base), "fonte": a.fonte.split(":")[0],
            "tipos": elegiveis, "liberados": liberados, "descricoes": {t: desc[t] for t in elegiveis},
            "limiares": {"confianca": LIM_CONF, "segue": LIM_SEGUE}, "max_chars": MAX_CHARS,
-           "avaliacao": desafiante, "campea_no_mesmo_conjunto": campea, "n_treino": len(treino),
+           "perguntas": {"choice": PERGUNTA_CHOICE, "segue": PERGUNTA_SEGUE},
+           "regra": "choice entre `tipos`; aceita só se o escolhido está em `liberados`, confiança >= limiar e "
+                    "'segue o tipo?' >= limiar; planilha (regra do tabular_spec) não passa pela porteira",
+           "avaliacao": desafiante, "avaliacao_todos_os_tipos": bruto, "campea_no_mesmo_conjunto": campea, "n_treino": len(treino),
            "n_itens": len(itens), "epocas": a.epocas, "impressoes": impr,
            "hash_modelo": hash_arquivo(out / "model.safetensors")}
     json.dump(man, open(out / "manifest.json", "w"), ensure_ascii=False, indent=1)
     if seguro and melhor and liberados:
-        tmp = dirp / "atual.tmp"
-        tmp.unlink(missing_ok=True)
-        tmp.symlink_to(Path("versoes") / vid)
-        os.replace(tmp, dirp / "atual")
-        reg["decisao"] = f"PROMOVIDA {vid}: liberados {liberados}"
+        # exporta ANTES de apontar `atual`: o nidhoggd só usa versão exportada (ONNX + rust.json +
+        # paridade.json), e não pode ver o symlink trocar para uma versão sem grafo
+        try:
+            import exporta
+            if not (out / "onnx" / "laya.onnx").exists():
+                exporta.exporta_onnx(out)
+            tok, cfg = exporta.rust_json(out)
+            casos = exporta.paridade(out, tok, cfg, random.Random(53).sample(aval, min(40, len(aval))))
+            log(f"{vid} exportada para o nidhoggd (onnx + rust.json + paridade de {len(casos)} casos)")
+            tmp = dirp / "atual.tmp"
+            tmp.unlink(missing_ok=True)
+            tmp.symlink_to(Path("versoes") / vid)
+            os.replace(tmp, dirp / "atual")
+            reg["decisao"] = f"PROMOVIDA {vid}: liberados {liberados}"
+        except Exception as e:
+            reg["decisao"] = f"reprovada {vid}: exportação falhou ({e}) — campeã mantida"
     else:
         motivo = "aceitou errado" if not seguro else ("cobertura abaixo da campeã" if not melhor else "nenhum tipo liberado")
         reg["decisao"] = f"reprovada {vid}: {motivo} — campeã mantida"
@@ -337,6 +379,8 @@ def main():
     ap.add_argument("--min-novos", type=int, default=10)
     ap.add_argument("--min-cobertura-tipo", type=float, default=0.5)
     ap.add_argument("--frac-aval", type=float, default=0.25)
+    ap.add_argument("--max-treino-tipo", type=int, default=40, help="teto de bases por tipo no treino")
+    ap.add_argument("--max-aval-tipo", type=int, default=15, help="teto de bases por tipo na avaliação")
     ap.add_argument("--epocas", type=int, default=2)
     # medido na Aron (Xeon E5-2680 v4, 14 núcleos/28 threads, 05/out): 14 threads sem checkpointing
     # = 0,99 s/exemplo; 8 threads com checkpointing = 1,31; 28 threads (hyper-threading) = 1,58 a 2,22
@@ -345,6 +389,7 @@ def main():
     ap.add_argument("--manter", type=int, default=3)
     ap.add_argument("--semente", type=int, default=2026)
     ap.add_argument("--forcar", action="store_true", help="treina mesmo sem rótulos novos suficientes")
+    ap.add_argument("--reavaliar", metavar="DIR_VERSAO", help="não treina: reavalia/promove uma versão já treinada")
     sys.exit(ciclo(ap.parse_args()))
 
 
