@@ -1057,3 +1057,99 @@ pub fn doctypes_uso(url: &str) -> Result<Value, String> {
     out.sort_by(|a, b| b["bases"].as_u64().unwrap_or(0).cmp(&a["bases"].as_u64().unwrap_or(0)));
     Ok(json!(out))
 }
+
+// ───────────────────────── [#14/#21] relink de base renomeada + poda de removidas ─────────────────────────
+// As tabelas são chaveadas pelo NOME da base: renomear no ragd parecia "base nova" (a re-tipagem
+// humana se perdia) e base removida deixava classe/entidades órfãs. Aqui ficam as três operações
+// de reconciliação. As mutations (ALTER … DELETE) são síncronas e raras: só rodam quando há
+// rename ou base removida passada a carência — não a cada ciclo.
+
+/// POST no ClickHouse com parâmetros por binding (`{p:Tipo}` + `param_p=`): INSERT…SELECT e
+/// mutations (GET é readonly). `mutations_sync=1` espera a mutation terminar.
+fn ch_post_param(url: &str, sql: &str, params: &[(&str, &str)], secs: u32) -> Result<String, String> {
+    let mut full = format!("{url}?mutations_sync=1");
+    for (k, v) in params { full.push_str(&format!("&param_{}={}", k, urlencode(v))); }
+    let out = Command::new("curl")
+        .args(["-s", "-m", &secs.to_string(), &full, "--data-binary", sql])
+        .output()
+        .map_err(|e| format!("curl falhou: {e}"))?;
+    if !out.status.success() { return Err(format!("curl status {:?}", out.status.code())); }
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    if body.contains("DB::Exception") || body.starts_with("Code:") {
+        return Err(body.chars().take(200).collect());
+    }
+    Ok(body)
+}
+
+/// Valor de parâmetro `Array(String)` no formato texto do ClickHouse: ['a','b'] com escape.
+fn ch_array_param(xs: &[String]) -> String {
+    let itens: Vec<String> = xs.iter()
+        .map(|x| format!("'{}'", x.replace('\\', "\\\\").replace('\'', "\\'")))
+        .collect();
+    format!("[{}]", itens.join(","))
+}
+
+/// Nomes de base que o Nidhogg conhece numa coleção (classe OU entidade) — é contra isto que se
+/// detecta base removida no ragd, inclusive órfã antiga de antes desta reconciliação existir.
+pub fn known_names(url: &str, coll: &str) -> Result<Vec<String>, String> {
+    let body = ch_query_param(url,
+        "SELECT name FROM (SELECT DISTINCT name FROM nidhogg.doc_class WHERE collection={coll:String} \
+         UNION DISTINCT SELECT DISTINCT base AS name FROM nidhogg.entidade WHERE collection={coll:String}) \
+         ORDER BY name FORMAT TabSeparatedRaw",
+        &[("coll", coll)], 20)?;
+    Ok(body.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+/// Move tudo de `de` para `para` na coleção: a classe (inclusive `origem=humano`) e as entidades
+/// atuais (menções, fichas, relações), já com o `state_hash` da base nova — assim o L1 não
+/// reclassifica e a extração não refaz. Depois apaga o nome antigo. Devolve (classes, entidades).
+/// Os nós (`no_valor`) são reconstruídos pelo próximo `mine_links` (o chamador força).
+pub fn relink(url: &str, coll: &str, de: &str, para: &str, novo_hash: &str) -> Result<(u64, u64), String> {
+    let p = [("coll", coll), ("de", de), ("para", para), ("sh", novo_hash)];
+    let conta = |sql: &str| -> u64 {
+        ch_query_param(url, sql, &[("coll", coll), ("de", de)], 15).ok()
+            .and_then(|b| b.trim().parse().ok()).unwrap_or(0)
+    };
+    let n_cls = conta("SELECT count() FROM nidhogg.doc_class FINAL WHERE collection={coll:String} AND name={de:String} FORMAT TabSeparated");
+    let n_ent = conta("SELECT count() FROM nidhogg.entidade_atual WHERE collection={coll:String} AND base={de:String} FORMAT TabSeparated");
+    if n_cls > 0 {
+        let v = now_version().to_string();
+        let mut pv: Vec<(&str, &str)> = p.to_vec();
+        pv.push(("v", v.as_str()));
+        ch_post_param(url,
+            "INSERT INTO nidhogg.doc_class (collection, name, state_hash, cfg_hash, natureza, tipo, csv, origem, \
+             confianca, classified_at, version, forma) \
+             SELECT collection, {para:String}, {sh:String}, cfg_hash, natureza, tipo, csv, origem, confianca, \
+             classified_at, {v:UInt64}, forma FROM nidhogg.doc_class FINAL \
+             WHERE collection={coll:String} AND name={de:String}", &pv, 30)?;
+    }
+    if n_ent > 0 {
+        // mesma `version` das linhas copiadas: a view entidade_atual (max por coleção/base/tipo)
+        // passa a enxergá-las sob o nome novo exatamente como eram sob o antigo.
+        ch_post_param(url,
+            "INSERT INTO nidhogg.entidade (collection, base, tipo, idx, dado, modo, nqi, prov, state_hash, \
+             ext_cfg_hash, version, extracted_at) \
+             SELECT collection, {para:String}, tipo, idx, dado, modo, nqi, prov, {sh:String}, ext_cfg_hash, \
+             version, extracted_at FROM nidhogg.entidade_atual \
+             WHERE collection={coll:String} AND base={de:String}", &p, 60)?;
+    }
+    podar(url, coll, &[de.to_string()])?;
+    Ok((n_cls, n_ent))
+}
+
+/// Apaga classe, entidades e nós das bases `nomes` numa coleção (mutations síncronas, em lote).
+/// Devolve quantas linhas de classe + entidade atual saíram (contadas antes).
+pub fn podar(url: &str, coll: &str, nomes: &[String]) -> Result<u64, String> {
+    if nomes.is_empty() { return Ok(0); }
+    let arr = ch_array_param(nomes);
+    let p = [("coll", coll), ("nomes", arr.as_str())];
+    let n: u64 = ch_query_param(url,
+        "SELECT (SELECT count() FROM nidhogg.doc_class FINAL WHERE collection={coll:String} AND has({nomes:Array(String)}, name)) \
+         + (SELECT count() FROM nidhogg.entidade_atual WHERE collection={coll:String} AND has({nomes:Array(String)}, base)) \
+         FORMAT TabSeparated", &p, 20)?.trim().parse().unwrap_or(0);
+    ch_post_param(url, "ALTER TABLE nidhogg.doc_class DELETE WHERE collection={coll:String} AND has({nomes:Array(String)}, name)", &p, 120)?;
+    ch_post_param(url, "ALTER TABLE nidhogg.entidade DELETE WHERE collection={coll:String} AND has({nomes:Array(String)}, base)", &p, 120)?;
+    // no_valor pode nem existir ainda (só nasce no L2): falha aqui não é erro de poda
+    let _ = ch_post_param(url, "ALTER TABLE nidhogg.no_valor DELETE WHERE collection={coll:String} AND has({nomes:Array(String)}, base)", &p, 120);
+    Ok(n)
+}
