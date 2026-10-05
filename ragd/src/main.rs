@@ -1522,7 +1522,10 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     let mut variants = vec![query.to_string()];
     variants.extend(kept.iter().cloned());
     // merge por (coll,base,chunk) -> melhor cobertura (original ganha leve desempate)
-    let mut best: HashMap<(String, String, u64), (f64, Value, usize)> = HashMap::new();
+    // BTreeMap (não HashMap): a ordem de iteração alimenta a ordenação estável abaixo, e empates
+    // de cobertura saíam na ordem sorteada por processo — a mesma query trocava resultados entre
+    // subidas do daemon (medido: 22/30 iguais). Com a chave ordenada, o desempate é sempre o mesmo.
+    let mut best: std::collections::BTreeMap<(String, String, u64), (f64, Value, usize)> = std::collections::BTreeMap::new();
     for (qi, q) in variants.iter().enumerate() {
         let mut qb = Map::new();
         if let Some(c) = &coll { qb.insert("collection".into(), json!(c)); }
