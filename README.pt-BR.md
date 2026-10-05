@@ -107,9 +107,13 @@ python3 python_concept/search_rag.py meu_corpus-tokenized.json "minha consulta" 
 
 ## API do daemon (HTTP JSON)
 
-`GET /health · /bases · /collections · /drivers · /interpret` ·
-`POST /ingest · /ingest_file · /ingest_upload · /search · /search_expand · /chunk` ·
-`DELETE /bases/{nome}`.
+Rotas principais: `GET /health · /bases · /collections · /profile · /stats` ·
+`POST /search · /chunk · /ingest · /ingest_file · /ingest_upload · /ingest_any · /transcribe` ·
+`DELETE /bases/{nome} · /collections/{nome}` — além do login JWT (`/login`) e das rotas administrativas.
+
+- **Uma rota de busca (#39):** `POST /search` aceita estágios opt-in — `expand` (dicionário → cache → IA),
+  `phonetic`, `literal_fallback` (ligado por padrão) — e toda resposta diz quais rodaram em `via: [...]`.
+  *Migração:* `POST /search_expand` continua funcionando igual; agora é um atalho para `/search` com `expand: true`.
 
 - Bases são organizadas por `collection/name`; busca é **scatter-gather** com wildcard
   (`"sd*"`, `"*"`) e merge por relevância.
