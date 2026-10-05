@@ -47,9 +47,11 @@ export const getHistogram = (query: string, opts: SearchOpts = {}) =>
 
 // Semântico: expansão em cascata 📚 dicionários → 📖 cache → 🧠 IA. Com forceInfer,
 // two_phase=false — pula o atalho "léxico já foi forte" e SEMPRE roda a cascata.
+// [#39] rota única: /search com expand=true (o /search_expand segue como preset compatível).
 export const searchExpand = (query: string, opts: SearchOpts & { forceInfer?: boolean } = {}) =>
-  ragd.post<SearchExpandResponse>('/search_expand', {
+  ragd.post<SearchExpandResponse>('/search', {
     ...searchBody(query, opts),
+    expand: true,
     ...(opts.forceInfer ? { two_phase: false } : {}),
   })
 
