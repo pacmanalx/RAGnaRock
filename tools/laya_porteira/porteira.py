@@ -279,7 +279,7 @@ def ciclo(a):
     log(f"{vid}: tipos {elegiveis} · treino {len(treino)} bases → {len(itens)} exemplos · avaliação {len(aval)} bases")
     t0 = time.time()
     targs = argparse.Namespace(epochs=a.epocas, micro_batch=2, grad_accum=16, calib_max=400,
-                               output_dir=str(out), no_checkpointing=False)
+                               output_dir=str(out), no_checkpointing=not a.checkpointing)
     laya_ft.train(targs, str(a.base), str(itens_p), torch.device("cpu"))
     shutil.rmtree(out / "checkpoint_latest", ignore_errors=True)
     itens_p.unlink(missing_ok=True)
@@ -338,7 +338,10 @@ def main():
     ap.add_argument("--min-cobertura-tipo", type=float, default=0.5)
     ap.add_argument("--frac-aval", type=float, default=0.25)
     ap.add_argument("--epocas", type=int, default=2)
-    ap.add_argument("--threads", type=int, default=8)
+    # medido na Aron (Xeon E5-2680 v4, 14 núcleos/28 threads, 05/out): 14 threads sem checkpointing
+    # = 0,99 s/exemplo; 8 threads com checkpointing = 1,31; 28 threads (hyper-threading) = 1,58 a 2,22
+    ap.add_argument("--threads", type=int, default=14, help="= núcleos FÍSICOS (hyper-threading piora)")
+    ap.add_argument("--checkpointing", action="store_true", help="economiza RAM recalculando ativações (~25%% mais lento)")
     ap.add_argument("--manter", type=int, default=3)
     ap.add_argument("--semente", type=int, default=2026)
     ap.add_argument("--forcar", action="store_true", help="treina mesmo sem rótulos novos suficientes")
