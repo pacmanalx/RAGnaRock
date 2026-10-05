@@ -54,7 +54,49 @@ fn nfc(s: &str) -> String {
 }
 
 /// Mapa de bases agrupadas por coleção: collection -> name -> RagBase.
-type Bases = HashMap<String, HashMap<String, RagBase>>;
+type Bases = HashMap<String, HashMap<String, Arc<RagBase>>>;
+
+/// [#37] Mapa de bases com trava PRÓPRIA e curta (fora da trava geral do State).
+/// Quem lê pega uma fotografia (`snap` = clonar um Arc) e solta a trava na hora — a busca roda
+/// sobre a fotografia, por mais que demore. Quem escreve (`muda`) faz cópia rasa do mapa se
+/// houver fotografias vivas (só ponteiros: as bases são `Arc<RagBase>`) e troca: espera apenas
+/// quem estiver no meio de um `snap`, nunca uma busca em andamento. Antes, inserir a base de uma
+/// ingestão esperava todas as buscas terminarem, e a trava justa enfileirava as novas atrás.
+struct BasesLock(RwLock<Arc<Bases>>);
+
+/// [#37] Cache de perfis unificados por coleção. Em `Arc` pelo mesmo motivo das bases: a busca
+/// copia os ponteiros de que precisa e solta a trava na hora — antes ela segurava o read lock do
+/// cache durante a busca inteira, e invalidar o perfil de uma coleção (write) enfileirava todas.
+type ProfMap = HashMap<String, Arc<rag::CollectionProfile>>;
+/// Uma remontagem de perfil por vez: com o cache invalidado, N buscas simultâneas montariam o
+/// mesmo perfil N vezes (cada um pode ter ~0,5 GB e ~1 s) — as outras esperam aqui, não na trava.
+static PERFIL_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Garante perfis em dia para `colls` (fingerprint) montando FORA da trava do cache.
+fn garante_perfis(bases: &Bases, profiles: &RwLock<ProfMap>, colls: &[String]) {
+    let velhas = |p: &ProfMap| -> Vec<String> {
+        colls.iter().filter(|c| bases.get(*c).map(|inner| {
+            p.get(*c).map(|x| x.fingerprint) != Some(rag::collection_fingerprint(inner))
+        }).unwrap_or(false)).cloned().collect()
+    };
+    if velhas(&profiles.read()).is_empty() { return; }
+    let _um = PERFIL_BUILD.lock().unwrap_or_else(|e| e.into_inner());
+    let falta = velhas(&profiles.read());   // outra busca pode ter montado enquanto esperávamos
+    for c in falta {
+        if let Some(inner) = bases.get(&c) {
+            let novo = Arc::new(rag::build_collection_profile(inner));
+            profiles.write().insert(c, novo);   // write só para trocar o ponteiro
+        }
+    }
+}
+impl BasesLock {
+    fn new(b: Bases) -> BasesLock { BasesLock(RwLock::new(Arc::new(b))) }
+    fn snap(&self) -> Arc<Bases> { self.0.read().clone() }
+    fn muda<R>(&self, f: impl FnOnce(&mut Bases) -> R) -> R {
+        let mut g = self.0.write();
+        f(Arc::make_mut(&mut g))
+    }
+}
 
 /// Retorna true se user/pass são as credenciais padrão não alteradas.
 fn is_default_creds(user: &str, pass: &str) -> bool {
@@ -69,7 +111,7 @@ fn is_default_creds(user: &str, pass: &str) -> bool {
 /// `search_expand` precisam mutar mesmo sob outer-read — `Mutex` interno permite isso sem
 /// pedir outer-write (que serializaria com as outras searches em paralelo).
 struct State {
-    bases: Bases,
+    bases: BasesLock,   // [#37] trava própria; leitura por fotografia
     drivers_dir: String,
     ingestors_dir: String,   // [#9] drivers de ingestão (scripts via shell)
     transcribe_timeout_s: u32,  // [#41] teto do /transcribe (áudio longo é lento por natureza)
@@ -96,7 +138,7 @@ struct State {
     session_ttl: u64,                     // validade da sessão em segundos (configurável; default 12h)
     max_bases: usize,                     // teto de bases (0 = sem limite); OOM guard no ingest
     max_chunks_per_base: usize,           // teto de chunks por base (0 = sem limite); OOM guard no ingest
-    collection_profiles: RwLock<HashMap<String, rag::CollectionProfile>>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
+    collection_profiles: RwLock<ProfMap>, // [#6] interior mut RW: search cacheia sob outer-read; N readers
     auth: auth::Auth,                     // [#33 JWT] usuários/perfis + secret (persistido em auth_file)
 }
 
@@ -473,11 +515,11 @@ fn tail_lines(path: &str, n: usize) -> String {
 fn total_bases(b: &Bases) -> usize { b.values().map(|m| m.len()).sum() }
 
 fn get_base<'a>(b: &'a Bases, coll: &str, name: &str) -> Option<&'a RagBase> {
-    b.get(coll)?.get(&nfc(name))
+    b.get(coll)?.get(&nfc(name)).map(|a| &**a)
 }
 
 fn insert_base(b: &mut Bases, coll: &str, name: String, base: RagBase) {
-    b.entry(coll.to_string()).or_default().insert(nfc(&name), base);
+    b.entry(coll.to_string()).or_default().insert(nfc(&name), Arc::new(base));
 }
 
 /// [#13] OOM guard: recusa um ingest que criaria uma base NOVA além do teto `max_bases`
@@ -673,7 +715,7 @@ fn main() {
              total_bases(&bases), bases.len(), n_drivers, cfg.ragfiles_dir, cfg.max_upload / (1024 * 1024));
     let max_upload = cfg.max_upload;   // local p/ limitar leitura sem travar o Mutex
     let state = Arc::new(RwLock::new(State {
-        bases, drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
+        bases: BasesLock::new(bases), drivers_dir: cfg.drivers_dir.clone(), ingestors_dir: cfg.ingestors_dir.clone(),
         transcribe_timeout_s: cfg.transcribe_timeout_s,
         ragfiles_dir: cfg.ragfiles_dir.clone(),
         web_dir: cfg.web_dir.clone(), api_port: cfg.api_port,
@@ -778,18 +820,24 @@ fn handle_api(mut req: Request, state: &Arc<RwLock<State>>, max_upload: usize) {
     }
     let t0 = Instant::now();
     let is_upload = method == Method::Post && (path == "/ingest_upload" || path == "/ingest_any");
+    let is_ingest = method == Method::Post && (path == "/ingest" || path == "/ingest_file");   // [#37]
     // [#41] /transcribe também roda FORA do lock — é o passo mais lento do daemon (minutos, em
     // áudio longo) e não escreve base nenhuma. Segurar o write lock aqui pararia o motor inteiro.
     let is_transcribe = method == Method::Post && path == "/transcribe";
     let (code, payload) = if is_transcribe {
         let (ing, teto) = { let st = state.read(); (st.ingestors_dir.clone(), st.transcribe_timeout_s) };
         transcrever(&query, &headers, &body_bytes, &ing, teto, max_upload)
+    } else if is_ingest {
+        // [#37] tokeniza/grava FORA do lock; write() só para inserir a base pronta
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("");
+        if path == "/ingest" { ingest_duas_fases(state, Box::new(move |c, cap| prepara_ingest(body, c, cap))) }
+        else { ingest_duas_fases(state, Box::new(move |c, cap| prepara_ingest_file(body, c, cap))) }
     } else if is_upload {
-        // driver FORA do lock (é o passo lento); store_upload pega write() só pra tokenizar/gravar.
+        // driver e tokenização FORA do lock (os passos lentos); write() só para inserir [#37]
         let use_drivers = path == "/ingest_any";
         let ing = { state.read().ingestors_dir.clone() };
         match resolve_and_convert(&query, &headers, &body_bytes, &ing, use_drivers, max_upload) {
-            Ok(up) => { let mut st = state.write(); store_upload(up, &mut *st) }
+            Ok(up) => ingest_duas_fases(state, Box::new(move |c, cap| prepara_upload(up, c, cap))),
             Err(e) => e,
         }
     } else if is_write_route(&method, &path) {
@@ -842,22 +890,22 @@ fn session_ok(headers: &[(String, String)], sessions: &HashMap<String, Instant>,
 }
 
 fn stats_json(st: &State) -> String {
-    let detail: Vec<Value> = st.bases.iter().map(|(c, m)| json!({
+    let detail: Vec<Value> = st.bases.snap().iter().map(|(c, m)| json!({
         "collection": c, "bases": m.len(),
         "chunks": m.values().map(|x| x.n_chunks).sum::<usize>(),
     })).collect();
     json!({
         "version": VERSION,
         "uptime_secs": st.started.elapsed().as_secs(),
-        "collections": st.bases.len(),
-        "bases": total_bases(&st.bases),
-        "chunks": total_chunks(&st.bases),
+        "collections": st.bases.snap().len(),
+        "bases": total_bases(&st.bases.snap()),
+        "chunks": total_chunks(&st.bases.snap()),
         "drivers": count_drivers(&st.drivers_dir),
         "dicts_active": dict_dirs(&st.thesaurus_dir).iter().filter(|p| p.join("inuse.flag").exists()).count(),
         "word_syn_entries": st.word_syn.len(),
         "ragfiles_dir": st.ragfiles_dir,
         "collections_detail": detail,
-        "mem": mem_stats(&st.bases),
+        "mem": mem_stats(&st.bases.snap()),
     }).to_string()
 }
 
@@ -1281,7 +1329,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
         let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
         let base_lit = v["base"].as_str().unwrap_or("*").to_string();
         let coll_lit = v["collection"].as_str().map(|s| s.to_string());
-        let lit_hits = literal_fallback(&needles_lit, &st.bases, coll_lit.as_deref(), &base_lit, k_lit);
+        let lit_hits = literal_fallback(&needles_lit, &st.bases.snap(), coll_lit.as_deref(), &base_lit, k_lit);
         if !lit_hits.is_empty() {
             slog(&format!("   └─ 🔎 literal (1ª classe) {needles_lit:?} · {} hit(s) · encerra", lit_hits.len()));
             return (200, json!({
@@ -1307,7 +1355,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
         qb.insert("query".into(), json!(query));
         qb.insert("k".into(), json!(k));
         qb.insert("phonetic".into(), json!(phon));
-        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &st.collection_profiles);
+        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases.snap(), &st.collection_profiles);
         if code == 200 {
             let rv: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
             if let Some(hits) = rv["hits"].as_array() {
@@ -1361,7 +1409,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
                 let k_lit = v["k"].as_u64().unwrap_or(8) as usize;
                 let base_lit = v["base"].as_str().unwrap_or("*").to_string();
                 let coll_lit = v["collection"].as_str().map(|s| s.to_string());
-                let lit_hits = literal_fallback(&needles, &st.bases, coll_lit.as_deref(), &base_lit, k_lit);
+                let lit_hits = literal_fallback(&needles, &st.bases.snap(), coll_lit.as_deref(), &base_lit, k_lit);
                 if !lit_hits.is_empty() {
                     slog(&format!("   └─ cascata: 📚 dict=∅ → 📖 cache MISS → 🧠 IA=∅ → 🔎 literal {needles:?} · {} hit(s)", lit_hits.len()));
                     return (200, json!({
@@ -1398,7 +1446,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     let coll = v["collection"].as_str().map(|s| s.to_string());
     // FILTRO POR VOCAB: variante que não ancora em nenhuma palavra do corpus do escopo é
     // busca garantidamente nula — corta ANTES de rodar. O que ficou de fora vira transparência.
-    let keys = scope_word_keys(&st.bases, coll.as_deref(), &base);
+    let keys = scope_word_keys(&st.bases.snap(), coll.as_deref(), &base);
     let orig_in = term_in_corpus(query, &keys);
     let mut kept: Vec<String> = vec![];
     let mut dropped: Vec<String> = vec![];
@@ -1413,7 +1461,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
     if !orig_in && kept.is_empty() {
         let mut missing = vec![query.to_string()];
         missing.extend(exps.iter().cloned());
-        let did_you_mean = suggest_terms(&st.bases, coll.as_deref(), &base, &missing, 6);
+        let did_you_mean = suggest_terms(&st.bases.snap(), coll.as_deref(), &base, &missing, 6);
         slog(&format!("   └─ AUSENTE: nada ancora no corpus · did-you-mean={did_you_mean:?}"));
         return (200, json!({
             "query": query, "provider": provider, "source": source,
@@ -1433,7 +1481,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
         qb.insert("query".into(), json!(q));
         qb.insert("k".into(), json!(k));
         qb.insert("phonetic".into(), json!(phon));
-        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases, &st.collection_profiles);
+        let (code, res) = search(&Value::Object(qb).to_string(), &st.bases.snap(), &st.collection_profiles);
         if code != 200 { slog(&format!("   │  ├ {} {q:?} → erro {code}", if qi == 0 { "orig" } else { "var " })); continue; }
         let rv: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
         let nh = rv["hits"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -1472,7 +1520,7 @@ fn search_expand(body: &str, st: &State) -> (u16, String) {
             let base_h = h["base"].as_str().unwrap_or("").to_string();
             let cid = h["chunk"].as_u64().unwrap_or(0) as usize;
             let w = exp_weightings.get(&coll_h).map(|v| v.as_slice());
-            let (orig_cov, orig_span) = st.bases.get(&coll_h)
+            let (orig_cov, orig_span) = st.bases.snap().get(&coll_h)
                 .and_then(|m| m.get(&base_h))
                 .map(|b| b.score_chunk(&qt, w, cid, phon))
                 .unwrap_or((0.0, 0));
@@ -1675,8 +1723,8 @@ fn set_config(body: &str, st: &mut State) -> (u16, String) {
         }
     }
     if reload {
-        st.bases.clear();
-        autoload_ragfiles(&st.ragfiles_dir, &mut st.bases);
+        let dir = st.ragfiles_dir.clone();
+        st.bases.muda(|b| { b.clear(); autoload_ragfiles(&dir, b); });
     }
     if notes.is_empty() { notes.push("nada mudou".into()); }
     (200, json!({"ok": true, "notes": notes, "reloaded": reload, "config": serde_json::from_str::<Value>(&config_json(st)).unwrap_or(Value::Null)}).to_string())
@@ -1880,20 +1928,20 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
             Ok(_) => state.auth.usuarios_json(), Err(e) => e,
         },
         (Method::Get, "/health") =>
-            (200, json!({"status": "ok", "bases": total_bases(&state.bases),
-                         "collections": state.bases.len(),
+            (200, json!({"status": "ok", "bases": total_bases(&state.bases.snap()),
+                         "collections": state.bases.snap().len(),
                          "drivers": count_drivers(&state.drivers_dir)}).to_string()),
-        (Method::Get, "/bases") => list_bases(query, &state.bases),
+        (Method::Get, "/bases") => list_bases(query, &state.bases.snap()),
         (Method::Get, p) if p.starts_with("/bases/") && p[7..].contains('/') => {   // [#4]
             let rest = &p[7..];
             match rest.split_once('/') {
                 // percent_decode: nome com espaço/acento chega %XX no path e dava 404
-                Some((coll, name)) => base_meta(&percent_decode(coll), &percent_decode(name), &state.bases),
+                Some((coll, name)) => base_meta(&percent_decode(coll), &percent_decode(name), &state.bases.snap()),
                 None => (404, json!({"error": "uso: GET /bases/{coll}/{name}"}).to_string()),
             }
         }
-        (Method::Get, "/collections") => list_collections(&state.bases),
-        (Method::Get, "/profile") => profile(query, &state.bases, &state.collection_profiles),  // [#1]
+        (Method::Get, "/collections") => list_collections(&state.bases.snap()),
+        (Method::Get, "/profile") => profile(query, &state.bases.snap(), &state.collection_profiles),  // [#1]
         (Method::Get, "/expansions") => (200, expansions_json(state)),              // [#48] cache p/ CacheDigest
         (Method::Get, "/stats") => (200, stats_json(state)),                        // [#3]
         (Method::Get, "/drivers") => list_drivers(query, &state.drivers_dir),
@@ -1907,11 +1955,11 @@ fn route_ro(method: &Method, path: &str, query: &str, headers: &[(String, String
         (Method::Get, "/ingestors") => list_ingestors(&state.ingestors_dir),
         (Method::Get, "/thesaurus") => list_dicts(query, &state.thesaurus_dir),
         (Method::Get, "/interpret") => interpret(query, &state.drivers_dir),
-        (Method::Post, "/search") => search(body_str(), &state.bases, &state.collection_profiles),
+        (Method::Post, "/search") => search(body_str(), &state.bases.snap(), &state.collection_profiles),
         (Method::Post, "/search_expand") => search_expand(body_str(), state),
-        (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases),
+        (Method::Post, "/chunk") => fetch_chunk(body_str(), &state.bases.snap()),
         // histograma do hit #1 (matched filter + embedding × query) — tela Performance do ValHalla
-        (Method::Post, "/histogram") => histogram(body_str(), &state.bases),
+        (Method::Post, "/histogram") => histogram(body_str(), &state.bases.snap()),
         _ => (404, json!({"error": "rota não encontrada", "path": path}).to_string()),
     }
 }
@@ -1922,10 +1970,8 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
     let body_str = || std::str::from_utf8(body_bytes).unwrap_or("");
     // [leak-fix 13/ago] rota que MUTA bases invalida o cache de perfis unificados (antes só o
     // DELETE de coleção invalidava — search/profile serviam perfil VELHO após ingest).
-    let muta_bases = matches!((method, path),
-        (Method::Post, "/ingest") | (Method::Post, "/ingest_file")
-        | (Method::Post, "/ingest_upload") | (Method::Post, "/ingest_any"))
-        || (matches!(method, Method::Delete) && (path.starts_with("/bases/") || path.starts_with("/collections/")));
+    // [#37] ingest invalida só o perfil da coleção ingerida (em `efetiva`); deleção ainda limpa tudo
+    let muta_bases = matches!(method, Method::Delete) && (path.starts_with("/bases/") || path.starts_with("/collections/"));
     if muta_bases { state.collection_profiles.write().clear(); }
     match (method, path) {
         // ── [#33 JWT] CRUD de perfis/usuários (guard: admin.usuarios) ──
@@ -1960,8 +2006,8 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             Ok(_) => { let n = percent_decode(&p["/auth/usuarios/".len()..]); state.auth.usuario_delete(&n) }
             Err(e) => e,
         },
-        (Method::Post, "/ingest") => ingest(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
-        (Method::Post, "/ingest_file") => ingest_file(body_str(), &state.drivers_dir, &state.ragfiles_dir, &mut state.bases, state.max_bases, state.max_chunks_per_base),
+        (Method::Post, "/ingest") => { let b = body_str(); ingest_sob_trava(state, Box::new(move |c, cap| prepara_ingest(b, c, cap))) }
+        (Method::Post, "/ingest_file") => { let b = body_str(); ingest_sob_trava(state, Box::new(move |c, cap| prepara_ingest_file(b, c, cap))) }
         (Method::Post, "/ingest_upload") => ingest_upload(query, headers, body_bytes, state, false),
         // [#9] /ingest_any = /ingest_upload + passo do driver de ingestão (mime|ext → script shell).
         (Method::Post, "/ingest_any") => ingest_upload(query, headers, body_bytes, state, true),
@@ -1969,7 +2015,7 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
             // percent_decode: nome com espaço/acento chega %XX no path e dava 404
             let name = percent_decode(&p["/bases/".len()..]);
             let coll = query_param(query, "collection").unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
-            if remove_base(&mut state.bases, &coll, &name) {
+            if state.bases.muda(|b| remove_base(b, &coll, &name)) {
                 // ?purge=1 apaga também o JSON do disco (senão o autoload ressuscita a base
                 // no próximo boot) — mesmo contrato do DELETE /collections/{name}?purge=1.
                 let purge = query_param(query, "purge").map(|s| s == "true" || s == "1").unwrap_or(false);
@@ -1988,7 +2034,7 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
                     let _ = std::fs::remove_file(rag::blob_path_for(&f.to_string_lossy()));
                 }
                 (200, json!({"ok": true, "removed": name, "collection": coll, "purged": purged,
-                             "bases": total_bases(&state.bases)}).to_string())
+                             "bases": total_bases(&state.bases.snap())}).to_string())
             } else {
                 (404, json!({"error": format!("base '{coll}/{name}' não encontrada")}).to_string())
             }
@@ -2008,27 +2054,90 @@ fn route(method: &Method, path: &str, query: &str, headers: &[(String, String)],
 ///       chunk?, driver?, with_text?, max_chunks?}     tokeniza usando o driver
 ///                                                      apontado por 'driver' ou
 ///                                                      auto-detectado pela ext.
-fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, max_bases: usize, max_chunks_per_base: usize) -> (u16, String) {
+// ───────────────────────── [#37] ingestão em DUAS fases ─────────────────────────
+// Antes, /ingest, /ingest_file e o upload faziam TUDO sob `state.write()`: driver, tokenização,
+// gravação do JSON e montagem da base — segundos de trava exclusiva por arquivo grande, com todas
+// as buscas (de qualquer coleção) esperando. Medido na Aron (335 livros, 8 clientes, livros de
+// 5 MB entrando em outra coleção): busca p50 692 ms → 5,7 s; p99 7,2 s → 15,4 s.
+// Agora: PREPARAR sem trava nenhuma (só uma fila entre ingestões — duas não gravam o mesmo
+// arquivo ao mesmo tempo) e EFETIVAR trocando o mapa de bases (`BasesLock`) sob a trava geral de
+// LEITURA, invalidando só o perfil da coleção ingerida (antes, o de TODAS). Busca nenhuma espera.
+struct IngestCfg { drivers_dir: String, ragfiles_dir: String, max_bases: usize, max_chunks_per_base: usize }
+impl IngestCfg {
+    fn de(st: &State) -> IngestCfg {
+        IngestCfg { drivers_dir: st.drivers_dir.clone(), ragfiles_dir: st.ragfiles_dir.clone(),
+                    max_bases: st.max_bases, max_chunks_per_base: st.max_chunks_per_base }
+    }
+}
+/// Base tokenizada, gravada e carregada — falta só entrar no mapa.
+struct Pronta { collection: String, name: String, base: RagBase, extra: Map<String, Value>, log: Option<Instant> }
+static INGEST_FILA: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Fase 2 (microssegundos): re-checa o teto, insere e invalida só o perfil da coleção. Só precisa
+/// da trava geral de LEITURA — o mapa de bases tem trava própria (`BasesLock::muda`), então
+/// inserir não espera as buscas em andamento.
+fn efetiva(p: Pronta, st: &State) -> (u16, String) {
+    if let Err(e) = base_count_cap_ok(&st.bases.snap(), &p.collection, &p.name, st.max_bases) {
+        return (413, json!({"error": e}).to_string());
+    }
+    let n = p.base.n_chunks;
+    st.bases.muda(|b| insert_base(b, &p.collection, p.name.clone(), p.base));
+    st.collection_profiles.write().remove(&p.collection);
+    let total = total_bases(&st.bases.snap());
+    if let Some(t0) = p.log {
+        tlog("ingest", &format!("   └─ carregado: {}/{} ({n} chunks) · total={total} bases ({:.0}ms)",
+                                p.collection, p.name, t0.elapsed().as_secs_f64() * 1000.0));
+    }
+    let mut r = Map::new();
+    r.insert("ok".into(), json!(true));
+    r.insert("collection".into(), json!(p.collection));
+    r.insert("name".into(), json!(p.name));
+    r.insert("n_chunks".into(), json!(n));
+    r.insert("bases".into(), json!(total));
+    for (k, v) in p.extra { r.insert(k, v); }
+    (200, Value::Object(r).to_string())
+}
+
+type Prepara<'a> = Box<dyn FnOnce(&IngestCfg, &dyn Fn(&str, &str) -> Result<(), String>) -> Result<Pronta, (u16, String)> + 'a>;
+
+/// Caminho da API: prepara SEM trava (só a fila entre ingestões) e efetiva sob write lock curto.
+fn ingest_duas_fases(state: &Arc<RwLock<State>>, preparar: Prepara) -> (u16, String) {
+    let _fila = INGEST_FILA.lock().unwrap_or_else(|e| e.into_inner());
+    let cfg = IngestCfg::de(&state.read());
+    let cap = |c: &str, n: &str| base_count_cap_ok(&state.read().bases.snap(), c, n, cfg.max_bases);
+    let r = preparar(&cfg, &cap);
+    match r { Ok(p) => efetiva(p, &state.read()), Err(e) => e }
+}
+
+/// Mesmo trabalho para quem JÁ está sob o write lock (rotas do dashboard via `route`).
+fn ingest_sob_trava(state: &mut State, preparar: Prepara) -> (u16, String) {
+    let cfg = IngestCfg::de(state);
+    let r = { let bases = &state.bases.snap(); preparar(&cfg, &|c: &str, n: &str| base_count_cap_ok(bases, c, n, cfg.max_bases)) };
+    match r { Ok(p) => efetiva(p, &*state), Err(e) => e }
+}
+
+fn prepara_ingest(body: &str, cfg: &IngestCfg, cap: &dyn Fn(&str, &str) -> Result<(), String>) -> Result<Pronta, (u16, String)> {
+    let (drivers_dir, ragfiles_dir, max_chunks_per_base) = (cfg.drivers_dir.as_str(), cfg.ragfiles_dir.as_str(), cfg.max_chunks_per_base);
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
+        Err(e) => return Err((400, json!({"error": format!("body JSON inválido: {e}")}).to_string())),
     };
     let name = match v["name"].as_str() {
         Some(n) => safe_name(n),
-        None => return (400, json!({"error": "falta 'name'"}).to_string()),
+        None => return Err((400, json!({"error": "falta 'name'"}).to_string())),
     };
     let collection = v["collection"].as_str().unwrap_or(DEFAULT_COLLECTION).to_string();
     let raw_mode = v["raw"].as_bool().unwrap_or(false);
 
     // [#13] OOM guard: recusa base nova além do teto antes de carregar/tokenizar.
-    if let Err(e) = base_count_cap_ok(bases, &collection, &name, max_bases) {
-        return (413, json!({"error": e}).to_string());
+    if let Err(e) = cap(&collection, &name) {
+        return Err((413, json!({"error": e}).to_string()));
     }
 
     let mut saved_to: Option<String> = None;
     let res: Result<RagBase, String> = if raw_mode {
         let path = match v["path"].as_str() {
-            Some(p) => p, None => return (400, json!({"error": "raw=true exige 'path' (arquivo bruto)"}).to_string()),
+            Some(p) => p, None => return Err((400, json!({"error": "raw=true exige 'path' (arquivo bruto)"}).to_string())),
         };
         ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to, max_chunks_per_base)
     } else if let Some(p) = v["path"].as_str() {
@@ -2037,27 +2146,21 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, 
         // [#41] modo data: a base não tem arquivo próprio → no disk, o texto fica na RAM até o próximo boot
         RagBase::from_str(&v["data"].to_string()).map(|mut b| { b.mtime = rag::now_secs(); b })
     } else {
-        return (400, json!({"error": "forneça 'path', 'data' (JSON tokenizado) ou {path, raw:true} (arquivo bruto)"}).to_string());
+        return Err((400, json!({"error": "forneça 'path', 'data' (JSON tokenizado) ou {path, raw:true} (arquivo bruto)"}).to_string()));
     };
     match res {
         Ok(b) => {
             let n = b.n_chunks;
             // [#13] modos path/data pulam o writer; aplica o mesmo teto de chunks aqui.
             if let Err(e) = chunk_cap_ok(n, max_chunks_per_base) {
-                return (413, json!({"error": e}).to_string());
+                return Err((413, json!({"error": e}).to_string()));
             }
-            insert_base(bases, &collection, name.clone(), b);
             let mut r = Map::new();
-            r.insert("ok".into(), json!(true));
-            r.insert("collection".into(), json!(collection));
-            r.insert("name".into(), json!(name));
-            r.insert("n_chunks".into(), json!(n));
-            r.insert("bases".into(), json!(total_bases(bases)));
             r.insert("raw".into(), json!(raw_mode));
             if let Some(p) = saved_to { r.insert("saved_to".into(), json!(p)); }
-            (200, Value::Object(r).to_string())
+            Ok(Pronta { collection, name, base: b, extra: r, log: None })
         }
-        Err(e) => (400, json!({"error": e}).to_string()),
+        Err(e) => Err((400, json!({"error": e}).to_string())),
     }
 }
 
@@ -2066,40 +2169,33 @@ fn ingest(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, 
 /// 'name' default = derive_base_name(path) (path achatado, ex: logic_path__03_histogram_py).
 /// 'driver' default = auto pela extensao (fallback PTBR).
 /// Sempre grava o JSON tokenizado em ragfiles_dir/<name>-tokenized.json.
-fn ingest_file(body: &str, drivers_dir: &str, ragfiles_dir: &str, bases: &mut Bases, max_bases: usize, max_chunks_per_base: usize) -> (u16, String) {
+fn prepara_ingest_file(body: &str, cfg: &IngestCfg, cap: &dyn Fn(&str, &str) -> Result<(), String>) -> Result<Pronta, (u16, String)> {
+    let (drivers_dir, ragfiles_dir, max_chunks_per_base) = (cfg.drivers_dir.as_str(), cfg.ragfiles_dir.as_str(), cfg.max_chunks_per_base);
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
+        Err(e) => return Err((400, json!({"error": format!("body JSON inválido: {e}")}).to_string())),
     };
     let path = match v["path"].as_str() {
-        Some(p) => p, None => return (400, json!({"error": "falta 'path'"}).to_string()),
+        Some(p) => p, None => return Err((400, json!({"error": "falta 'path'"}).to_string())),
     };
     let collection = v["collection"].as_str().unwrap_or(DEFAULT_COLLECTION).to_string();
     let name = safe_name(&v["name"].as_str().map(|s| s.to_string())
         .unwrap_or_else(|| ingestor::derive_base_name(Path::new(path))));
 
     // [#13] OOM guard: recusa base nova além do teto antes de tokenizar.
-    if let Err(e) = base_count_cap_ok(bases, &collection, &name, max_bases) {
-        return (413, json!({"error": e}).to_string());
+    if let Err(e) = cap(&collection, &name) {
+        return Err((413, json!({"error": e}).to_string()));
     }
 
     let mut saved_to: Option<String> = None;
     match ingest_raw_to_base(path, drivers_dir, ragfiles_dir, &collection, &name, &v, &mut saved_to, max_chunks_per_base) {
         Ok(b) => {
-            let n = b.n_chunks;
-            let corpus = b.corpus.clone();
-            insert_base(bases, &collection, name.clone(), b);
             let mut r = Map::new();
-            r.insert("ok".into(), json!(true));
-            r.insert("collection".into(), json!(collection));
-            r.insert("name".into(), json!(name));
-            r.insert("corpus".into(), json!(corpus));
-            r.insert("n_chunks".into(), json!(n));
-            r.insert("bases".into(), json!(total_bases(bases)));
+            r.insert("corpus".into(), json!(b.corpus.clone()));
             if let Some(p) = saved_to { r.insert("saved_to".into(), json!(p)); }
-            (200, Value::Object(r).to_string())
+            Ok(Pronta { collection, name, base: b, extra: r, log: None })
         }
-        Err(e) => (400, json!({"error": e}).to_string()),
+        Err(e) => Err((400, json!({"error": e}).to_string())),
     }
 }
 
@@ -2349,7 +2445,7 @@ fn resolve_and_convert(query: &str, headers: &[(String, String)], body: &[u8],
 
 /// [M2b] Parte SOB write lock: tokeniza o texto já convertido, grava o `<name>-tokenized.json` e
 /// carrega a base em memória. Rápida (sem subprocess) — só isto precisa do lock exclusivo.
-fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
+fn prepara_upload(up: UploadReady, cfg: &IngestCfg, cap: &dyn Fn(&str, &str) -> Result<(), String>) -> Result<Pronta, (u16, String)> {
     let UploadReady { filename, content_bytes, fields, driver_used, orig_len, via, t0 } = up;
 
     // conteudo precisa ser UTF-8 pra tokenizar como texto
@@ -2357,7 +2453,7 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
         Ok(s) => s.to_string(),
         Err(e) => {
             tlog("ingest", &format!("   └─ FALHOU: arquivo não é UTF-8 ({e})"));
-            return (400, json!({"error": format!("arquivo nao e' UTF-8: {e}")}).to_string());
+            return Err((400, json!({"error": format!("arquivo nao e' UTF-8: {e}")}).to_string()));
         }
     };
 
@@ -2378,15 +2474,15 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
                             if append { " append" } else { "" }));
 
     // [#13] OOM guard: recusa base nova além do teto antes de qualquer trabalho de I/O.
-    if let Err(e) = base_count_cap_ok(&state.bases, &collection, &name, state.max_bases) {
+    if let Err(e) = cap(&collection, &name) {
         tlog("ingest", &format!("   └─ RECUSADO: {e}"));
-        return (413, json!({"error": e}).to_string());
+        return Err((413, json!({"error": e}).to_string()));
     }
 
     // persiste em ragfiles_dir/<collection>/<name>-tokenized.json
-    let rag_dir = Path::new(&state.ragfiles_dir).join(&collection);
+    let rag_dir = Path::new(&cfg.ragfiles_dir).join(&collection);
     if let Err(e) = std::fs::create_dir_all(&rag_dir) {
-        return (500, json!({"error": format!("nao criou {}: {e}", rag_dir.display())}).to_string());
+        return Err((500, json!({"error": format!("nao criou {}: {e}", rag_dir.display())}).to_string()));
     }
     let out_path = rag_dir.join(format!("{name}-tokenized.json"));
 
@@ -2397,26 +2493,26 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
         let existing_str = match std::fs::read_to_string(&out_path) {
             Ok(s) => s,
             Err(e) => { tlog("ingest", &format!("   └─ FALHOU: ler base p/ append: {e}"));
-                        return (500, json!({"error": format!("ler base p/ append {}: {e}", out_path.display())}).to_string()); }
+                        return Err((500, json!({"error": format!("ler base p/ append {}: {e}", out_path.display())}).to_string())); }
         };
         let existing: Value = match serde_json::from_str(&existing_str) {
             Ok(v) => v,
             Err(e) => { tlog("ingest", &format!("   └─ FALHOU: base existente não é JSON válido: {e}"));
-                        return (400, json!({"error": format!("base existente nao e' JSON valido: {e}")}).to_string()); }
+                        return Err((400, json!({"error": format!("base existente nao e' JSON valido: {e}")}).to_string())); }
         };
-        match ingestor::tokenize_content_append(&existing, &text, &source_label, Path::new(&state.drivers_dir)) {
+        match ingestor::tokenize_content_append(&existing, &text, &source_label, Path::new(&cfg.drivers_dir)) {
             Ok(v) => v,
             Err(e) => { tlog("ingest", &format!("   └─ FALHOU na tokenização: {e}"));
-                        return (400, json!({"error": e}).to_string()); }
+                        return Err((400, json!({"error": e}).to_string())); }
         }
     } else {
         match ingestor::tokenize_content(
             &text, &filename, &source_label,
-            Path::new(&state.drivers_dir), driver_override, chunk_size, max_chunks, with_text,
+            Path::new(&cfg.drivers_dir), driver_override, chunk_size, max_chunks, with_text,
         ) {
             Ok(v) => v,
             Err(e) => { tlog("ingest", &format!("   └─ FALHOU na tokenização: {e}"));
-                        return (400, json!({"error": e}).to_string()); }
+                        return Err((400, json!({"error": e}).to_string())); }
         }
     };
     tlog("ingest", &format!("   ├─ tokenizado em {:.0}ms (texto {} bytes)",
@@ -2425,14 +2521,14 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     if let Err(e) = serde::Serialize::serialize(&value, &mut ser) {
-        return (500, json!({"error": format!("serialize JSON: {e}")}).to_string());
+        return Err((500, json!({"error": format!("serialize JSON: {e}")}).to_string()));
     }
     let json_bytes = buf.len();
     // [#12] backup .bak antes de sobrescrever + [#13] recusa se exceder max_chunks_per_base.
-    if let Err(e) = write_base_json(&out_path, &buf, value_n_chunks(&value), state.max_chunks_per_base) {
+    if let Err(e) = write_base_json(&out_path, &buf, value_n_chunks(&value), cfg.max_chunks_per_base) {
         tlog("ingest", &format!("   └─ FALHOU/RECUSADO ao gravar {}: {e}", out_path.display()));
         let code = if e.contains("max_chunks_per_base") { 413 } else { 500 };
-        return (code, json!({"error": e}).to_string());
+        return Err((code, json!({"error": e}).to_string()));
     }
     let saved_to = std::fs::canonicalize(&out_path).map(|p| p.display().to_string())
         .unwrap_or_else(|_| out_path.display().to_string());
@@ -2441,21 +2537,15 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
     let mut base = match RagBase::from_str(&String::from_utf8(buf).unwrap_or_default()) {
         Ok(b) => b,
         Err(e) => { tlog("ingest", &format!("   └─ FALHOU ao carregar como RagBase: {e}"));
-                    return (400, json!({"error": e}).to_string()); }
+                    return Err((400, json!({"error": e}).to_string())); }
     };
     base.spill_if_disk(&rag::blob_path_for(&out_path.to_string_lossy()));   // [#41]
     base.mtime = rag::now_secs();   // ingestão recém-feita → "agora" pra boost de recência
-    let n = base.n_chunks;
-    let corpus = base.corpus.clone();
-    insert_base(&mut state.bases, &collection, name.clone(), base);
-    let total = total_bases(&state.bases);
-    tlog("ingest", &format!("   └─ carregado: {collection}/{name} ({n} chunks) · total={total} bases ({:.0}ms)",
-                            t0.elapsed().as_secs_f64() * 1000.0));
-    (200, json!({"ok": true, "collection": collection, "name": name, "filename": filename,
-                 "corpus": corpus, "n_chunks": n, "bytes": orig_len,
-                 "appended": did_append, "driver": driver_used,
-                 "bases": total, "saved_to": saved_to,
-                 "via": via}).to_string())
+    let mut r = Map::new();
+    for (k, v) in [("filename", json!(filename)), ("corpus", json!(base.corpus.clone())), ("bytes", json!(orig_len)),
+                   ("appended", json!(did_append)), ("driver", json!(driver_used)), ("saved_to", json!(saved_to)),
+                   ("via", json!(via))] { r.insert(k.into(), v); }
+    Ok(Pronta { collection, name, base, extra: r, log: Some(t0) })
 }
 
 /// [compat] wrapper monolítico pro caller do dashboard (/api/ingest_upload): resolve+converte e
@@ -2464,7 +2554,7 @@ fn store_upload(up: UploadReady, state: &mut State) -> (u16, String) {
 fn ingest_upload(query: &str, headers: &[(String, String)], body: &[u8], state: &mut State, use_drivers: bool) -> (u16, String) {
     let (ing, mu) = (state.ingestors_dir.clone(), state.max_upload);
     match resolve_and_convert(query, headers, body, &ing, use_drivers, mu) {
-        Ok(up) => store_upload(up, state),
+        Ok(up) => ingest_sob_trava(state, Box::new(move |c, cap| prepara_upload(up, c, cap))),
         Err(e) => e,
     }
 }
@@ -2606,7 +2696,7 @@ fn expansions_json(st: &State) -> String {
     json!({"count": map.len(), "expansions": Value::Object(obj)}).to_string()
 }
 
-fn profile(query: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::CollectionProfile>>) -> (u16, String) {
+fn profile(query: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String) {
     let coll = match query_param(query, "collection") {
         Some(c) => c, None => return (400, json!({"error": "falta 'collection'"}).to_string()),
     };
@@ -2647,21 +2737,13 @@ fn profile(query: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Co
     // [leak-fix 13/ago] USA O CACHE unificado (mesmo padrão do search). Recomputar a cada
     // chamada custava 6,2s + ~1,5GB de transientes na `livros` — o nidhoggd chama /profile
     // todo ciclo e o glibc não devolve as arenas pro SO: o RSS só subia até derrubar a Aron.
-    {
-        let p = profiles.read();
-        if !p.contains_key(&coll) {
-            drop(p);
-            let mut w = profiles.write();
-            if !w.contains_key(&coll) {
-                w.insert(coll.clone(), rag::build_collection_profile(inner));
-            }
-        }
-    }
-    let profiles_guard = profiles.read();
-    let prof = match profiles_guard.get(&coll) {
+    let _ = inner;
+    garante_perfis(bases, profiles, std::slice::from_ref(&coll));
+    let prof_arc = match profiles.read().get(&coll).cloned() {
         Some(p) => p,
         None => return (500, json!({"error": "perfil evaporou do cache (corrida?)"}).to_string()),
     };
+    let prof: &rag::CollectionProfile = &prof_arc;
     let mut udim2syl: HashMap<usize, &str> = HashMap::with_capacity(prof.uvocab.len());
     for (s, &d) in &prof.uvocab { udim2syl.insert(d, s.as_str()); }
 
@@ -2774,7 +2856,7 @@ fn profile(query: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Co
 /// Com `purge=true` também remove `ragfiles/<name>/` do disco. [#2]
 fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
     let purge = query_param(query, "purge").map(|s| s == "true" || s == "1").unwrap_or(false);
-    let removed = match st.bases.remove(name) {
+    let removed = match st.bases.muda(|b| b.remove(name)) {
         Some(m) => m.len(),
         None => return (404, json!({"error": format!("coleção '{name}' não encontrada")}).to_string()),
     };
@@ -2791,11 +2873,11 @@ fn drop_collection(name: &str, query: &str, st: &mut State) -> (u16, String) {
         }
     }
     (200, json!({"ok": true, "collection": name, "bases_removed": removed,
-                 "purged": purged, "bases": total_bases(&st.bases),
-                 "collections": st.bases.len()}).to_string())
+                 "purged": purged, "bases": total_bases(&st.bases.snap()),
+                 "collections": st.bases.snap().len()}).to_string())
 }
 
-fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::CollectionProfile>>) -> (u16, String) {
+fn search(body: &str, bases: &Bases, profiles: &RwLock<ProfMap>) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("body JSON inválido: {e}")}).to_string()),
@@ -2840,29 +2922,13 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
     let unified = v["unified"].as_bool().unwrap_or(!build_colls.is_empty());
     // [#6] check fingerprint sob READ primeiro (N searches paralelas não esperam aqui); só pega
     // WRITE rapidinho se precisa rebuild — minimiza tempo de exclusão.
-    let stale: Vec<String> = {
-        let p = profiles.read();
-        build_colls.iter().filter(|c| {
-            bases.get(*c).map(|inner| {
-                let fp = rag::collection_fingerprint(inner);
-                p.get(*c).map(|x| x.fingerprint) != Some(fp)
-            }).unwrap_or(false)
-        }).cloned().collect()
-    };
-    if !stale.is_empty() {
-        let mut p = profiles.write();
-        for c in &stale {
-            if let Some(inner) = bases.get(c) {
-                let fp = rag::collection_fingerprint(inner);
-                if p.get(c).map(|x| x.fingerprint) != Some(fp) {
-                    p.insert(c.clone(), rag::build_collection_profile(inner));
-                }
-            }
-        }
-    }
+    garante_perfis(bases, profiles, &build_colls);
     let qt = rag::prep_query(query);
-    // segura UM read-lock durante todo o scatter-gather: outras searches lêem em paralelo
-    let profiles_guard = profiles.read();
+    // [#37] fotografia dos perfis do escopo (ponteiros) — a trava do cache sai aqui, não no fim
+    let profiles_guard: ProfMap = {
+        let g = profiles.read();
+        build_colls.iter().filter_map(|c| g.get(c).map(|p| (c.clone(), p.clone()))).collect()
+    };
     let weightings: HashMap<String, Vec<f64>> = build_colls.iter()
         .filter_map(|c| profiles_guard.get(c).map(|p| (c.clone(), rag::weighting_unified(&qt, p))))
         .collect();
@@ -2871,7 +2937,7 @@ fn search(body: &str, bases: &Bases, profiles: &RwLock<HashMap<String, rag::Coll
             .filter_map(|c| profiles_guard.get(c).map(|p| (c.clone(), rag::query_vec_unified(query, p))))
             .collect()
     } else { HashMap::new() };
-    let profiles_ref: &HashMap<String, rag::CollectionProfile> = &*profiles_guard;
+    let profiles_ref: &ProfMap = &profiles_guard;
 
     // scatter-gather: busca em cada base. Paraleliza com rayon quando há mais de uma
     // base no escopo (caso GLOBAL/coleção); cada base é independente, merge no fim.

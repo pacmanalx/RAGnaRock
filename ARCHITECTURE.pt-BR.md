@@ -209,24 +209,24 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
 - **Pressão de memória:** o console mede RSS (`/proc/self/statm`) + estimativa text/vec/words; medido:
   ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [FEITO]
 
-### 3.5 Concorrência
+### 3.5 Concorrência [FEITO]
 
-- **Hoje:** `Arc<Mutex<State>>` global — toda operação (read ou write) compete pelo mesmo lock.
-  Throughput medido: ~500 req/s num Mac M-series, ~65 num x86 de 2 cores, ~43 num Raspberry Pi 3 (busca global). [FEITO]
-- **Por que basta hoje:** o uso principal é **UMA IA, sequencial** — não há contenção real. Mutex
-  funciona bem até dezenas de req/s concorrentes.
-  - ⚠️ **Nota (Kimi):** o `rayon` paraleliza o scatter-gather, mas o `Mutex` global **re-serializa**
-    internamente — o ganho real de paralelismo só vem com o `RwLock`/lock-por-coleção abaixo. É
-    otimização **[FUTURO]** de **mesma prioridade** que a leitura on-disk no `hybrid`; não urgente com 1
-    IA sequencial.
-- **`[FUTURO]` quando virar multi-agente:**
-  - `Mutex<State>` → **`RwLock<State>`**: N **buscas read-only** em paralelo; `write()` só em
-    ingest/delete. (Ressalva do Codex: o rerank em `hybrid` recomputa `words` — mas isso é leitura pura,
-    cabe no read-lock; não vira write.)
-  - **Granularidade por coleção** (lock por coleção, não global) → buscar na coleção A enquanto ingere na B.
-  - Cuidado: starvation de writers se readers forem contínuos (usar `RwLock` justo/fair).
-  - Codex sugere desacoplar ingest×busca por **canal/mensagem** (lock-light) — guardar para se o RwLock
-    não bastar; YAGNI antes disso.
+- **Trava geral:** `parking_lot::RwLock<State>` (justa, #6) — N requisições de leitura em paralelo; `write()` só
+  para config/auth/drivers e deleções.
+- **Bases e perfis têm travas próprias e curtas (#37):** o mapa de bases é `BasesLock(RwLock<Arc<Bases>>)` com
+  `Arc<RagBase>` dentro, e o cache de perfis por coleção guarda `Arc<CollectionProfile>`. A busca pega uma
+  **fotografia** (copia ponteiros) e solta a trava na hora; roda sobre a fotografia o tempo que precisar. Quem
+  escreve copia o mapa de forma rasa (só ponteiros) e troca — nunca espera uma busca em andamento, então a trava
+  justa não enfileira mais as buscas novas atrás da escrita.
+- **Ingestão em duas fases (#37):** `/ingest`, `/ingest_file` e uploads **preparam** sem trava (driver, tokenização,
+  gravação do JSON, carga — a parte de segundos; as ingestões só fazem fila entre si para duas não gravarem o mesmo
+  arquivo) e **efetivam** em microssegundos sob a trava geral de LEITURA (insere + invalida só o perfil daquela
+  coleção; antes, toda ingestão invalidava todos). A remontagem de perfil também é fora da trava do cache, uma por vez.
+- **Medido (#37, Aron, 335 livros, 8 clientes simultâneos, livros de 5 MB entrando em outra coleção):** busca p50
+  durante a ingestão 5,7 s → 1,1 s (= p50 sem ingestão); buscas atendidas na janela 64 → 119; respostas
+  idênticas byte a byte.
+- **Em aberto:** latência de cauda com muitas buscas globais simultâneas (laços `rayon` aninhados sobre bases e
+  trechos dividem um pool; aparece com ou sem ingestão) — tratado à parte.
 
 ### 3.6 Drivers de linguagem [FEITO]
 
