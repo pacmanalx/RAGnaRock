@@ -83,6 +83,12 @@ struct Config {
                          // Independente do provider do ragd de propósito.
     store: String,       // backend do acumulado/classes: "clickhouse" (default) | "sqlite" (rollback)
     ch_url: String,      // endpoint HTTP do ClickHouse (default http://127.0.0.1:8123)
+    // [#15] diário de mastigação (llm-ledger.jsonl): o que gravar, quais coleções só em
+    // metadados, e rotação por tamanho com retenção de N arquivos girados.
+    llm_ledger: String,       // full (default) | meta | off
+    llm_ledger_meta: String,  // coleções sempre em metadados, separadas por vírgula ("*" = todas)
+    llm_ledger_max_mb: u64,   // gira o arquivo ao passar disso (0 = nunca)
+    llm_ledger_keep: usize,   // arquivos girados mantidos (os mais antigos são apagados)
 }
 impl Default for Config {
     fn default() -> Self {
@@ -94,7 +100,9 @@ impl Default for Config {
                  llm_temp: 0.0, llm_extra: String::new(),
                  llm_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
                  store: "clickhouse".to_string(),
-                 ch_url: "http://127.0.0.1:8123".to_string() }
+                 ch_url: "http://127.0.0.1:8123".to_string(),
+                 llm_ledger: "full".to_string(), llm_ledger_meta: String::new(),
+                 llm_ledger_max_mb: 20, llm_ledger_keep: 6 }
     }
 }
 fn load_cfg(cfg: &mut Config, path: &str) {
@@ -118,6 +126,10 @@ fn load_cfg(cfg: &mut Config, path: &str) {
             "llm_key"  => cfg.llm_key = v.to_string(),
             "llm_temp" => if let Ok(n) = v.parse() { cfg.llm_temp = n },
             "llm_extra" => cfg.llm_extra = v.to_string(),
+            "llm_ledger" => cfg.llm_ledger = v.to_lowercase(),
+            "llm_ledger_meta" => cfg.llm_ledger_meta = v.to_string(),
+            "llm_ledger_max_mb" => if let Ok(n) = v.parse() { cfg.llm_ledger_max_mb = n },
+            "llm_ledger_keep" => if let Ok(n) = v.parse() { cfg.llm_ledger_keep = n },
             "store"    => cfg.store = v.to_string(),
             "ch_url"   => cfg.ch_url = v.to_string(),
             other => eprintln!("config: chave desconhecida {other:?}"),
@@ -232,6 +244,75 @@ fn http_post_t(url: &str, body: &str, secs: u32) -> Option<String> {
 // entendimento ciclo a ciclo. Caminho: <dir>/llm-ledger.jsonl (setado no boot a partir do cfg).
 static LLM_LEDGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// [#15] Política do diário. O arquivo guarda prompt e resposta COMPLETOS — ou seja, conteúdo
+/// do corpus —, então: (1) coleções listadas em `llm_ledger_meta` (ou tudo, com
+/// `llm_ledger = meta`) gravam só metadados (papel, coleção, latência, tamanhos e uma
+/// impressão digital do prompt/resposta, sem texto); (2) o arquivo nasce 0600; (3) ao passar
+/// de `llm_ledger_max_mb` ele gira para `llm-ledger-AAAAMMDD-HHMMSS.jsonl` e só os
+/// `llm_ledger_keep` girados mais novos ficam. `/api/nidhogg/llm_ledger` lê o corrente.
+struct LedgerCfg { modo: String, meta: Vec<String>, max_bytes: u64, keep: usize }
+static LEDGER_CFG: std::sync::OnceLock<LedgerCfg> = std::sync::OnceLock::new();
+static LEDGER_LOCK: Mutex<()> = Mutex::new(());
+
+/// A coleção desta chamada grava só metadados? Conservador: L4 com escopo amplo ("*" ou
+/// vazio) puxa contexto de todas as coleções, então cai em metadados se QUALQUER coleção
+/// estiver marcada.
+fn ledger_so_meta(c: &LedgerCfg, coll: &str) -> bool {
+    if c.modo == "meta" { return true; }
+    if c.meta.is_empty() { return false; }
+    let coll = nfc(coll.trim());
+    coll.is_empty() || coll == "*" || c.meta.iter().any(|m| m == "*" || *m == coll)
+}
+
+/// Impressão digital FNV-1a 64 (estável entre versões e máquinas): permite ver que dois
+/// prompts/respostas são iguais sem guardar o texto. Não é criptográfica — não é segredo.
+fn fnv64(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+    format!("{h:016x}")
+}
+
+/// Grava uma linha no diário, girando antes se o arquivo passou do limite.
+fn ledger_append(path: &str, linha: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = LEDGER_CFG.get() {
+        let tam = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if c.max_bytes > 0 && tam > 0 && tam + linha.len() as u64 > c.max_bytes { ledger_girar(path, c.keep); }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path) {
+        let _ = writeln!(f, "{linha}");
+    }
+}
+
+/// Renomeia o corrente para `llm-ledger-AAAAMMDD-HHMMSS.jsonl` e apaga os girados além de `keep`.
+fn ledger_girar(path: &str, keep: usize) {
+    let p = Path::new(path);
+    let dir = p.parent().unwrap_or(Path::new("."));
+    let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("llm-ledger").to_string();
+    let carimbo: String = now_stamp().chars().filter(|c| c.is_ascii_digit() || *c == ' ').collect::<String>().replace(' ', "-");
+    let mut destino = dir.join(format!("{stem}-{carimbo}.jsonl"));
+    let mut n = 1;
+    while destino.exists() { destino = dir.join(format!("{stem}-{carimbo}-{n}.jsonl")); n += 1; }
+    if let Err(e) = std::fs::rename(path, &destino) { nlog(&format!("🐿️ ledger: não girou ({e})")); return; }
+    nlog(&format!("🐿️ ledger girado → {}", destino.display()));
+    let prefixo = format!("{stem}-");
+    let mut girados: Vec<std::path::PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|x| x.file_name().and_then(|n| n.to_str())
+            .map(|n| n.starts_with(&prefixo) && n.ends_with(".jsonl")).unwrap_or(false))
+        .collect();
+    girados.sort();   // o carimbo AAAAMMDD-HHMMSS ordena por data
+    while girados.len() > keep {
+        let velho = girados.remove(0);
+        match std::fs::remove_file(&velho) {
+            Ok(_) => nlog(&format!("🐿️ ledger: retenção apagou {}", velho.display())),
+            Err(e) => nlog(&format!("🐿️ ledger: não apagou {} ({e})", velho.display())),
+        }
+    }
+}
+
 /// Ajusta o corpo ao DIALETO do provedor, num ponto só — todas as camadas (classificador,
 /// modelador, extrator, relacoes, analista, comparador) passam por aqui, então nenhuma delas
 /// precisa saber com quem está falando. Medido contra a API do Kimi em 15/ago:
@@ -259,7 +340,7 @@ fn ajusta_dialeto(body: &str) -> String {
     v.to_string()
 }
 
-fn llm_post(tag: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<String> {
+fn llm_post(tag: &str, coll: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<String> {
     let t0 = std::time::Instant::now();
     let body = &ajusta_dialeto(body);
     let resp = http_post_t(url, body, secs);
@@ -272,16 +353,27 @@ fn llm_post(tag: &str, ctx: &str, url: &str, body: &str, secs: u32) -> Option<St
         }
         None => (String::new(), String::new()),
     };
-    if let Some(path) = LLM_LEDGER.get() {
+    let lcfg = LEDGER_CFG.get();
+    if let (Some(path), true) = (LLM_LEDGER.get(), lcfg.map(|c| c.modo != "off").unwrap_or(true)) {
         let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let entry = json!({
-            "ts": now_stamp(), "tag": tag, "ctx": ctx, "ms": ms, "ok": resp.is_some(),
-            "url": url, "messages": req["messages"], "finish": finish, "resposta": conteudo,
-        });
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{entry}");
-        }
+        let entry = if lcfg.map(|c| ledger_so_meta(c, coll)).unwrap_or(false) {
+            // [#15] só metadados: nada do corpus (nem o rótulo, que traz nome de base) vai pro disco
+            let sys = req["messages"][0]["content"].as_str().unwrap_or("");
+            let user = req["messages"][1]["content"].as_str().unwrap_or("");
+            json!({
+                "ts": now_stamp(), "tag": tag, "coll": coll, "meta": true, "ms": ms, "ok": resp.is_some(),
+                "url": url, "finish": finish,
+                "system_len": sys.chars().count(), "user_len": user.chars().count(),
+                "resposta_len": conteudo.chars().count(),
+                "ctx_fp": fnv64(ctx), "prompt_fp": fnv64(&format!("{sys}\u{1f}{user}")), "resposta_fp": fnv64(&conteudo),
+            })
+        } else {
+            json!({
+                "ts": now_stamp(), "tag": tag, "coll": coll, "ctx": ctx, "ms": ms, "ok": resp.is_some(),
+                "url": url, "messages": req["messages"], "finish": finish, "resposta": conteudo,
+            })
+        };
+        ledger_append(path, &entry.to_string());
     }
     // rastro curto no log principal (o diário guarda o inteiro teor)
     nlog(&format!("🐿️ llm {tag} [{ctx}] {ms}ms → {}", if resp.is_some() {
@@ -950,7 +1042,7 @@ fn mine_relacoes(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &str
                 "temperature": 0, "max_tokens": max_tokens,
                 "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
             }).to_string();
-            let obj = llm_post("relacoes", &format!("L3 {coll}/{name} chunk {cid}"), llm_url, &body, 150)
+            let obj = llm_post("relacoes", coll, &format!("L3 {coll}/{name} chunk {cid}"), llm_url, &body, 150)
                 .and_then(|resp| serde_json::from_str::<Value>(&resp).ok())
                 .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
                 .and_then(|c| extract_json_object(&c));
@@ -1259,7 +1351,7 @@ fn l4_fingerprint(api: &str, ch_url: &str, coll: &str, texto: &str, tipo: &str, 
 
 /// Chama o analista (LLM) com a pergunta + contexto determinístico. `tabular` muda a forma da
 /// resposta (tabela em vez de texto). Devolve o JSON estruturado validado.
-fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo: &str, ctx: &str)
+fn l4_responder(llm_url: &str, lib: &Value, coll: &str, ctxlabel: &str, pergunta: &str, tipo: &str, ctx: &str)
     -> Result<Value, String> {
     let sys = match lib["templates"]["analista"]["system"].as_str() {
         Some(s) if !s.trim().is_empty() => s.to_string(),
@@ -1299,7 +1391,7 @@ fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo
         "temperature": 0, "max_tokens": max_tokens,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = llm_post("analista", ctxlabel, llm_url, &body, 240).ok_or("sem resposta (analista)")?;
+    let resp = llm_post("analista", coll, ctxlabel, llm_url, &body, 240).ok_or("sem resposta (analista)")?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| "resposta não-JSON".to_string())?;
     let content = rv["choices"][0]["message"]["content"].as_str().ok_or("sem content")?;
     extract_json_object(content).ok_or_else(|| "resposta não é JSON válido".to_string())
@@ -1307,7 +1399,7 @@ fn l4_responder(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, tipo
 
 /// O COMPARADOR — o coração da timeline (decisão do Pacman): responde-se todo ciclo, mas só
 /// vira ETAPA se a perspectiva mudou. Devolve Some(o que mudou) ou None (nada novo).
-fn l4_mudou(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, antes: &str, agora: &str)
+fn l4_mudou(llm_url: &str, lib: &Value, coll: &str, ctxlabel: &str, pergunta: &str, antes: &str, agora: &str)
     -> Option<String> {
     if antes.trim() == agora.trim() { return None; }        // idêntico: nem gasta LLM
     let sys = match lib["templates"]["comparador"]["system"].as_str() {
@@ -1325,7 +1417,7 @@ fn l4_mudou(llm_url: &str, lib: &Value, ctxlabel: &str, pergunta: &str, antes: &
         "temperature": 0, "max_tokens": 300,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let obj = llm_post("comparador", ctxlabel, llm_url, &body, 120)
+    let obj = llm_post("comparador", coll, ctxlabel, llm_url, &body, 120)
         .and_then(|r| serde_json::from_str::<Value>(&r).ok())
         .and_then(|rv| rv["choices"][0]["message"]["content"].as_str().map(String::from))
         .and_then(|c| extract_json_object(&c))?;
@@ -1377,7 +1469,7 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
     let (ctx, _fp_ctx) = l4_contexto(api, ch_url, &coll, &texto);
     if ctx.trim().is_empty() { return json!({"ok": false, "pergunta": nome, "error": "contexto vazio (nada acumulado no escopo)"}); }
     let ctxlabel = format!("L4 {nome} [{coll}]");
-    let obj = match l4_responder(llm_url, lib, &ctxlabel, &texto, &tipo, &ctx) {
+    let obj = match l4_responder(llm_url, lib, &coll, &ctxlabel, &texto, &tipo, &ctx) {
         Ok(o) => o,
         Err(e) => { nlog(&format!("L4 {nome}: {e}")); return json!({"ok": false, "pergunta": nome, "error": e}); }
     };
@@ -1393,9 +1485,9 @@ fn l4_processar(api: &str, llm_url: &str, ch_url: &str, lib: &Value, p: &Value, 
     };
     // primeira resposta SEMPRE vira etapa; depois, só quando o comparador diz que mudou
     let mudou = if anterior.is_none() { Some("primeira resposta".to_string()) }
-                else if forcar { Some(l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s)
+                else if forcar { Some(l4_mudou(llm_url, lib, &coll, &ctxlabel, &texto, &texto_ant, &resposta_s)
                                         .unwrap_or_else(|| "resposta forçada pelo operador".to_string())) }
-                else { l4_mudou(llm_url, lib, &ctxlabel, &texto, &texto_ant, &resposta_s) };
+                else { l4_mudou(llm_url, lib, &coll, &ctxlabel, &texto, &texto_ant, &resposta_s) };
     // carimba o escopo como JÁ PROCESSADO — vale para os DOIS desfechos abaixo. É justamente o
     // caminho "não mudou" que precisa disso: ele não grava linha nenhuma, e sem o carimbo a
     // pergunta voltaria a gastar analista + comparador em todo ciclo, para sempre.
@@ -1767,12 +1859,17 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
                     let sys = e["messages"][0]["content"].as_str().unwrap_or("");
                     let user = e["messages"][1]["content"].as_str().unwrap_or("");
                     let resp = e["resposta"].as_str().unwrap_or("");
+                    // [#15] entrada só de metadados: sem texto, com os tamanhos gravados
+                    let meta = e["meta"].as_bool().unwrap_or(false);
+                    let len = |campo: &str, s: &str| if meta { e[campo].as_u64().unwrap_or(0) as usize } else { s.chars().count() };
                     json!({
-                        "ts": e["ts"], "tag": e["tag"], "ctx": e["ctx"], "ms": e["ms"],
+                        "ts": e["ts"], "tag": e["tag"], "coll": e["coll"],
+                        "ctx": if meta { json!(format!("[só metadados · {}]", e["coll"].as_str().unwrap_or(""))) } else { e["ctx"].clone() },
+                        "meta": meta, "ms": e["ms"],
                         "ok": e["ok"], "finish": e["finish"],
-                        "system": corta(sys, 2000), "system_len": sys.chars().count(),
-                        "user": corta(user, 4000), "user_len": user.chars().count(),
-                        "resposta": corta(resp, 6000), "resposta_len": resp.chars().count(),
+                        "system": corta(sys, 2000), "system_len": len("system_len", sys),
+                        "user": corta(user, 4000), "user_len": len("user_len", user),
+                        "resposta": corta(resp, 6000), "resposta_len": len("resposta_len", resp),
                     })
                 }).collect();
             (200, json!({"file": path, "entries": entries}).to_string())
@@ -2101,7 +2198,7 @@ fn route(method: &Method, path: &str, query: &str, body: &str, st: &Arc<Mutex<St
             let amostra = match fetch_base_text(&api, &coll, &base) { Some(t) => cap_amostra(&t), None => return (404, json!({"error":"amostra sem texto (base não encontrada no ragd)"}).to_string()) };
             let lib = read_prompts(&dir);
             let (sys, _from) = template_system(&lib);
-            let (schema, regras) = match llm_make_template(&llm_url, &format!("molde-dirigido {coll}/{base} tipo={tipo}"), &sys, &tipo, &amostra, &instrucao) {
+            let (schema, regras) = match llm_make_template(&llm_url, &coll, &format!("molde-dirigido {coll}/{base} tipo={tipo}"), &sys, &tipo, &amostra, &instrucao) {
                 Ok(x) => x,
                 Err(e) => return (502, json!({"error": format!("L1 não criou o molde: {e}")}).to_string()),
             };
@@ -2775,7 +2872,7 @@ fn template_system(lib: &Value) -> (String, String) {
 }
 /// Fase 3 — o L1 cria o molde de um tipo a partir de UMA amostra. Structured output força
 /// `{schema:[...], regras:[{campo,regex,limpar}]}`. Devolve (schema_json, regras_json) como strings.
-fn llm_make_template(llm_url: &str, ctx: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
+fn llm_make_template(llm_url: &str, coll: &str, ctx: &str, sys: &str, tipo: &str, amostra: &str, instrucao: &str) -> Result<(String, String), String> {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -2802,7 +2899,7 @@ fn llm_make_template(llm_url: &str, ctx: &str, sys: &str, tipo: &str, amostra: &
         "temperature": 0, "max_tokens": 1200,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = llm_post("modelador", ctx, llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
+    let resp = llm_post("modelador", coll, ctx, llm_url, &body, 180).ok_or_else(|| "sem resposta (template)".to_string())?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
         .ok_or_else(|| format!("sem content (err={})", rv["error"].to_string().chars().take(120).collect::<String>()))?;
@@ -2875,7 +2972,7 @@ fn mine_templates(api: &str, llm_url: &str, ch_url: &str, lib: &Value, coll: &st
         }
     }
     let (sys, _from) = template_system(lib);
-    let (schema, regras) = match llm_make_template(llm_url, &format!("mineração {coll} tipo={tipo}"), &sys, &tipo, &amostra, "") {
+    let (schema, regras) = match llm_make_template(llm_url, coll, &format!("mineração {coll} tipo={tipo}"), &sys, &tipo, &amostra, "") {
         Ok(x) => x,
         Err(e) => {
             nlog(&format!("template {coll}/{tipo}: {e}"));
@@ -3027,7 +3124,7 @@ fn fetch_chunk0(api: &str, coll: &str, name: &str) -> Option<String> {
 
 /// Uma classificação por LLM com CONSTRAINED DECODING (json_schema/enum). temperature 0.
 /// Err carrega o motivo. Devolve (natureza, tipo).
-fn llm_classify(llm_url: &str, ctx: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
+fn llm_classify(llm_url: &str, coll: &str, ctx: &str, sys: &str, text: &str, naturezas: &[String], tipos: &[String])
     -> Result<(String, String), String>
 {
     let schema = json!({
@@ -3046,7 +3143,7 @@ fn llm_classify(llm_url: &str, ctx: &str, sys: &str, text: &str, naturezas: &[St
         "temperature": 0, "max_tokens": 40,
         "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}
     }).to_string();
-    let resp = llm_post("classificador", ctx, llm_url, &body, CLASSIFY_TIMEOUT_S)
+    let resp = llm_post("classificador", coll, ctx, llm_url, &body, CLASSIFY_TIMEOUT_S)
         .ok_or(format!("sem resposta (timeout {CLASSIFY_TIMEOUT_S}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -3066,7 +3163,7 @@ fn classify_base(api: &str, llm_url: &str, sys: &str, coll: &str, name: &str,
                  naturezas: &[String], tipos: &[String]) -> Result<(String, String, bool), String> {
     let text = fetch_chunk0(api, coll, name).ok_or_else(|| "sem-texto".to_string())?;
     let csv = tabular_spec(&text).is_some();
-    let (nat, tip) = llm_classify(llm_url, &format!("classe {coll}/{name}"), sys, &text, naturezas, tipos)?;
+    let (nat, tip) = llm_classify(llm_url, coll, &format!("classe {coll}/{name}"), sys, &text, naturezas, tipos)?;
     Ok((nat, tip, csv))
 }
 
@@ -3232,14 +3329,14 @@ fn classify_list_cli(cfg: &Config, path: &str) {
 
 /// Extrai os registros de UMA janela como array JSON. temperature 0. Reusa o salvage pra truncado.
 /// O chamador valida cada elemento (all-or-nothing).
-fn llm_extract_records(llm_url: &str, ctx: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
+fn llm_extract_records(llm_url: &str, coll: &str, ctx: &str, sys: &str, tipo: &str, text: &str) -> Result<Vec<Value>, String> {
     let sys_r = sys.replace("{tipo}", tipo);
     let body = json!({
         "messages": [{"role":"system","content":sys_r},{"role":"user","content":format!("DOCUMENTO:\n{text}")}],
         "temperature": 0, "max_tokens": EXTRACT_MAX_TOKENS
     }).to_string();
     let to = ((text.len() / 90) + (EXTRACT_MAX_TOKENS as usize / 10) + 90).min(400) as u32;
-    let resp = llm_post("extrator", ctx, llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
+    let resp = llm_post("extrator", coll, ctx, llm_url, &body, to).ok_or(format!("sem resposta (timeout {to}s)"))?;
     let rv: Value = serde_json::from_str(&resp).map_err(|_| format!("resposta não-JSON ({} bytes)", resp.len()))?;
     let truncated = rv["choices"][0]["finish_reason"].as_str() == Some("length");
     let content = rv["choices"][0]["message"]["content"].as_str()
@@ -3590,7 +3687,23 @@ fn main() {
     if Path::new(&cfg_path).exists() { load_cfg(&mut cfg, &cfg_path); } else { cfg.cfg_path = cfg_path.clone(); }
     // diário de mastigação do LLM: <dir>/llm-ledger.jsonl (todas as consultas/respostas de IA)
     let _ = std::fs::create_dir_all(&cfg.dir);
-    let _ = LLM_LEDGER.set(format!("{}/llm-ledger.jsonl", cfg.dir.trim_end_matches('/')));
+    let ledger_path = format!("{}/llm-ledger.jsonl", cfg.dir.trim_end_matches('/'));
+    // [#15] o diário pode ter conteúdo do corpus: fecha a permissão do que já existe (0600)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if Path::new(&ledger_path).exists() {
+            let _ = std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let _ = LLM_LEDGER.set(ledger_path);
+    let modo = if matches!(cfg.llm_ledger.as_str(), "full" | "meta" | "off") { cfg.llm_ledger.clone() }
+               else { eprintln!("config: llm_ledger={:?} inválido, usando full", cfg.llm_ledger); "full".to_string() };
+    let _ = LEDGER_CFG.set(LedgerCfg {
+        modo,
+        meta: cfg.llm_ledger_meta.split(',').map(|x| nfc(x.trim())).filter(|x| !x.is_empty()).collect(),
+        max_bytes: cfg.llm_ledger_max_mb.saturating_mul(1024 * 1024),
+        keep: cfg.llm_ledger_keep,
+    });
     // CLI sobrescreve
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -3673,5 +3786,92 @@ fn main() {
         resp.add_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
         cors_header(&mut resp);
         let _ = req.respond(resp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(modo: &str, meta: &[&str]) -> LedgerCfg {
+        LedgerCfg { modo: modo.into(), meta: meta.iter().map(|s| s.to_string()).collect(), max_bytes: 0, keep: 0 }
+    }
+
+    /// Política única do processo de teste (LEDGER_CFG é OnceLock): `sensivel` só em metadados,
+    /// gira acima de 100 bytes, mantém 2 girados.
+    fn cfg_teste() {
+        let _ = LEDGER_CFG.get_or_init(|| LedgerCfg { modo: "full".into(), meta: vec!["sensivel".into()], max_bytes: 100, keep: 2 });
+    }
+
+    /// [#15] de ponta a ponta: `llm_post` numa coleção marcada grava a linha SEM texto nenhum
+    /// (nem prompt, nem resposta, nem o rótulo com nome de base). Endpoint local que recusa a
+    /// conexão — nada sai da máquina.
+    #[test]
+    fn llm_post_colecao_marcada_nao_grava_texto() {
+        cfg_teste();
+        let dir = std::env::temp_dir().join(format!("nidhogg-ledger-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("llm-ledger.jsonl");
+        let _ = LLM_LEDGER.set(path.to_str().unwrap().to_string());
+        let body = json!({"messages": [{"role": "system", "content": "SEGREDO-SYS"},
+                                       {"role": "user", "content": "SEGREDO-USER documento"}]}).to_string();
+        let _ = llm_post("classificador", "sensivel", "classe sensivel/BASE-SECRETA", "http://127.0.0.1:9/x", &body, 2);
+        let txt = std::fs::read_to_string(LLM_LEDGER.get().unwrap()).unwrap();
+        assert!(!txt.contains("SEGREDO") && !txt.contains("BASE-SECRETA"), "{txt}");
+        let e: Value = serde_json::from_str(txt.lines().last().unwrap()).unwrap();
+        assert_eq!(e["meta"], json!(true));
+        assert_eq!(e["user_len"], json!(22));
+        assert_eq!(e["ok"], json!(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// [#15] quem grava só metadados: coleção listada, "*", modo meta — e L4 de escopo amplo
+    /// cai em metadados se QUALQUER coleção estiver marcada.
+    #[test]
+    fn ledger_regra_de_metadados() {
+        let c = cfg("full", &["sensivel"]);
+        assert!(ledger_so_meta(&c, "sensivel"));
+        assert!(!ledger_so_meta(&c, "livros"));
+        assert!(ledger_so_meta(&c, "*"));
+        assert!(ledger_so_meta(&c, ""));
+        assert!(!ledger_so_meta(&cfg("full", &[]), "*"));
+        assert!(ledger_so_meta(&cfg("full", &["*"]), "livros"));
+        assert!(ledger_so_meta(&cfg("meta", &[]), "livros"));
+    }
+
+    #[test]
+    fn fnv64_estavel() {
+        assert_eq!(fnv64(""), "cbf29ce484222325");
+        assert_eq!(fnv64("a"), "af63dc4c8601ec8c");
+        assert_ne!(fnv64("prompt 1"), fnv64("prompt 2"));
+    }
+
+    /// [#15] gira ao passar do limite, mantém só `keep` girados e o arquivo nasce 0600.
+    #[test]
+    fn ledger_gira_retem_e_fecha_permissao() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nidhogg-ledger-teste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("llm-ledger.jsonl");
+        let p = path.to_str().unwrap();
+        // girados "antigos" já existentes (carimbos fixos, ordenam antes de hoje)
+        for c in ["20200101-000000", "20200201-000000", "20200301-000000"] {
+            std::fs::write(dir.join(format!("llm-ledger-{c}.jsonl")), "x\n").unwrap();
+        }
+        cfg_teste();
+        let linha = "y".repeat(60);
+        ledger_append(p, &linha);   // 61 bytes
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        ledger_append(p, &linha);   // passaria de 100 → gira antes
+        let mut nomes: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
+            .map(|e| e.file_name().into_string().unwrap()).collect();
+        nomes.sort();
+        let girados: Vec<&String> = nomes.iter().filter(|n| n.starts_with("llm-ledger-")).collect();
+        assert_eq!(girados.len(), 2, "{nomes:?}");
+        assert_eq!(girados[0], "llm-ledger-20200301-000000.jsonl", "{nomes:?}");   // os 2 mais antigos saíram
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{linha}\n"));  // corrente recomeçou
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

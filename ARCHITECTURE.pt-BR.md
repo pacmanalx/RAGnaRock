@@ -310,6 +310,18 @@ TTL; **[FUTURO]** senha real). Abas:
 - **Dois dials ortogonais:** **nível** (profundidade) + **cadência** (segundos entre ciclos = orçamento
   de tempo).
 
+### 5.1.1 Diário de mastigação (`llm-ledger.jsonl`) — retenção e privacidade (#15)
+Toda chamada de IA (classificador, modelador, relações, analista, comparador) grava uma linha em
+`<dir>/llm-ledger.jsonl`, com prompt e resposta **completos**, ou seja, conteúdo do corpus. Por isso:
+- o arquivo é criado (e, no boot, corrigido) com permissão **0600**;
+- ao passar de `llm_ledger_max_mb` (padrão 20) ele **gira** para `llm-ledger-AAAAMMDD-HHMMSS.jsonl`,
+  e só os `llm_ledger_keep` (padrão 6) girados mais novos ficam no disco;
+- `llm_ledger_meta = colA,colB` faz essas coleções gravarem **só metadados**: papel, coleção, latência,
+  tamanhos e uma impressão digital (FNV-1a) do prompt e da resposta, sem texto nem nome de base. O L4
+  com escopo amplo (`*`) cai em metadados se qualquer coleção estiver marcada;
+- `llm_ledger = full | meta | off` vale para tudo (padrão `full`, o comportamento anterior).
+O ValHalla (`/api/nidhogg/llm_ledger`) lê o arquivo corrente; as entradas só de metadados aparecem sem texto.
+
 ### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
 
 > **Decisão (Pacman):** o Nidhogg é um **projeto autônomo**, um **analisador crítico**. O `ragd`
