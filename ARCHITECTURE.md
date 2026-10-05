@@ -308,10 +308,9 @@ TTL; **[FUTURE]** real password). Tabs:
   the same one N times). A keepalive pings `ragd` every 15s and caches it (status never does a live curl).
 - **Two orthogonal dials:** **level** (depth) + **cadence** (seconds between cycles = time budget).
 
-### 5.1.1 Digestion ledger (`llm-ledger.jsonl`) — retention and privacy (#15)
+### 5.1.1 Digestion ledger (`llm-ledger.jsonl`) — retention (#15)
 Every AI call (classifier, template maker, relations, analyst, comparator) writes one line to
-`<dir>/llm-ledger.jsonl` with the **full** prompt and answer, i.e. corpus content. Therefore:
-- the file is created (and fixed at boot) with mode **0600**;
+`<dir>/llm-ledger.jsonl` with the **full** prompt and answer. So it does not grow without bound:
 - past `llm_ledger_max_mb` (default 20) it **rotates** to `llm-ledger-YYYYMMDD-HHMMSS.jsonl`, and only the
   newest `llm_ledger_keep` (default 6) rotated files stay on disk;
 - `llm_ledger_meta = colA,colB` makes those collections write **metadata only**: role, collection,
