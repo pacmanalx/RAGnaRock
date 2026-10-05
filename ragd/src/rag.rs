@@ -411,7 +411,7 @@ impl RagBase {
         }
     }
 
-    fn query_vec(&self, query: &str) -> (HashMap<usize, f64>, f64, Vec<String>, usize) {
+    fn query_vec(&self, query: &str) -> (Vec<(usize, f64)>, f64, Vec<String>, usize) {
         let lower = query.to_lowercase();
         let mut tf: HashMap<usize, u32> = HashMap::new();
         let mut syls = vec![];
@@ -430,12 +430,15 @@ impl RagBase {
         // O chunk guarda tf CRU e norma tf-idf. Pra fechar o cosseno de verdade, a query sai
         // daqui com o idf DOBRADO (tf_q·idf²): `Σ (tf_q·idf)(tf_c·idf) = Σ (tf_q·idf²)·tf_c`.
         // A NORMA continua sendo a do vetor tf-idf honesto (‖tf_q·idf‖) — ver `cosine_tfidf`.
-        let mut qw2: HashMap<usize, f64> = HashMap::new();
+        // [#56] em ordem de dim: norma e dot somam sempre na mesma ordem (determinístico).
+        let mut dims: Vec<(usize, u32)> = tf.into_iter().collect();
+        dims.sort_unstable_by_key(|&(d, _)| d);
+        let mut qw2: Vec<(usize, f64)> = Vec::with_capacity(dims.len());
         let mut s = 0.0;
-        for (d, c) in &tf {
-            let idf = self.idf.get(d).copied().unwrap_or(0.0);
-            let w = *c as f64 * idf;
-            if w != 0.0 { qw2.insert(*d, w * idf); s += w * w; }
+        for (d, c) in dims {
+            let idf = self.idf.get(&d).copied().unwrap_or(0.0);
+            let w = c as f64 * idf;
+            if w != 0.0 { qw2.push((d, w * idf)); s += w * w; }
         }
         let qnorm = if s == 0.0 { 1.0 } else { s.sqrt() };
         (qw2, qnorm, syls, oov)
@@ -733,9 +736,13 @@ pub fn query_vec_unified(query: &str, p: &CollectionProfile) -> (HashMap<usize, 
     }
     // Mesmo esquema do `query_vec`: idf DOBRADO no lado da query (aqui o uidf, da coleção),
     // porque o chunk entra no dot com tf cru e o denominador é a norma tf-idf unificada.
+    // [#56] norma somada em ordem de dim global (a ordem do HashMap muda a cada processo).
+    // O cosseno unificado já é determinístico: ele percorre o `vec` do chunk, que é ordenado.
+    let mut dims: Vec<(usize, u32)> = tf.into_iter().collect();
+    dims.sort_unstable_by_key(|&(d, _)| d);
     let mut qw2: HashMap<usize, f64> = HashMap::new();
     let mut sum = 0.0;
-    for (&gd, &c) in &tf {
+    for (gd, c) in dims {
         let uidf = p.uidf.get(&gd).copied().unwrap_or(0.0);
         let w = c as f64 * uidf;
         if w != 0.0 { qw2.insert(gd, w * uidf); sum += w * w; }
@@ -868,6 +875,39 @@ mod tests {
         assert_eq!(p.uidf, uidf_ref);
         for (nome, ns) in &unorms_ref {
             for (x, y) in p.unorms[nome].iter().zip(ns) { assert!((x - y).abs() < 1e-12, "{nome}: {x} vs {y}"); }
+        }
+    }
+
+    /// [#56] a mesma busca dá o MESMO score, bit a bit, em todas as execuções. Cada HashMap novo
+    /// ganha uma semente própria (RandomState), então repetir a busca no mesmo processo já
+    /// sorteia a ordem de iteração — com a soma seguindo essa ordem, o cos variava na 16ª casa.
+    #[test]
+    fn busca_deterministica_bit_a_bit() {
+        let texto = "paralelepipedo borboleta caramelo abacaxi telefone maravilhosa";
+        let mut vocab: Vec<String> = vec![];
+        for w in words(texto) {
+            for sy in syllabify(&w) {
+                let ns = normalize(&sy);
+                if !ns.is_empty() && !vocab.contains(&ns) { vocab.push(ns); }
+            }
+        }
+        let refs: Vec<&str> = vocab.iter().map(|x| x.as_str()).collect();
+        let todas: Vec<usize> = (0..vocab.len()).collect();
+        let mut b = mk_base(&refs, &[&todas, &todas[..todas.len() / 2]]);
+        b.idf = (0..vocab.len()).map(|d| (d, 0.1 + (d as f64).sqrt() * 0.37)).collect();
+        for ch in &mut b.chunks { for (i, x) in ch.vec.iter_mut().enumerate() { x.1 = (i % 5 + 1) as f32; } }
+        let mut bases = HashMap::new();
+        bases.insert("a".to_string(), b);
+        let p = build_collection_profile(&bases);
+        let (h0, _) = bases["a"].search(texto, 5, false, 20, false, None);
+        let (_, n0) = query_vec_unified(texto, &p);
+        assert!(!h0.is_empty());
+        for _ in 0..300 {
+            let (h, _) = bases["a"].search(texto, 5, false, 20, false, None);
+            let got: Vec<(u64, usize)> = h.iter().map(|x| (x.3.to_bits(), x.4)).collect();
+            let want: Vec<(u64, usize)> = h0.iter().map(|x| (x.3.to_bits(), x.4)).collect();
+            assert_eq!(got, want);
+            assert_eq!(query_vec_unified(texto, &p).1.to_bits(), n0.to_bits());
         }
     }
 

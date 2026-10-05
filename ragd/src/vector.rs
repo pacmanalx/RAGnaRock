@@ -49,8 +49,12 @@ pub type SparseVec = Vec<(u32, f32)>;
 
 /// Norma L2 do vetor tf-idf (peso = count*idf). 0 -> 1.0 (igual ao Python).
 pub fn tfidf_norm(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> f64 {
+    // [#56] soma em ordem de dim (não na ordem do HashMap, sorteada por processo): a mesma
+    // entrada dá sempre a mesma norma, até o último bit.
+    let mut dims: Vec<(&usize, &u32)> = tf.iter().collect();
+    dims.sort_unstable_by_key(|(d, _)| **d);
     let mut s = 0.0;
-    for (d, c) in tf {
+    for (d, c) in dims {
         let w = *c as f64 * idf.get(d).copied().unwrap_or(0.0);
         s += w * w;
     }
@@ -76,9 +80,13 @@ pub fn tfidf_norm(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> f64 {
 /// memória contígua, em vez de sondar hash por entrada. O acumulador é `f64` de propósito:
 /// a contagem é inteira (exata em f32 até 2^24), então manter o dot em f64 deixa o ranking
 /// bit-a-bit igual ao do `HashMap<usize,f64>` — qualquer divergência vira sinal de bug.
-pub fn cosine_tfidf(qw2: &HashMap<usize, f64>, qn: f64, ctf: &SparseVec, cn: f64) -> f64 {
+///
+/// [#56] `qw2` chega como pares ORDENADOS por dim (de `query_vec`): o dot soma sempre na
+/// mesma ordem, e o cosseno sai igual em toda execução (com HashMap a ordem era sorteada
+/// por processo e o score variava na 16ª casa).
+pub fn cosine_tfidf(qw2: &[(usize, f64)], qn: f64, ctf: &SparseVec, cn: f64) -> f64 {
     let mut dot = 0.0_f64;
-    for (&d, &v) in qw2 {
+    for &(d, v) in qw2 {
         let key = d as u32;
         if let Ok(i) = ctf.binary_search_by_key(&key, |&(dim, _)| dim) {
             dot += v * ctf[i].1 as f64;
@@ -104,13 +112,15 @@ mod tests {
     use super::*;
 
     /// Monta (qw2, qnorm) do jeito que `query_vec` monta: idf dobrado no dot, norma honesta.
-    fn q_from(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> (HashMap<usize, f64>, f64) {
-        let mut qw2 = HashMap::new();
+    fn q_from(tf: &HashMap<usize, u32>, idf: &HashMap<usize, f64>) -> (Vec<(usize, f64)>, f64) {
+        let mut dims: Vec<(&usize, &u32)> = tf.iter().collect();
+        dims.sort_unstable_by_key(|(d, _)| **d);
+        let mut qw2 = Vec::new();
         let mut s = 0.0;
-        for (d, c) in tf {
+        for (d, c) in dims {
             let i = idf.get(d).copied().unwrap_or(0.0);
             let w = *c as f64 * i;
-            if w != 0.0 { qw2.insert(*d, w * i); s += w * w; }
+            if w != 0.0 { qw2.push((*d, w * i)); s += w * w; }
         }
         (qw2, if s == 0.0 { 1.0 } else { s.sqrt() })
     }
