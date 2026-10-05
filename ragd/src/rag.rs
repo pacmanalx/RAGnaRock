@@ -656,19 +656,20 @@ pub fn now_secs() -> u64 {
         .map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn collection_fingerprint(bases: &HashMap<String, RagBase>) -> (usize, usize) {
-    (bases.len(), bases.values().map(|b| b.chunks.len()).sum())
+pub fn collection_fingerprint<B: std::borrow::Borrow<RagBase>>(bases: &HashMap<String, B>) -> (usize, usize) {
+    (bases.len(), bases.values().map(|b| b.borrow().chunks.len()).sum())
 }
 
 /// Constrói o perfil unificado das bases de uma coleção. Determinístico: ordena bases
 /// por nome e sílabas por dim local — a mesma coleção gera sempre o mesmo perfil.
-pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionProfile {
+/// [#37] Aceita `RagBase` ou `Arc<RagBase>` (o mapa vivo do daemon guarda `Arc`).
+pub fn build_collection_profile<B: std::borrow::Borrow<RagBase>>(bases: &HashMap<String, B>) -> CollectionProfile {
     let mut uvocab: HashMap<String, usize> = HashMap::new();
     let mut remap: HashMap<String, Vec<usize>> = HashMap::new();
     let mut names: Vec<&String> = bases.keys().collect();
     names.sort();
     for name in &names {
-        let base = &bases[*name];
+        let base = bases[*name].borrow();
         let mut m = vec![0usize; base.index.len()];
         let mut pairs: Vec<(&String, usize)> = base.index.iter().map(|(s, &d)| (s, d)).collect();
         pairs.sort_by_key(|(_, d)| *d);
@@ -689,7 +690,7 @@ pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionP
     let mut n_docs = 0usize;
     for name in &names {
         let m = &remap[*name];
-        for ch in &bases[*name].chunks {
+        for ch in &bases[*name].borrow().chunks {
             n_docs += 1;
             for &(ld, _) in &ch.vec {
                 if let Some(&gd) = m.get(ld as usize) { df[gd] += 1; }
@@ -706,7 +707,7 @@ pub fn build_collection_profile(bases: &HashMap<String, RagBase>) -> CollectionP
     let mut unorms: HashMap<String, Vec<f64>> = HashMap::new();
     for name in &names {
         let m = &remap[*name];
-        let norms: Vec<f64> = bases[*name].chunks.iter().map(|ch| {
+        let norms: Vec<f64> = bases[*name].borrow().chunks.iter().map(|ch| {
             let mut s = 0.0;
             for &(ld, cnt) in &ch.vec {
                 if let Some(&gd) = m.get(ld as usize) {

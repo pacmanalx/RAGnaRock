@@ -210,23 +210,23 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
 - **Memory pressure:** the console measures RSS (`/proc/self/statm`) + text/vec/words estimate; measured:
   ~580 bases ≈ 516 MB (`memory`) → 174 MB (`hybrid`). [DONE]
 
-### 3.5 Concurrency
+### 3.5 Concurrency [DONE]
 
-- **Today:** global `Arc<Mutex<State>>` — every operation (read or write) competes for the same lock.
-  Measured throughput: ~500 req/s on an M-series Mac, ~65 on a 2-core x86, ~43 on a Raspberry Pi 3 (global search). [DONE]
-- **Why it's enough today:** the main use is **ONE AI, sequential** — no real contention. A Mutex works
-  well up to dozens of concurrent req/s.
-  - ⚠️ **Note (Kimi):** `rayon` parallelizes the scatter-gather, but the global `Mutex` **re-serializes**
-    internally — real parallelism only comes with the `RwLock`/per-collection lock below. It's a **[FUTURE]**
-    optimization of **the same priority** as on-disk reads in `hybrid`; not urgent with 1 sequential AI.
-- **`[FUTURE]` when it becomes multi-agent:**
-  - `Mutex<State>` → **`RwLock<State>`**: N **read-only searches** in parallel; `write()` only on
-    ingest/delete. (Codex's caveat: rerank in `hybrid` recomputes `words` — but that's a pure read, fits the
-    read-lock; it doesn't become a write.)
-  - **Per-collection granularity** (lock per collection, not global) → search collection A while ingesting into B.
-  - Careful: writer starvation if readers are continuous (use a fair `RwLock`).
-  - Codex suggests decoupling ingest×search via **channel/message** (lock-light) — keep that for if the RwLock
-    isn't enough; YAGNI before that.
+- **Outer lock:** `parking_lot::RwLock<State>` (fair, #6) — N read-only requests in parallel; `write()` only for
+  config/auth/driver changes and deletes.
+- **Bases and profiles have their own short locks (#37):** the base map is `BasesLock(RwLock<Arc<Bases>>)` with
+  `Arc<RagBase>` inside, and the per-collection profile cache stores `Arc<CollectionProfile>`. A search takes a
+  **snapshot** (clones pointers) and releases the lock at once, then runs on the snapshot however long it takes.
+  A writer copies the map shallowly (pointers only) and swaps it — it never waits for an in-flight search, so a
+  fair lock no longer queues new searches behind it.
+- **Two-phase ingest (#37):** `/ingest`, `/ingest_file` and uploads **prepare** with no lock (driver, tokenization,
+  JSON write, load — the seconds-long part; ingests only queue among themselves so two never write the same file)
+  and **commit** in microseconds under the outer READ lock (insert + invalidate only that collection's profile;
+  before, every ingest invalidated all of them). Profile rebuilds also happen outside the cache lock, one at a time.
+- **Measured (#37, Aron, 335 books, 8 concurrent clients, 5 MB books ingested into another collection):** search p50
+  during ingest 5.7 s → 1.1 s (= p50 without ingest); searches served in the window 64 → 119; answers byte-identical.
+- **Open:** tail latency with many concurrent global searches (nested `rayon` loops over bases and chunks share one
+  pool; seen with or without ingest) — tracked separately.
 
 ### 3.6 Language drivers [DONE]
 
