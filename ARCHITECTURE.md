@@ -334,6 +334,21 @@ compares the `ragd` bases with the previous cycle's (`bases_vistas` in `knowledg
 L0 itself (RootIndex/CorpusDict) stays collection-wide: the unified vocabulary and idf change with any base
 and cost two `ragd` calls. The expensive work (classify, extract, census) is already per base, via `state_hash`.
 
+### 5.1.3 Laya gatekeeper for L1 — recurring training (#53)
+A local decision model (Laya, Apache 2.0, mmBERT/MIT base) learns to answer "which type?" and "does it follow the type?"
+from the classes already stored, so bases it recognizes safely are classified without the LLM. Training is
+**recurring**, because the database is dynamic: `tools/laya_porteira/agendado.sh` runs on a schedule on Aron (user
+cron), fully local and offline (Laya base, packages and `SHA256SUMS` under `/dados/modelos/laya`).
+- Labels: `doc_class FINAL` (human re-typing wins); text = the first 1000 characters of chunk 0, the same the LLM
+  classifier sees.
+- Trigger: trains only with ≥ `--min-novos` new labels since the current model. Types with ≥ `--min-por-tipo` bases
+  are eligible; the rest are orphans (negatives in training, "must not accept" in evaluation).
+- Evaluation on a held-out set split by base. The new version is **promoted** only with zero wrong accepts (known and
+  orphans) and coverage ≥ the current model's on the same set. Each type is released only with minimum coverage and zero errors.
+- Output: `/dados/ragnarock/laya/versoes/<id>/` with `manifest.json` (released types, descriptions, thresholds,
+  metrics, hash); `atual` points to the champion; `historico.jsonl` records every run.
+- Use inside `nidhoggd` (ONNX in Rust, optional, off by default) reads the champion's `manifest.json`. **[FUTURE]**
+
 ### 5.2 Nature & consumption — Nidhogg is AUTONOMOUS; the reader is HUMAN
 
 > **Decision (owner):** Nidhogg is an **autonomous project**, a **critical analyzer**. `ragd` **NEVER**

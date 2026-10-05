@@ -1,0 +1,7 @@
+# Versões validadas na Aron (05/out/2026). Lista completa e travada: /dados/modelos/laya/requirements-lock.txt
+laya==0.3.24
+torch==2.14.1+cpu
+transformers==5.18.0
+safetensors==0.8.0
+tokenizers==0.23.2
+huggingface_hub==1.33.0

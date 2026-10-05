@@ -336,6 +336,21 @@ o Nidhogg compara as bases do `ragd` com as do ciclo anterior (`bases_vistas` no
 O L0 (RootIndex/CorpusDict) continua sendo da coleção inteira: vocabulário unificado e idf mudam com qualquer
 base e custam duas chamadas ao `ragd`. O trabalho caro (classificar, extrair, recensear) já é por base, pelo `state_hash`.
 
+### 5.1.3 Porteira Laya do L1 — treino recorrente (#53)
+Um modelo de decisão local (Laya, Apache 2.0, base mmBERT/MIT) aprende a responder "qual tipo?" e "segue o tipo?"
+a partir das classes já gravadas, para decidir sem LLM as bases que ele reconhece com segurança. O treino é
+**recorrente**, porque o banco é dinâmico: `tools/laya_porteira/agendado.sh` roda agendado na Aron (cron do usuário),
+todo local e offline (Laya base, pacotes e `SHA256SUMS` em `/dados/modelos/laya`).
+- Rótulos: `doc_class FINAL` (a re-tipagem humana prevalece); texto = os 1000 primeiros caracteres do chunk 0,
+  o mesmo que o classificador LLM vê.
+- Gatilho: só treina com ≥ `--min-novos` rótulos novos desde o modelo atual. Tipos com ≥ `--min-por-tipo` bases são
+  elegíveis; os demais entram como órfãos (negativos no treino, "não aceitar" na avaliação).
+- Avaliação num conjunto separado por base. **Promove** a versão nova só com zero aceito-errado (conhecidos e órfãos)
+  e cobertura ≥ à do modelo atual no mesmo conjunto. Cada tipo só é liberado com cobertura mínima e zero erro.
+- Saída: `/dados/ragnarock/laya/versoes/<id>/` com `manifest.json` (tipos liberados, descrições, limiares, métricas,
+  hash), `atual` aponta para a campeã, `historico.jsonl` registra toda execução.
+- O uso no `nidhoggd` (ONNX em Rust, opcional, desligado por padrão) lê o `manifest.json` da campeã. **[FUTURO]**
+
 ### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
 
 > **Decisão (Pacman):** o Nidhogg é um **projeto autônomo**, um **analisador crítico**. O `ragd`
