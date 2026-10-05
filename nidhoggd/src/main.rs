@@ -247,7 +247,7 @@ static LLM_LEDGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// [#15] Política do diário. O arquivo guarda prompt e resposta COMPLETOS — ou seja, conteúdo
 /// do corpus —, então: (1) coleções listadas em `llm_ledger_meta` (ou tudo, com
 /// `llm_ledger = meta`) gravam só metadados (papel, coleção, latência, tamanhos e uma
-/// impressão digital do prompt/resposta, sem texto); (2) o arquivo nasce 0600; (3) ao passar
+/// impressão digital do prompt/resposta, sem texto); (2) ao passar
 /// de `llm_ledger_max_mb` ele gira para `llm-ledger-AAAAMMDD-HHMMSS.jsonl` e só os
 /// `llm_ledger_keep` girados mais novos ficam. `/api/nidhogg/llm_ledger` lê o corrente.
 struct LedgerCfg { modo: String, meta: Vec<String>, max_bytes: u64, keep: usize }
@@ -275,13 +275,12 @@ fn fnv64(s: &str) -> String {
 /// Grava uma linha no diário, girando antes se o arquivo passou do limite.
 fn ledger_append(path: &str, linha: &str) {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = LEDGER_CFG.get() {
         let tam = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if c.max_bytes > 0 && tam > 0 && tam + linha.len() as u64 > c.max_bytes { ledger_girar(path, c.keep); }
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{linha}");
     }
 }
@@ -3688,13 +3687,6 @@ fn main() {
     // diário de mastigação do LLM: <dir>/llm-ledger.jsonl (todas as consultas/respostas de IA)
     let _ = std::fs::create_dir_all(&cfg.dir);
     let ledger_path = format!("{}/llm-ledger.jsonl", cfg.dir.trim_end_matches('/'));
-    // [#15] o diário pode ter conteúdo do corpus: fecha a permissão do que já existe (0600)
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if Path::new(&ledger_path).exists() {
-            let _ = std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
     let _ = LLM_LEDGER.set(ledger_path);
     let modo = if matches!(cfg.llm_ledger.as_str(), "full" | "meta" | "off") { cfg.llm_ledger.clone() }
                else { eprintln!("config: llm_ledger={:?} inválido, usando full", cfg.llm_ledger); "full".to_string() };
@@ -3847,10 +3839,9 @@ mod tests {
         assert_ne!(fnv64("prompt 1"), fnv64("prompt 2"));
     }
 
-    /// [#15] gira ao passar do limite, mantém só `keep` girados e o arquivo nasce 0600.
+    /// [#15] gira ao passar do limite e mantém só `keep` girados.
     #[test]
-    fn ledger_gira_retem_e_fecha_permissao() {
-        use std::os::unix::fs::PermissionsExt;
+    fn ledger_gira_e_retem() {
         let dir = std::env::temp_dir().join(format!("nidhogg-ledger-teste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3863,7 +3854,6 @@ mod tests {
         cfg_teste();
         let linha = "y".repeat(60);
         ledger_append(p, &linha);   // 61 bytes
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         ledger_append(p, &linha);   // passaria de 100 → gira antes
         let mut nomes: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
             .map(|e| e.file_name().into_string().unwrap()).collect();
