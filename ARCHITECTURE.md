@@ -347,7 +347,14 @@ cron), fully local and offline (Laya base, packages and `SHA256SUMS` under `/dad
   orphans) and coverage ≥ the current model's on the same set. Each type is released only with minimum coverage and zero errors.
 - Output: `/dados/ragnarock/laya/versoes/<id>/` with `manifest.json` (released types, descriptions, thresholds,
   metrics, hash); `atual` points to the champion; `historico.jsonl` records every run.
-- Use inside `nidhoggd` (ONNX in Rust, optional, off by default) reads the champion's `manifest.json`. **[FUTURE]**
+- On promotion the version is exported (`exporta.py`): `onnx/laya.onnx`, `rust.json` (special tokens, temperatures,
+  limits) and `paridade.json` (reference decisions from the official Laya). Classes with origin `laya` never enter training.
+- **Use inside `nidhoggd`** (optional; without `laya_dir` nothing changes): `laya_dir = /dados/ragnarock/laya/atual`,
+  `laya_ort_lib = <libonnxruntime.so>` (the training environment's; nothing is downloaded), `laya_threads`. Pure-Rust
+  inference (`ort` crate with the library loaded dynamically + `tokenizers`); the sequence reproduces Laya's token by token.
+  In `mine_classes`, before the LLM: spreadsheets skip it; it chooses among `tipos` and accepts only a `liberado` type
+  with confidence and "follows" above thresholds → class with origin `laya`; the rest goes to the LLM as before. It reloads
+  itself when `atual` changes. `nidhoggd --laya-check <version>` proves parity against `paridade.json`.
 
 ### 5.2 Nature & consumption — Nidhogg is AUTONOMOUS; the reader is HUMAN
 

@@ -71,7 +71,9 @@ def fonte_producao(ch_url, ragd):
     docs = []
     for l in corpo.splitlines():
         r = json.loads(l)
-        if r["tipo"] in FORA:
+        # FORA não é tipo; `laya` é a própria porteira — treinar nas próprias respostas a faria
+        # reforçar os próprios erros. Só LLM e humano ensinam.
+        if r["tipo"] in FORA or r["origem"] == "laya":
             continue
         req = json.dumps({"collection": r["collection"], "base": r["name"], "id": 0}).encode()
         try:
@@ -147,12 +149,16 @@ def variacoes(txt, rnd):
     return [txt, "\n".join([ls[0]] + corpo), "\n".join(l.lower() for l in corpo)]
 
 
+PERGUNTA_CHOICE = "Que tipo de documento é este?"
+PERGUNTA_SEGUE = "Este documento é um(a) {desc}?"     # o nidhoggd lê as duas do manifest
+
+
 def q_choice(tipos, desc):
-    return {"type": "choice", "instructions": "Que tipo de documento é este?", "criteria": {t: desc[t] for t in tipos}}
+    return {"type": "choice", "instructions": PERGUNTA_CHOICE, "criteria": {t: desc[t] for t in tipos}}
 
 
 def q_segue(t, desc):
-    return {"type": "noul", "instructions": f"Este documento é um(a) {desc[t]}?"}
+    return {"type": "noul", "instructions": PERGUNTA_SEGUE.replace("{desc}", desc[t])}
 
 
 def monta_itens(treino, elegiveis, desc, base, rnd):
@@ -322,6 +328,7 @@ def ciclo(a):
     man = {"versao": vid, "criado": reg["at"], "base": str(a.base), "fonte": a.fonte.split(":")[0],
            "tipos": elegiveis, "liberados": liberados, "descricoes": {t: desc[t] for t in elegiveis},
            "limiares": {"confianca": LIM_CONF, "segue": LIM_SEGUE}, "max_chars": MAX_CHARS,
+           "perguntas": {"choice": PERGUNTA_CHOICE, "segue": PERGUNTA_SEGUE},
            "regra": "choice entre `tipos`; aceita só se o escolhido está em `liberados`, confiança >= limiar e "
                     "'segue o tipo?' >= limiar; planilha (regra do tabular_spec) não passa pela porteira",
            "avaliacao": desafiante, "avaliacao_todos_os_tipos": bruto, "campea_no_mesmo_conjunto": campea, "n_treino": len(treino),
@@ -329,11 +336,22 @@ def ciclo(a):
            "hash_modelo": hash_arquivo(out / "model.safetensors")}
     json.dump(man, open(out / "manifest.json", "w"), ensure_ascii=False, indent=1)
     if seguro and melhor and liberados:
-        tmp = dirp / "atual.tmp"
-        tmp.unlink(missing_ok=True)
-        tmp.symlink_to(Path("versoes") / vid)
-        os.replace(tmp, dirp / "atual")
-        reg["decisao"] = f"PROMOVIDA {vid}: liberados {liberados}"
+        # exporta ANTES de apontar `atual`: o nidhoggd só usa versão exportada (ONNX + rust.json +
+        # paridade.json), e não pode ver o symlink trocar para uma versão sem grafo
+        try:
+            import exporta
+            if not (out / "onnx" / "laya.onnx").exists():
+                exporta.exporta_onnx(out)
+            tok, cfg = exporta.rust_json(out)
+            casos = exporta.paridade(out, tok, cfg, random.Random(53).sample(aval, min(40, len(aval))))
+            log(f"{vid} exportada para o nidhoggd (onnx + rust.json + paridade de {len(casos)} casos)")
+            tmp = dirp / "atual.tmp"
+            tmp.unlink(missing_ok=True)
+            tmp.symlink_to(Path("versoes") / vid)
+            os.replace(tmp, dirp / "atual")
+            reg["decisao"] = f"PROMOVIDA {vid}: liberados {liberados}"
+        except Exception as e:
+            reg["decisao"] = f"reprovada {vid}: exportação falhou ({e}) — campeã mantida"
     else:
         motivo = "aceitou errado" if not seguro else ("cobertura abaixo da campeã" if not melhor else "nenhum tipo liberado")
         reg["decisao"] = f"reprovada {vid}: {motivo} — campeã mantida"

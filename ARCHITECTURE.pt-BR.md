@@ -349,7 +349,14 @@ todo local e offline (Laya base, pacotes e `SHA256SUMS` em `/dados/modelos/laya`
   e cobertura ≥ à do modelo atual no mesmo conjunto. Cada tipo só é liberado com cobertura mínima e zero erro.
 - Saída: `/dados/ragnarock/laya/versoes/<id>/` com `manifest.json` (tipos liberados, descrições, limiares, métricas,
   hash), `atual` aponta para a campeã, `historico.jsonl` registra toda execução.
-- O uso no `nidhoggd` (ONNX em Rust, opcional, desligado por padrão) lê o `manifest.json` da campeã. **[FUTURO]**
+- Na promoção, a versão é exportada (`exporta.py`): `onnx/laya.onnx`, `rust.json` (tokens especiais, temperaturas, limites)
+  e `paridade.json` (decisões de referência do Laya oficial). Classes com origem `laya` não entram no treino.
+- **Uso no `nidhoggd`** (opcional; sem `laya_dir` nada muda): `laya_dir = /dados/ragnarock/laya/atual`,
+  `laya_ort_lib = <libonnxruntime.so>` (a do ambiente de treino; nada é baixado), `laya_threads`. Inferência em Rust
+  puro (crate `ort` com a biblioteca carregada dinamicamente + `tokenizers`); a sequência reproduz a do Laya token a token.
+  No `mine_classes`, antes do LLM: planilha não passa; escolhe entre os `tipos`, aceita só tipo `liberado` com confiança
+  e "segue" acima dos limiares → classe com origem `laya`; o resto vai ao LLM como antes. Recarrega sozinho quando `atual` muda.
+  `nidhoggd --laya-check <versão>` prova a paridade com o `paridade.json`.
 
 ### 5.2 Natureza & consumo — o Nidhogg é AUTÔNOMO; o leitor é HUMANO
 
