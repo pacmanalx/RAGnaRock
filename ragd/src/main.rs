@@ -3919,9 +3919,6 @@ rotas:
 mod testes_dicionario {
     use super::*;
 
-    /// O caso "sword" (05/out/2026): o ENEN tem dezenas de sinônimos em inglês, quase todos fora
-    /// do corpus; o ENPT traz "espada". Intercalando os dicionários e filtrando pelo corpus antes
-    /// do corte, "espada" entra; os de fora vão para `descartadas`.
     #[test]
     fn array_cortado_aproveita_strings_completas() {
         let v = super::parse_str_array(r#"["casa assombrada", "casa \"fantasma\"", "morad"#);
@@ -3929,6 +3926,9 @@ mod testes_dicionario {
         assert_eq!(super::parse_str_array(r#"["a", "b"]"#), vec!["a".to_string(), "b".to_string()]);
     }
 
+    /// O caso "sword" (05/out/2026): o ENEN tem dezenas de sinônimos em inglês, quase todos fora
+    /// do corpus; o ENPT traz "espada". Intercalando os dicionários e filtrando pelo corpus antes
+    /// do corte, "espada" entra; os de fora vão para `descartadas`.
     #[test]
     fn dicionarios_intercalados_e_filtrados_pelo_corpus() {
         let mut map: HashMap<String, Vec<(bool, Vec<String>)>> = HashMap::new();
@@ -3942,5 +3942,65 @@ mod testes_dicionario {
         // "espada" veio do dicionário de TRADUÇÃO (de "sword"); "blade" é sinônimo da mesma língua
         assert_eq!(trad.get("espada").map(String::as_str), Some("sword"));
         assert!(!trad.contains_key("blade"));
+    }
+}
+
+/// #50 — roteamento dos drivers de ingestão: o MIME decide os binários; quando o MIME é cego
+/// (text/plain, octet-stream, vazio), a extensão do arquivo decide; áudio é família.
+#[cfg(test)]
+mod testes_ingestao {
+    use super::*;
+
+    /// Uma pasta POR TESTE: os testes rodam em paralelo e um apagaria a pasta do outro.
+    fn pasta_com_drivers(teste: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ragd-ingestors-{}-{teste}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for k in ["csv", "xlsx", "docx", "pptx", "pdf", "audio"] {
+            std::fs::write(d.join(format!("{k}.py")), "").unwrap();
+        }
+        d
+    }
+
+    fn driver(d: &std::path::Path, mime: &str, arquivo: &str) -> Option<String> {
+        resolve_ingestor(d.to_str().unwrap(), mime, arquivo)
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn mime_decide_os_binarios() {
+        let d = pasta_com_drivers("mime_decide_os_binarios");
+        let x = "application/vnd.openxmlformats-officedocument.";
+        assert_eq!(driver(&d, "application/pdf", "x.bin").as_deref(), Some("pdf.py"));
+        assert_eq!(driver(&d, &format!("{x}spreadsheetml.sheet"), "x").as_deref(), Some("xlsx.py"));
+        assert_eq!(driver(&d, &format!("{x}wordprocessingml.document"), "x").as_deref(), Some("docx.py"));
+        assert_eq!(driver(&d, &format!("{x}presentationml.presentation"), "x").as_deref(), Some("pptx.py"));
+        assert_eq!(driver(&d, "text/csv; charset=utf-8", "x").as_deref(), Some("csv.py"));
+        assert_eq!(driver(&d, "audio/ogg", "recado").as_deref(), Some("audio.py"));
+        // MIME vence a extensão: um PDF com nome .csv continua PDF
+        assert_eq!(driver(&d, "APPLICATION/PDF", "planilha.csv").as_deref(), Some("pdf.py"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn extensao_decide_quando_o_mime_e_cego() {
+        let d = pasta_com_drivers("extensao_decide_quando_o_mime_e_cego");
+        for mime in ["text/plain", "application/octet-stream", ""] {
+            assert_eq!(driver(&d, mime, "dados.CSV").as_deref(), Some("csv.py"), "{mime}");
+            assert_eq!(driver(&d, mime, "deck.pptx").as_deref(), Some("pptx.py"), "{mime}");
+            // recado de WhatsApp chega .opus (Android) ou .m4a (iOS), quase sempre octet-stream
+            assert_eq!(driver(&d, mime, "recado.opus").as_deref(), Some("audio.py"), "{mime}");
+            assert_eq!(driver(&d, mime, "recado.M4A").as_deref(), Some("audio.py"), "{mime}");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn sem_driver_o_corpo_vira_texto() {
+        let d = pasta_com_drivers("sem_driver_o_corpo_vira_texto");
+        assert_eq!(driver(&d, "text/plain", "notas.txt"), None);      // texto puro: sem driver
+        assert_eq!(driver(&d, "text/plain", "sem_extensao"), None);
+        assert_eq!(driver(&d, "application/msword", "velho.doc"), None);   // .doc sem driver instalado
+        assert_eq!(driver(&d, "video/mp4", "filme.mp4"), None);       // vídeo fica de fora de propósito
+        std::fs::remove_dir_all(&d).ok();
     }
 }
