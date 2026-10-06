@@ -127,6 +127,30 @@ decisão de conteúdo, e ela fica no cabeçalho dele:
   `slide7.xml` na quarta posição, e ordenar por nome contaria a história na sequência errada.
   Único driver de arquivo **sem dependência fora da stdlib** (`.pptx` é ZIP de XML).
 
+## Testes (#50)
+
+Três camadas, dos drivers de ARQUIVO (csv, xlsx, docx, pptx, pdf, audio). Os de banco ficam de fora por ora.
+
+```bash
+python3 -m unittest discover -s ingestors/tests -v   # 1. cada driver, como o ragd o chama
+cargo test --release testes_ingestao                 # 2. roteamento MIME/extensão → driver (em ragd/)
+tools/e2e_ingest.sh [--audio recado.m4a --audio-palavra X]   # 3. ponta a ponta, no servidor
+```
+
+1. **`ingestors/tests/`** — `python3 <driver>` com o payload no stdin e `PYTHONSAFEPATH=1`, igual ao
+   `run_ingestor`. Os exemplos são **gerados em código** (`fixtures.py`, nada binário versionado): csv com
+   `;` e BOM, xlsx com aba vazia, docx com tabela, pptx com ordem de slides, runs picados, tabela e nota,
+   pdf com acentos e página sem texto. Cobre também as recusas (vazio, lixo, `.doc`/`.ppt` antigos, pdf só
+   de imagem, ffmpeg/whisper ausentes). Sem openpyxl/python-docx/pypdf/ffmpeg, o teste é **pulado** com o
+   motivo; no servidor, todos rodam. A transcrição de verdade roda com `RAG_TEST_AUDIO=<arquivo>`.
+2. **`testes_ingestao`** (ragd) — MIME decide os binários e vence a extensão; text/plain, octet-stream e
+   MIME vazio caem na extensão; `.opus`/`.m4a` viram `audio`; `.txt`, `.doc` sem driver e vídeo não
+   resolvem driver.
+3. **`tools/e2e_ingest.sh`** — sobe um ragd **descartável** (porta 11595, pasta temporária; nada da
+   produção é gravado), manda cada formato pelo `POST /ingest_any`, confere o `driver` da resposta e que a
+   **busca acha a palavra-âncora** do arquivo na base criada. Derruba tudo no fim; exit ≠ 0 se algum caso
+   falhar. Usa o binário e os drivers instalados em `/opt/ragnarock` (troque com `--ragd`/`--ingestors`).
+
 ## Fronteira (não confundir)
 
 Isto é o **driver de ingestão** — dado entra, RAGnaRock é *cliente* da fonte. **Não** é a interface
