@@ -1048,6 +1048,25 @@ fn parse_str_array(s: &str) -> Vec<String> {
             }
         }
     }
+    // array cortado pelo teto de tokens (`["a", "b", "c…`): aproveita as strings COMPLETAS
+    if let Some(a) = s.find('[') {
+        let mut out = Vec::new();
+        let mut it = s[a + 1..].chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '"' { continue; }
+            let mut cur = String::new();
+            let mut fechou = false;
+            while let Some(d) = it.next() {
+                match d {
+                    '\\' => { if let Some(e) = it.next() { cur.push(e); } }
+                    '"' => { fechou = true; break; }
+                    _ => cur.push(d),
+                }
+            }
+            if fechou && !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+        }
+        return out;
+    }
     vec![]
 }
 
@@ -1062,7 +1081,7 @@ fn llm_expand(provider: &str, key: &str, local_url: &str, query: &str) -> Result
     let (url, model, headers, body) = match provider {
         "openai" => ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini",
             vec![format!("Authorization: Bearer {key}")],
-            json!({"model": "gpt-4o-mini", "temperature": 0.3,
+            json!({"model": "gpt-4o-mini", "temperature": 0.3, "max_tokens": 300,
                    "messages": [{"role": "user", "content": prompt}]}).to_string()),
         "anthropic" => ("https://api.anthropic.com/v1/messages", "claude-3-5-haiku-20241022",
             vec![format!("x-api-key: {key}"), "anthropic-version: 2023-06-01".into()],
@@ -1072,7 +1091,8 @@ fn llm_expand(provider: &str, key: &str, local_url: &str, query: &str) -> Result
         // Mesmo formato de request/response do openai — o parsing reaproveita choices[0].message.content.
         "local" => (local_url, "local",
             vec![],
-            json!({"model": "local", "temperature": 0.3, "stream": false,
+            // max_tokens: sem ele o modelo local gerou 3.500+ tokens (~2 min) numa expansão (06/out)
+            json!({"model": "local", "temperature": 0.3, "stream": false, "max_tokens": 300,
                    "messages": [{"role": "user", "content": prompt}]}).to_string()),
         _ => return Err("provider inválido".into()),
     };
@@ -1339,6 +1359,10 @@ fn busca(body: &str, st: &State) -> (u16, String) {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v, Err(e) => return (400, json!({"error": format!("JSON inválido: {e}")}).to_string()),
     };
+    // páginas e trilha profunda (IA local) — só entram quando pedidas
+    if v.get("page").is_some() || deep_modo(&v) != DeepModo::Off {
+        return busca_paginada(&v, st);
+    }
     let phon = v["phonetic"].as_bool().unwrap_or(false);
     if v["expand"].as_bool().unwrap_or(false) {
         return com_via(search_expand(body, st), phon);
@@ -1353,6 +1377,268 @@ fn busca(body: &str, st: &State) -> (u16, String) {
     }
     rv["via"] = json!(via);
     (200, rv.to_string())
+}
+
+// ───────────────────────── busca em páginas + trilha profunda (IA local) ─────────────────────────
+// Decisão do mantenedor (06/out/2026): a IA local entende tradução e contexto ("white whale" →
+// "baleia branca", "baleia de Moby Dick"), mas é lenta (2–5 s) — o desempenho importa até a
+// PÁGINA 2. Então:
+//   • páginas 1 e 2 = trilha RÁPIDA (o modo pedido: léxico ou expansão), nunca esperam a IA e
+//     não mudam depois de mostradas;
+//   • numa busca COMPLEXA, a 1ª chamada dispara a IA em SEGUNDO PLANO (uma chamada por vez,
+//     com teto de tokens e de tempo) e guarda as variantes;
+//   • da página 3 em diante, a busca espera a IA (até `deep_wait_s`) e junta os resultados das
+//     variantes dela, sem repetir o que já saiu nas páginas 1 e 2.
+// Página = k resultados. `deep`: false (padrão na API — Nidhogg/MCP não disparam IA por engano),
+// "auto" (só busca complexa) ou true (sempre).
+#[derive(PartialEq, Clone, Copy)]
+enum DeepModo { Off, Auto, Sempre }
+fn deep_modo(v: &Value) -> DeepModo {
+    match &v["deep"] {
+        Value::Bool(true) => DeepModo::Sempre,
+        Value::String(s) if s == "auto" => DeepModo::Auto,
+        Value::String(s) if s == "true" => DeepModo::Sempre,
+        _ => DeepModo::Off,
+    }
+}
+
+#[derive(Clone)]
+enum DeepEstado { Pendente, Pronto(Vec<String>), Falhou(String) }
+fn deep_cache() -> &'static Mutex<HashMap<String, DeepEstado>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, DeepEstado>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Uma chamada à IA por vez (a GPU da Aron já caiu em uso pesado).
+static DEEP_UMA_VEZ: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const DEEP_FILA_MAX: usize = 4;
+/// Páginas com resultados da IA (depois das 2 rápidas): 3..=12.
+const DEEP_PAGINAS: usize = 10;
+/// Lista já montada das páginas 3+ (chave = corpo da busca sem `page`): a pág. 3 monta, as
+/// seguintes só fatiam. Só entra quando a IA terminou (pronta ou falhou) — lista definitiva.
+fn deep_listas() -> &'static Mutex<HashMap<String, Vec<Value>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, Vec<Value>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+const DEEP_LISTAS_MAX: usize = 64;
+
+/// Variantes da IA: traduções da consulta inteira e reformulações NO SENTIDO dela. Filtra o que o
+/// modelo inventa fora do pedido (texto explicativo, escrita não latina — medido: "arma锋利和防护").
+fn llm_deep(provider: &str, key: &str, local_url: &str, query: &str) -> Result<Vec<String>, String> {
+    let prompt = format!(
+        "Você expande consultas para um motor de busca LÉXICO (casa palavras) sobre um acervo em português, \
+         inglês e espanhol. Dada a CONSULTA, gere de 4 a 8 variantes curtas que achem o MESMO assunto: a \
+         tradução da consulta inteira para português, inglês e espanhol, e sinônimos no SENTIDO desta consulta \
+         (ex.: 'white whale' é a baleia branca de Moby Dick, não pessoas brancas). Não explique nem diga o \
+         idioma. Responda APENAS com um array JSON de strings.\n\nCONSULTA: {query}");
+    let (url, headers, body) = match provider {
+        "local" => (local_url.to_string(), vec![],
+            json!({"model": "local", "temperature": 0.0, "stream": false, "max_tokens": 200,
+                   "messages": [{"role": "user", "content": prompt}]}).to_string()),
+        "openai" => ("https://api.openai.com/v1/chat/completions".to_string(), vec![format!("Authorization: Bearer {key}")],
+            json!({"model": "gpt-4o-mini", "temperature": 0.2, "max_tokens": 200,
+                   "messages": [{"role": "user", "content": prompt}]}).to_string()),
+        "anthropic" => ("https://api.anthropic.com/v1/messages".to_string(),
+            vec![format!("x-api-key: {key}"), "anthropic-version: 2023-06-01".into()],
+            json!({"model": "claude-3-5-haiku-20241022", "max_tokens": 200,
+                   "messages": [{"role": "user", "content": prompt}]}).to_string()),
+        _ => return Err("sem provider de IA".into()),
+    };
+    let mut cmd = std::process::Command::new("wget");
+    cmd.args(["-q", "-O", "-", "--content-on-error", "--timeout=30", "--tries=1"]);
+    cmd.arg("--header=Content-Type: application/json");
+    for h in &headers { cmd.arg(format!("--header={h}")); }
+    cmd.arg(format!("--post-data={body}")).arg(&url);
+    let t0 = Instant::now();
+    let out = cmd.output().map_err(|e| format!("wget: {e}"))?;
+    let rv: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap_or(Value::Null);
+    let content = match provider {
+        "anthropic" => rv["content"][0]["text"].as_str(),
+        _ => rv["choices"][0]["message"]["content"].as_str(),
+    }.unwrap_or("");
+    let latino = |s: &str| s.chars().all(|c| c.is_ascii() || ('\u{00C0}'..='\u{024F}').contains(&c));
+    let meta = ["português", "portugues", "inglês", "ingles", "espanhol", "english", "spanish", "español", "outras línguas", "tradução"];
+    let mut vistas: HashSet<String> = HashSet::new();
+    vistas.insert(query.to_lowercase());
+    let vars: Vec<String> = parse_str_array(content).into_iter()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty() && x.chars().count() <= 80 && latino(x))
+        .filter(|x| { let l = x.to_lowercase(); !meta.iter().any(|m| l.contains(m)) })
+        .filter(|x| vistas.insert(x.to_lowercase()))
+        .take(8).collect();
+    slog(&format!("   │  🧠 deep {query:?} ({:.0} ms) → {vars:?}", t0.elapsed().as_secs_f64() * 1000.0));
+    if vars.is_empty() { Err(format!("sem variantes úteis: {}", content.chars().take(100).collect::<String>())) } else { Ok(vars) }
+}
+
+/// Dispara a IA em segundo plano para `query` (se ainda não há resultado nem chamada pendente).
+fn deep_dispara(st: &State, query: &str) -> DeepEstado {
+    let chave = normalize_query(query);
+    {
+        let mut c = deep_cache().lock();
+        if let Some(e) = c.get(&chave) { return e.clone(); }
+        let pendentes = c.values().filter(|e| matches!(e, DeepEstado::Pendente)).count();
+        if pendentes >= DEEP_FILA_MAX { return DeepEstado::Falhou("fila da IA cheia".into()); }
+        c.insert(chave.clone(), DeepEstado::Pendente);
+    }
+    let provider = st.active_provider.clone();
+    let key = match provider.as_str() { "anthropic" => st.anthropic_key.clone(), "openai" => st.openai_key.clone(), _ => String::new() };
+    let url = st.local_url.clone();
+    let q = query.to_string();
+    thread::spawn(move || {
+        let _uma = DEEP_UMA_VEZ.lock().unwrap_or_else(|e| e.into_inner());
+        let est = match llm_deep(&provider, &key, &url, &q) { Ok(v) => DeepEstado::Pronto(v), Err(e) => DeepEstado::Falhou(e) };
+        deep_cache().lock().insert(chave, est);
+    });
+    DeepEstado::Pendente
+}
+
+/// Busca é "complexa" (vale a IA no modo auto): 2+ palavras de conteúdo, ou trilha rápida fraca.
+/// Conteúdo = 2+ sílabas OU 4+ letras (em inglês "sword", "shield" são monossílabas).
+fn busca_complexa(query: &str, hits: &[Value]) -> bool {
+    let conteudo = query.split_whitespace()
+        .filter(|w| w.chars().filter(|c| c.is_alphanumeric()).count() >= 4
+            || tokenizer::syllabify(&w.to_lowercase()).iter().filter(|s| !tokenizer::normalize(s).is_empty()).count() >= 2)
+        .count();
+    let topo = hits.first().map(|h| h["coverage"].as_f64().or_else(|| h["matchpoint"].as_f64()).unwrap_or(0.0)).unwrap_or(0.0);
+    conteudo >= 2 || topo < 0.999
+}
+
+/// Ranking da trilha RÁPIDA com `n` resultados (o modo pedido). Devolve (hits, resposta completa).
+fn trilha_rapida(v: &Value, st: &State, n: usize) -> Result<(Vec<Value>, Value), (u16, String)> {
+    let mut b = v.clone();
+    b["k"] = json!(n);
+    if let Some(o) = b.as_object_mut() { o.remove("page"); o.remove("deep"); o.remove("deep_wait_s"); }
+    let corpo = b.to_string();
+    let phon = v["phonetic"].as_bool().unwrap_or(false);
+    let (code, res) = if v["expand"].as_bool().unwrap_or(false) { com_via(search_expand(&corpo, st), phon) } else { busca(&corpo, st) };
+    if code != 200 { return Err((code, res)); }
+    let rv: Value = serde_json::from_str(&res).map_err(|e| (500u16, json!({"error": e.to_string()}).to_string()))?;
+    Ok((rv["hits"].as_array().cloned().unwrap_or_default(), rv))
+}
+
+fn busca_paginada(v: &Value, st: &State) -> (u16, String) {
+    let query = v["query"].as_str().unwrap_or("").to_string();
+    let k = v["k"].as_u64().unwrap_or(5).clamp(1, 100) as usize;
+    let page = v["page"].as_u64().unwrap_or(1).clamp(1, 50) as usize;
+    let modo = deep_modo(v);
+    let espera = v["deep_wait_s"].as_u64().unwrap_or(15).min(60);
+    // trilha rápida: SEMPRE a mesma lista de 2k para as páginas 1 e 2 (pedir mais resultados faz
+    // cada base reordenar mais candidatos e pode mudar o topo — medido: a pág. 3 repetia um hit)
+    let (rapida, resp) = match trilha_rapida(v, st, 2 * k) { Ok(x) => x, Err(e) => return e };
+    // dispara a IA já na 1ª chamada (segundo plano), se o modo e a busca pedem
+    let usa_ia = match modo { DeepModo::Off => false, DeepModo::Sempre => true, DeepModo::Auto => busca_complexa(&query, &rapida) };
+    let mut estado = if usa_ia && st.active_provider != "none" { Some(deep_dispara(st, &query)) } else { None };
+    let mut out = resp;
+    let mut via: Vec<Value> = out["via"].as_array().cloned().unwrap_or_default();
+    let fatia = |lista: &[Value], ini: usize| -> Vec<Value> { lista.iter().skip(ini).take(k).cloned().collect() };
+    let hits: Vec<Value> = if page <= 2 {
+        fatia(&rapida, (page - 1) * k)
+    } else {
+        // página 3+: espera a IA (se disparada) até o teto e junta as variantes dela
+        let chave = normalize_query(&query);
+        let t0 = Instant::now();
+        while estado.is_some() {
+            let e = deep_cache().lock().get(&chave).cloned();
+            match e {
+                Some(DeepEstado::Pendente) if t0.elapsed().as_secs() < espera => thread::sleep(std::time::Duration::from_millis(200)),
+                other => { estado = other.or(estado); break; }
+            }
+        }
+        let mut chave_lista = v.clone();
+        if let Some(o) = chave_lista.as_object_mut() { o.remove("page"); o.remove("deep_wait_s"); }
+        let chave_lista = chave_lista.to_string();
+        let pronta = deep_listas().lock().get(&chave_lista).cloned();
+        let todos: Vec<Value> = if let Some(l) = pronta { l } else {
+        let mostrados: HashSet<(String, String, u64)> = rapida.iter().take(2 * k)
+            .map(|h| (h["collection"].as_str().unwrap_or("").to_string(), h["base"].as_str().unwrap_or("").to_string(), h["chunk"].as_u64().unwrap_or(0)))
+            .collect();
+        let chave_h = |h: &Value| (h["collection"].as_str().unwrap_or("").to_string(), h["base"].as_str().unwrap_or("").to_string(), h["chunk"].as_u64().unwrap_or(0));
+        // candidatos: o resto da trilha rápida + os hits das variantes da IA (pela própria cobertura —
+        // a variante é a consulta inteira reformulada/traduzida, então vale como a original)
+        let mut melhores: std::collections::BTreeMap<(String, String, u64), Value> = std::collections::BTreeMap::new();
+        // conjunto FIXO das páginas 3+ (não depende da página pedida — senão a pág. 4 repete ou
+        // pula trechos da 3): até DEEP_PAGINAS páginas depois da 2
+        let pool = (DEEP_PAGINAS + 2) * k;
+        if page > DEEP_PAGINAS + 2 { return (200, json!({"page": page, "k": k, "hits": [], "deep": "end"}).to_string()); }
+        // continuação da trilha rápida, SEM o que as páginas 1 e 2 já mostraram; `_pos` = posição
+        // dentro da própria fonte (para intercalar as fontes no empate)
+        if let Ok((maior, _)) = trilha_rapida(v, st, pool) {
+            for (i, mut h) in maior.into_iter().enumerate() {
+                let kk = chave_h(&h);
+                if mostrados.contains(&kk) { continue; }
+                if let Some(o) = h.as_object_mut() { o.insert("_pos".into(), json!(i)); }
+                melhores.entry(kk).or_insert(h);
+            }
+        }
+        if let Some(DeepEstado::Pronto(vars)) = &estado {
+            let bases = st.bases.snap();
+            // no rodízio cada fonte ocupa ~1/(variantes+1) das vagas: pedir o conjunto inteiro a cada
+            // variante só custa tempo (medido: 9 buscas de 96 = 12–20 s por página)
+            let k_var = (3 * pool / (vars.len() + 1)).max(2 * k).min(pool);
+            for (vi, var) in vars.iter().enumerate() {
+                let mut b = v.clone();
+                if let Some(o) = b.as_object_mut() { for c in ["page", "deep", "deep_wait_s", "expand"] { o.remove(c); } }
+                b["query"] = json!(var);
+                b["k"] = json!(k_var);
+                if let Ok(rv) = search_val(&b.to_string(), &bases, &st.collection_profiles) {
+                    for (pos, mut h) in rv["hits"].as_array().cloned().unwrap_or_default().into_iter().enumerate() {
+                        let kk = chave_h(&h);
+                        if mostrados.contains(&kk) { continue; }
+                        let cov = |x: &Value| x["coverage"].as_f64().or_else(|| x["matchpoint"].as_f64()).unwrap_or(0.0);
+                        if melhores.get(&kk).map(|a| cov(a) >= cov(&h)).unwrap_or(false) { continue; }
+                        if let Some(o) = h.as_object_mut() {
+                            o.insert("via".into(), json!(var)); o.insert("deep".into(), json!(true));
+                            o.insert("_ord".into(), json!(vi + 1));   // ordem da variante (só para ordenar)
+                            o.insert("_pos".into(), json!(pos));
+                        }
+                        melhores.insert(kk, h);
+                    }
+                }
+            }
+            if !via.iter().any(|x| x == "llm") { via.push(json!("llm")); }
+        }
+        let cov = |x: &Value| x["coverage"].as_f64().or_else(|| x["matchpoint"].as_f64()).unwrap_or(0.0);
+        let mut todos: Vec<Value> = melhores.into_values().collect();
+        // cobertura ↓ · posição na própria fonte ↑ · ordem da variante ↑ · span ↑ · cos ↓.
+        // A posição INTERCALA as fontes no empate (tradução vale como original): 1º da consulta,
+        // 1º de cada variante, 2º da consulta… — medido: só com "original primeiro", centenas de
+        // trechos em inglês de cobertura cheia empurravam os da IA para fora de todas as páginas.
+        // A ordem da variante põe as traduções diretas (as 1as da IA) antes das reformulações
+        // soltas ("close combat" dominava "sword and shield"). Estável sobre chave ordenada.
+        let ord = |x: &Value| x["_ord"].as_u64().unwrap_or(0);
+        let pos = |x: &Value| x["_pos"].as_u64().unwrap_or(0);
+        todos.sort_by(|a, b| cov(b).partial_cmp(&cov(a)).unwrap_or(std::cmp::Ordering::Equal)
+            .then(pos(a).cmp(&pos(b)))
+            .then(ord(a).cmp(&ord(b)))
+            .then(a["span"].as_u64().unwrap_or(0).cmp(&b["span"].as_u64().unwrap_or(0)))
+            .then(b["cos"].as_f64().unwrap_or(0.0).partial_cmp(&a["cos"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal)));
+        todos.truncate(DEEP_PAGINAS * k);
+        if !matches!(estado, Some(DeepEstado::Pendente)) {
+            let mut c = deep_listas().lock();
+            if c.len() >= DEEP_LISTAS_MAX { c.clear(); }
+            c.insert(chave_lista, todos.clone());
+        }
+        todos
+        };
+        if matches!(estado, Some(DeepEstado::Pronto(_))) && !via.iter().any(|x| x == "llm") { via.push(json!("llm")); }
+        fatia(&todos, (page - 3) * k)
+    };
+    let hits: Vec<Value> = hits.into_iter().enumerate().map(|(i, mut h)| {
+        if let Some(o) = h.as_object_mut() { o.insert("rank".into(), json!((page - 1) * k + i + 1)); o.remove("_ord"); o.remove("_pos"); }
+        h
+    }).collect();
+    let (deep_txt, deep_vars) = match &estado {
+        None => ("off".to_string(), Value::Null),
+        Some(DeepEstado::Pendente) => ("pending".to_string(), Value::Null),
+        Some(DeepEstado::Pronto(v)) => ("ready".to_string(), json!(v)),
+        Some(DeepEstado::Falhou(e)) => (format!("failed: {e}"), Value::Null),
+    };
+    out["page"] = json!(page);
+    out["k"] = json!(k);
+    out["hits"] = json!(hits);
+    out["via"] = json!(via);
+    out["deep"] = json!(deep_txt);
+    if !deep_vars.is_null() { out["deep_variants"] = deep_vars; }
+    (200, out.to_string())
 }
 
 fn search_expand(body: &str, st: &State) -> (u16, String) {
@@ -3636,6 +3922,13 @@ mod testes_dicionario {
     /// O caso "sword" (05/out/2026): o ENEN tem dezenas de sinônimos em inglês, quase todos fora
     /// do corpus; o ENPT traz "espada". Intercalando os dicionários e filtrando pelo corpus antes
     /// do corte, "espada" entra; os de fora vão para `descartadas`.
+    #[test]
+    fn array_cortado_aproveita_strings_completas() {
+        let v = super::parse_str_array(r#"["casa assombrada", "casa \"fantasma\"", "morad"#);
+        assert_eq!(v, vec!["casa assombrada".to_string(), "casa \"fantasma\"".to_string()]);
+        assert_eq!(super::parse_str_array(r#"["a", "b"]"#), vec!["a".to_string(), "b".to_string()]);
+    }
+
     #[test]
     fn dicionarios_intercalados_e_filtrados_pelo_corpus() {
         let mut map: HashMap<String, Vec<(bool, Vec<String>)>> = HashMap::new();

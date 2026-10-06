@@ -160,6 +160,25 @@ língua seguem a regra da pergunta original.
 **Erros:** 400 sem dicionário, cache nem provider de IA (e o literal não achou) · 502 falha da IA.
 Estas respostas não trazem `query_syllables`, `scope` nem `searched`.
 
+### 1.4.1 Páginas e trilha profunda (IA local) — `page`, `deep`
+
+Opcionais no `/search` (sem `page`/`deep` a resposta não muda). Página = `k` hits.
+
+| campo | padrão | significado |
+|---|---|---|
+| `page` | — | página a partir de 1. As páginas **1–2** vêm da trilha rápida (o modo pedido), nunca esperam a IA e ficam fixas. |
+| `deep` | `false` | `"auto"`: busca complexa (2+ palavras de conteúdo, ou resultado rápido fraco) dispara a IA **em segundo plano** já na 1ª chamada. `true`: sempre. |
+| `deep_wait_s` | `15` | quanto a página 3+ espera pela IA (máx. 60). |
+
+Da **página 3** em diante, as variantes da IA (tradução da pergunta inteira e reformulações no contexto —
+`"white whale"` → `"baleia branca"`, `"baleia de Moby Dick"`) juntam-se ao resto da trilha rápida, sem repetir as
+páginas 1–2. No empate de cobertura as fontes são **intercaladas** (1º da pergunta, 1º de cada variante, 2º da
+pergunta…). As páginas 3–12 saem de uma lista montada uma vez por busca. Uma chamada à IA por vez, com teto de
+200 tokens e 30 s.
+**A resposta ganha:** `page`, `k`, `deep` (`"off"` · `"pending"` · `"ready"` · `"failed: …"` · `"end"` após a
+página 12), `deep_variants` quando pronta, `rank` por hit; hits da IA trazem `deep: true` e `via` = a variante; `via`
+ganha `"llm"`.
+
 ### 1.5 Trechos e diagnóstico
 
 | Método | Rota | Requisição | Resposta |

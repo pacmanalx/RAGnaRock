@@ -161,6 +161,23 @@ the original-query rule.
 **Errors:** 400 with no dictionary, cache or AI provider (and the literal found nothing) · 502 AI failure.
 These responses carry no `query_syllables`, `scope` or `searched`.
 
+### 1.4.1 Pages and the deep track (local AI) — `page`, `deep`
+
+Opt-in on `/search` (without `page`/`deep` the response is unchanged). A page is `k` hits.
+
+| field | default | meaning |
+|---|---|---|
+| `page` | — | 1-based page. Pages **1–2** come from the fast track (the requested mode) and never wait for the AI; they stay fixed. |
+| `deep` | `false` | `"auto"`: a complex query (2+ content words, or a weak fast result) fires the AI provider **in the background** on the first call. `true`: always. |
+| `deep_wait_s` | `15` | how long page 3+ waits for the AI (max 60). |
+
+From **page 3** on, the AI's variants (whole-query translations and rephrasings in context — `"white whale"` →
+`"baleia branca"`, `"baleia de Moby Dick"`) join the rest of the fast track, never repeating pages 1–2. At equal
+coverage, sources are **interleaved** (1st of the query, 1st of each variant, 2nd of the query…). Pages 3–12 come
+from one list built once per query. One AI call at a time, capped at 200 tokens and 30 s.
+**Response adds:** `page`, `k`, `deep` (`"off"` · `"pending"` · `"ready"` · `"failed: …"` · `"end"` past page 12),
+`deep_variants` when ready, `rank` per hit; AI hits carry `deep: true` and `via` = the variant; `via` gains `"llm"`.
+
 ### 1.5 Chunks and diagnostics
 
 | Method | Route | Request | Response |
