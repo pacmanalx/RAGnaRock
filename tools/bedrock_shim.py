@@ -14,7 +14,7 @@ Sem argumentos mostra este help (convenção do repo).
 
 Credenciais: ~/.aws/credentials, perfil default (o mesmo que a CLI usaria).
 """
-import configparser, datetime, hashlib, hmac, json, os, sys, time
+import configparser, datetime, hashlib, hmac, io, json, os, sys, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -23,6 +23,7 @@ REGIAO_PADRAO = "us-east-1"
 PORTA_PADRAO = 8081
 
 CFG = {"model": MODELO_PADRAO, "region": REGIAO_PADRAO}
+SEM_TEMPERATURA = set()   # modelos que recusaram o campo `temperature` (aprendido em execução)
 
 
 def creds():
@@ -50,8 +51,10 @@ def bedrock_converse(model, region, system, messages, max_tokens, temperature):
     canon = f"/model/{urllib.parse.quote(model, safe='')}/converse"
 
     cfg = {"maxTokens": max_tokens}
-    # a geração 5 da Anthropic depreciou `temperature` — mandar o campo dá 400
-    if temperature is not None and "-5" not in model.rsplit(".", 1)[-1]:
+    # a geração 5 da Anthropic depreciou `temperature` — mandar o campo dá 400; o Kimi K3 também
+    # recusa ("doesn't support the temperature field"). Modelos assim entram em SEM_TEMPERATURA
+    # na primeira recusa (ver do_POST) e o campo deixa de ir.
+    if temperature is not None and "-5" not in model.rsplit(".", 1)[-1] and model not in SEM_TEMPERATURA:
         cfg["temperature"] = temperature
     body = {"messages": messages, "inferenceConfig": cfg}
     if system:
@@ -155,7 +158,15 @@ class Handler(BaseHTTPRequestHandler):
         temp = req.get("temperature", 0)
         t0 = time.time()
         try:
-            d = bedrock_converse(modelo, CFG["region"], system, msgs, max_tokens, temp)
+            try:
+                d = bedrock_converse(modelo, CFG["region"], system, msgs, max_tokens, temp)
+            except urllib.error.HTTPError as e1:
+                corpo1 = e1.read().decode()[:300]
+                if e1.code != 400 or "temperature" not in corpo1 or modelo in SEM_TEMPERATURA:
+                    raise urllib.error.HTTPError(e1.url, e1.code, e1.msg, e1.hdrs, io.BytesIO(corpo1.encode()))
+                SEM_TEMPERATURA.add(modelo)
+                self._log(f"{modelo} recusa temperature — repetindo sem o campo (e daqui em diante)")
+                d = bedrock_converse(modelo, CFG["region"], system, msgs, max_tokens, temp)
         except urllib.error.HTTPError as e:
             corpo = e.read().decode()[:300]
             self._log(f"ERRO {e.code} · {modelo} · {corpo}")
