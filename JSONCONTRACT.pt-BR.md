@@ -93,7 +93,12 @@ Rota única de busca (#39), com estágios **opt-in**: padrão conservador = busc
   "phonetic": false,        // casa pelo SOM (SOUNDEX): "Aslan" acha "Aslam"
   "literal_fallback": true, // needles alfanuméricos COM dígito (OE-6016, M31May-23h28): grep literal,
                             // achados exatos vêm na frente (#38); false desliga
-  "expand": false           // true = cascata dicionário → cache → IA (mesmo motor de /search_expand)
+  "expand": false,          // true = cascata dicionário → cache → IA (mesmo motor de /search_expand)
+  "merge_adjacent": false,  // #44: candidatos de trechos consecutivos de uma base → UMA passagem, cobertura
+                            // recalculada sobre o texto junto (exige rerank; não vale com expand)
+  "merge_max": 3,           // máximo de trechos por passagem (2–8)
+  "context": 0,             // #45: N (0–5) trechos vizinhos antes/depois de cada hit, na própria resposta
+  "context_max_chars": 20000// teto do texto de contexto; passou → "context_truncated": true
 }
 ```
 **Resposta** (`expand: false`):
@@ -119,7 +124,10 @@ Rota única de busca (#39), com estágios **opt-in**: padrão conservador = busc
 ```
 - Ordem: `coverage` ↓ · `span` ↑ · `cos` ↓ · recência (só desempata); hits literais na frente, sem repetir chunk.
 - `coverage`/`span` só existem com `rerank`. `recency` é texto, só para exibição. `cos` dos hits literais é 0.
-- Com `expand: true`, a resposta é a do `/search_expand` (abaixo), com `via`.
+- **Passagens (#44):** o hit fundido mantém `chunk` = primeiro id e ganha `chunks:[ids]`; o `snippet` cobre o texto junto.
+- **Contexto (#45):** cada hit ganha `context:{before:[{id, text}], after:[{id, text}]}` (os trechos da própria
+  passagem ficam de fora); a resposta ganha `context_truncated: true` quando o teto cortou.
+- Com `expand: true`, a resposta é a do `/search_expand` (abaixo), com `via` (`merge_adjacent`/`context` não se aplicam).
 - 404 quando nenhuma base casa com o escopo. A busca é **determinística**: mesma query, mesma resposta (#56).
 
 ### 1.4 Busca com expansão — `POST /search_expand`
@@ -141,9 +149,35 @@ busca original e, se o topo cobre a query inteira (≥ 0,999) com ≥ min(k,2) h
 
 **Resposta (normal):** `{via, query, provider, source, expansions:[…], absent:false, dropped:[…], hits}` —
 hits com os campos da busca silábica + `var_cov`; `via` do hit = `"original"` ou a variante que o trouxe.
+
+**Dicionários:** os dicionários ativos são **intercalados** (cada um contribui, na vez) e só variantes presentes no
+vocabulário do escopo ocupam as 12 vagas (as demais vão para `dropped`). Os hits são repontuados contra a pergunta
+ORIGINAL, exceto **traduções**: uma variante entre as 2 primeiras traduções de uma palavra num dicionário entre
+línguas (ENPT, PTEN, ESPT…) vale como o original e ganha a fração da pergunta que a palavra traduzida representa —
+`"sword"` → trechos com `"espada"` disputam pelo mérito; esses hits trazem `translated: true`. Sinônimos da mesma
+língua seguem a regra da pergunta original.
 **Ausente** (nem a query nem variante ancoram no vocabulário): `{…, absent:true, dropped, reason, did_you_mean, hits:[]}`.
 **Erros:** 400 sem dicionário, cache nem provider de IA (e o literal não achou) · 502 falha da IA.
 Estas respostas não trazem `query_syllables`, `scope` nem `searched`.
+
+### 1.4.1 Páginas e trilha profunda (IA local) — `page`, `deep`
+
+Opcionais no `/search` (sem `page`/`deep` a resposta não muda). Página = `k` hits.
+
+| campo | padrão | significado |
+|---|---|---|
+| `page` | — | página a partir de 1. As páginas **1–2** vêm da trilha rápida (o modo pedido), nunca esperam a IA e ficam fixas. |
+| `deep` | `false` | `"auto"`: busca complexa (2+ palavras de conteúdo, ou resultado rápido fraco) dispara a IA **em segundo plano** já na 1ª chamada. `true`: sempre. |
+| `deep_wait_s` | `15` | quanto a página 3+ espera pela IA (máx. 60). |
+
+Da **página 3** em diante, as variantes da IA (tradução da pergunta inteira e reformulações no contexto —
+`"white whale"` → `"baleia branca"`, `"baleia de Moby Dick"`) juntam-se ao resto da trilha rápida, sem repetir as
+páginas 1–2. No empate de cobertura as fontes são **intercaladas** (1º da pergunta, 1º de cada variante, 2º da
+pergunta…). As páginas 3–12 saem de uma lista montada uma vez por busca. Uma chamada à IA por vez, com teto de
+200 tokens e 30 s.
+**A resposta ganha:** `page`, `k`, `deep` (`"off"` · `"pending"` · `"ready"` · `"failed: …"` · `"end"` após a
+página 12), `deep_variants` quando pronta, `rank` por hit; hits da IA trazem `deep: true` e `via` = a variante; `via`
+ganha `"llm"`.
 
 ### 1.5 Trechos e diagnóstico
 

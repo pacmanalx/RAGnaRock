@@ -28,6 +28,17 @@ export interface SearchOpts {
   base?: string // wildcard: 'sda' exata · 'sd*' prefixo · '*' todas
   k?: number
   phonetic?: boolean
+  // [#39/#44/#45] demais opções do POST /search — só vão no corpo quando diferem do padrão do motor
+  rerank?: boolean // padrão true
+  recall_n?: number // padrão 20
+  unified?: boolean // ausente = automático (true quando há coleção com >1 base no escopo)
+  literal_fallback?: boolean // padrão true
+  merge_adjacent?: boolean // padrão false
+  merge_max?: number // padrão 3
+  context?: number // padrão 0
+  context_max_chars?: number // padrão 20000
+  page?: number // busca em páginas (página = k resultados)
+  deep?: boolean // IA local para buscas complexas (envia deep: "auto")
 }
 const searchBody = (query: string, o: SearchOpts) => ({
   base: o.base?.trim() || '*',
@@ -35,6 +46,14 @@ const searchBody = (query: string, o: SearchOpts) => ({
   k: o.k ?? 8,
   phonetic: !!o.phonetic,
   ...(o.collection ? { collection: o.collection } : {}),
+  ...(o.rerank === false ? { rerank: false } : {}),
+  ...(o.recall_n != null && o.recall_n !== 20 ? { recall_n: o.recall_n } : {}),
+  ...(o.unified != null ? { unified: o.unified } : {}),
+  ...(o.literal_fallback === false ? { literal_fallback: false } : {}),
+  ...(o.merge_adjacent ? { merge_adjacent: true, ...(o.merge_max && o.merge_max !== 3 ? { merge_max: o.merge_max } : {}) } : {}),
+  ...(o.context ? { context: o.context, ...(o.context_max_chars && o.context_max_chars !== 20000 ? { context_max_chars: o.context_max_chars } : {}) } : {}),
+  ...(o.page ? { page: o.page } : {}),
+  ...(o.deep ? { deep: 'auto' } : {}),
 })
 
 // Léxico puro (silábico tf-idf + matched filter).

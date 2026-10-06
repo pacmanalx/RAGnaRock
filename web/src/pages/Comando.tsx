@@ -6,10 +6,11 @@ import { useAsync } from '@/hooks/useAsync'
 import { Panel, Spinner, ErrorBox } from '@/components/ui'
 import { ChunkModal, type ChunkTarget } from '@/components/ChunkModal'
 
-// Modos de busca (espelham a aba Buscar do dashboard legado do ragd):
-//   lexico    → POST /search        (silábico puro: tf-idf + matched filter)
-//   semantico → POST /search_expand (two-phase: expande 📚→📖→🧠 SÓ quando o léxico é fraco)
-//   inferir   → POST /search_expand two_phase=false (SEMPRE roda a cascata, incl. a IA)
+// Modos de busca — todos vão em POST /search (#39); o modo decide `expand`/`two_phase`:
+//   lexico    → expand=false        (silábico puro: tf-idf + matched filter)
+//   semantico → expand=true         (two-phase: expande 📚→📖→🧠 SÓ quando o léxico é fraco)
+//   inferir   → expand=true, two_phase=false (SEMPRE roda a cascata, incl. a IA)
+// As demais opções da rota ficam no bloco "opções do /search".
 type Modo = 'lexico' | 'semantico' | 'inferir'
 
 const MODOS: { id: Modo; label: string; hint: string }[] = [
@@ -17,6 +18,12 @@ const MODOS: { id: Modo; label: string; hint: string }[] = [
   { id: 'semantico', label: 'semântico 🧠', hint: 'expande por sinônimos quando o léxico é fraco. Cascata: dicionários ativos (📚) → cache (📖) → IA (🧠)' },
   { id: 'inferir', label: 'inferência forçada', hint: 'sempre roda a cascata de expansão, mesmo quando a busca pura já acha (two_phase off)' },
 ]
+
+// [#39] estágios efetivos que o motor devolve em `via`
+const VIA_LABEL: Record<string, string> = {
+  silabico: 'silábico', phonetic: 'fonético', literal: '🔎 literal', literal_fallback: '🔎 literal',
+  dict: '📚 dicionário', cache: '📖 cache', llm: '🧠 IA',
+}
 
 const SOURCE_LABEL: Record<string, string> = {
   phase1: '⚡ léxico forte (fase 1, sem expansão)',
@@ -49,6 +56,19 @@ export function Comando() {
   const [base, setBase] = useState('*')
   const [k, setK] = useState(8)
   const [phonetic, setPhonetic] = useState(false)
+  // opções do POST /search (padrões = os do motor)
+  const [rerank, setRerank] = useState(true)
+  const [literal, setLiteral] = useState(true)
+  const [unified, setUnified] = useState<'auto' | 'sim' | 'nao'>('auto')
+  const [recallN, setRecallN] = useState(20)
+  const [merge, setMerge] = useState(false)
+  const [mergeMax, setMergeMax] = useState(3)
+  const [contexto, setContexto] = useState(0)
+  const [ctxMax, setCtxMax] = useState(20000)
+  const [abertos, setAbertos] = useState<Set<string>>(new Set())
+  // páginas + IA local: páginas 1–2 vêm rápidas; da 3 em diante a IA junta traduções e contexto
+  const [deep, setDeep] = useState(true)
+  const [pagina, setPagina] = useState(1)
   const [res, setRes] = useState<SearchExpandResponse | null>(null)
   const [ms, setMs] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
@@ -62,12 +82,21 @@ export function Comando() {
 
   const form: FormState = { q, modo, coll, base, k, phonetic }
 
-  async function run(e?: React.FormEvent) {
+  async function run(e?: React.FormEvent, pag = 1) {
     e?.preventDefault()
+    setPagina(pag)
     const query = q.trim()
     if (!query) return
     setLoading(true); setError(null)
-    const opts = { collection: coll || undefined, base, k, phonetic }
+    const opts = {
+      collection: coll || undefined, base, k, phonetic,
+      rerank, recall_n: recallN, literal_fallback: literal,
+      unified: unified === 'auto' ? undefined : unified === 'sim',
+      // passagens e contexto só valem sem expansão (o motor ignora com expand)
+      ...(modo === 'lexico' ? { merge_adjacent: merge && rerank, merge_max: mergeMax, context: contexto, context_max_chars: ctxMax } : {}),
+      page: pag, deep,
+    }
+    setAbertos(new Set())
     const t0 = performance.now()
     try {
       const r = modo === 'lexico'
@@ -170,10 +199,62 @@ export function Comando() {
               <input type="checkbox" checked={phonetic} onChange={(e) => setPhonetic(e.target.checked)} className="accent-[var(--color-accent)]" />
               fonético
             </label>
+            <label className="flex cursor-pointer items-center gap-2 pb-2 text-[13px]" title="buscas complexas disparam a IA local (tradução e contexto) em segundo plano; as páginas 1–2 não esperam por ela, e os resultados dela entram da página 3 em diante">
+              <input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} className="accent-[var(--color-accent)]" />
+              IA local (pág. 3+)
+            </label>
             <button className="rounded-md bg-[var(--color-accent)] px-5 py-2 text-[13px] font-semibold text-[var(--color-accent-fg)] hover:opacity-90">
               buscar
             </button>
           </div>
+
+          {/* ── todas as opções do POST /search (#39/#44/#45) ── */}
+          <details className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2">
+            <summary className="cursor-pointer text-[11px] uppercase tracking-wide text-[var(--color-muted)]">
+              opções do /search <span className="normal-case">— padrões do motor; mude para testar</span>
+            </summary>
+            <div className="mt-3 flex flex-wrap items-end gap-x-5 gap-y-3 text-[13px]">
+              <label className="flex cursor-pointer items-center gap-2" title="estágio 2: ordena por cobertura e proximidade; desligado = só o recall (cosseno)">
+                <input type="checkbox" checked={rerank} onChange={(e) => setRerank(e.target.checked)} className="accent-[var(--color-accent)]" />
+                reordenar (rerank)
+              </label>
+              <label className="flex cursor-pointer items-center gap-2" title="códigos com dígito (OE-6016, M31May-23h28): busca literal, achados exatos na frente">
+                <input type="checkbox" checked={literal} onChange={(e) => setLiteral(e.target.checked)} className="accent-[var(--color-accent)]" />
+                literal (literal_fallback)
+              </label>
+              <div title="vocabulário e idf unificados da coleção; automático = ligado quando a coleção tem mais de uma base no escopo">
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">vocabulário unificado</div>
+                <select value={unified} onChange={(e) => setUnified(e.target.value as 'auto' | 'sim' | 'nao')} className={inputCls}>
+                  <option value="auto">automático</option>
+                  <option value="sim">sim</option>
+                  <option value="nao">não (idf local)</option>
+                </select>
+              </div>
+              <div title="candidatos de cada base que vão para o reordenamento">
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">candidatos/base</div>
+                <input type="number" min={1} max={200} value={recallN} onChange={(e) => setRecallN(Math.max(1, +e.target.value || 20))} className={`w-[70px] ${inputCls}`} />
+              </div>
+              <label
+                className={`flex items-center gap-2 ${modo === 'lexico' && rerank ? 'cursor-pointer' : 'opacity-45'}`}
+                title={modo !== 'lexico' ? 'não se aplica com expansão (modo léxico apenas)' : !rerank ? 'exige reordenar' : 'trechos consecutivos da mesma base viram uma passagem, com a cobertura recalculada sobre o texto junto (#44) — custa ~25% de tempo'}
+              >
+                <input type="checkbox" checked={merge} disabled={modo !== 'lexico' || !rerank} onChange={(e) => setMerge(e.target.checked)} className="accent-[var(--color-accent)]" />
+                juntar trechos vizinhos
+              </label>
+              <div className={modo === 'lexico' && merge && rerank ? '' : 'opacity-45'} title="máximo de trechos por passagem">
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">trechos/passagem</div>
+                <input type="number" min={2} max={8} value={mergeMax} disabled={modo !== 'lexico' || !merge || !rerank} onChange={(e) => setMergeMax(Math.min(8, Math.max(2, +e.target.value || 3)))} className={`w-[60px] ${inputCls}`} />
+              </div>
+              <div className={modo === 'lexico' ? '' : 'opacity-45'} title={modo !== 'lexico' ? 'não se aplica com expansão (modo léxico apenas)' : 'trechos vizinhos antes e depois de cada resultado, na própria resposta (#45)'}>
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">contexto (± trechos)</div>
+                <input type="number" min={0} max={5} value={contexto} disabled={modo !== 'lexico'} onChange={(e) => setContexto(Math.min(5, Math.max(0, +e.target.value || 0)))} className={`w-[60px] ${inputCls}`} />
+              </div>
+              <div className={modo === 'lexico' && contexto > 0 ? '' : 'opacity-45'} title="teto do texto de contexto somado; passou, corta e avisa">
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--color-muted)]">teto do contexto (caracteres)</div>
+                <input type="number" min={1000} max={200000} step={1000} value={ctxMax} disabled={modo !== 'lexico' || contexto === 0} onChange={(e) => setCtxMax(Math.max(1000, +e.target.value || 20000))} className={`w-[100px] ${inputCls}`} />
+              </div>
+            </div>
+          </details>
         </form>
 
         {/* ───── painel Geração: a linguagem, nada executa (motor = #35, depois) ───── */}
@@ -220,17 +301,25 @@ export function Comando() {
       </div>
 
       {error && <ErrorBox message={error} onRetry={() => run()} />}
-      {loading && <Spinner label={modo === 'lexico' ? 'buscando…' : '🧠 expandindo + buscando…'} />}
+      {loading && <Spinner label={pagina >= 3 && deep ? '🧠 juntando os resultados da IA local…' : modo === 'lexico' ? 'buscando…' : '🧠 expandindo + buscando…'} />}
 
       {res && !loading && (
         <>
           {/* linha de info: fonte da cascata + sinônimos (riscado = fora do corpus) */}
-          {(source || res.expansions?.length || res.query_syllables) && (
+          {(source || res.expansions?.length || res.query_syllables || res.via?.length || res.page) && (
             <div className="space-y-1 text-[12px] text-[var(--color-muted)]">
               <div>
                 {source && <span>{source}{res.source === 'llm' && res.provider ? ` (${res.provider})` : ''}</span>}
                 {ms != null && <span> · <b className="text-[var(--color-ok,#3fb950)]">{ms.toFixed(0)} ms</b></span>}
                 {res.query_syllables && <span> · sílabas: {res.query_syllables}</span>}
+                {(res.via?.length ?? 0) > 0 && <span> · via: <b>{res.via!.map((v) => VIA_LABEL[v] ?? v).join(' → ')}</b></span>}
+                {res.context_truncated && <span className="text-[var(--color-warn,#d29922)]"> · contexto cortado pelo teto</span>}
+                {res.page && <span> · página <b>{res.page}</b></span>}
+                {res.deep && res.deep !== 'off' && (
+                  <span title={res.deep_variants?.join(' · ')}>
+                    {' · '}🧠 IA: {res.deep === 'pending' ? 'buscando em segundo plano (entra da página 3)' : res.deep === 'ready' ? `pronta (${res.deep_variants?.length ?? 0} variantes)` : res.deep}
+                  </span>
+                )}
               </div>
               {(res.expansions?.length ?? 0) > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -270,7 +359,18 @@ export function Comando() {
               </div>
             </Panel>
           ) : (
-            <Panel title={`${res.hits.length} resultado(s)`}>
+            <Panel
+              title={`${res.hits.length} resultado(s)${res.page ? ` · página ${res.page}` : ''}`}
+              actions={
+                <div className="flex items-center gap-2 text-[12px]">
+                  <button type="button" disabled={pagina <= 1 || loading} onClick={() => run(undefined, pagina - 1)}
+                    className="rounded border border-[var(--color-border)] px-2 py-0.5 disabled:opacity-40 hover:border-[var(--color-accent)]">◀ anterior</button>
+                  <button type="button" disabled={loading || res.hits.length < k} onClick={() => run(undefined, pagina + 1)}
+                    title={pagina + 1 >= 3 && deep ? 'da página 3 em diante entram os resultados da IA local (pode levar alguns segundos)' : undefined}
+                    className="rounded border border-[var(--color-border)] px-2 py-0.5 disabled:opacity-40 hover:border-[var(--color-accent)]">próxima ▶</button>
+                </div>
+              }
+            >
               <div className="space-y-2">
                 {res.hits.map((h) => (
                   <div
@@ -284,9 +384,9 @@ export function Comando() {
                   >
                     <div className="mb-1 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--color-muted)]">
                       <span>
-                        #{h.rank} · <span className="text-[var(--color-accent)]">{h.collection}</span> / {h.base} · chunk {h.chunk}
+                        #{h.rank} · <span className="text-[var(--color-accent)]">{h.collection}</span> / {h.base} · {h.chunks && h.chunks.length > 1 ? <>passagem: trechos {h.chunks.join('+')}</> : <>chunk {h.chunk}</>}
                         {h.via && h.via !== 'original' && (
-                          <span className="ml-1.5 rounded-full border border-[var(--color-border)] px-1.5 text-[9px]" title={`casou via: ${h.via}`}>🧠 {h.via}</span>
+                          <span className="ml-1.5 rounded-full border border-[var(--color-border)] px-1.5 text-[9px]" title={`casou via: ${h.via}`}>{h.deep ? '🧠 IA: ' : '🧠 '}{h.via}</span>
                         )}
                       </span>
                       <span className="flex items-center gap-2">
@@ -309,6 +409,27 @@ export function Comando() {
                       </span>
                     </div>
                     <div className="text-[13px] leading-relaxed"><Snippet text={h.snippet ?? ''} /></div>
+                    {h.context && (h.context.before.length + h.context.after.length) > 0 && (() => {
+                      const chave = `${h.collection}/${h.base}/${h.chunk}`
+                      const aberto = abertos.has(chave)
+                      return (
+                        <div className="mt-2" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
+                            onClick={() => setAbertos((s) => { const n = new Set(s); if (n.has(chave)) n.delete(chave); else n.add(chave); return n })}
+                            className="text-[11px] text-[var(--color-accent)] hover:underline"
+                          >
+                            {aberto ? '▾' : '▸'} contexto ({h.context.before.length} antes, {h.context.after.length} depois)
+                          </button>
+                          {aberto && (
+                            <div className="mt-1 space-y-1.5 text-[12px] leading-relaxed text-[var(--color-muted)]">
+                              {h.context.before.map((c) => <div key={`b${c.id}`}><b>trecho {c.id} ↑</b> {c.text}</div>)}
+                              {h.context.after.map((c) => <div key={`a${c.id}`}><b>trecho {c.id} ↓</b> {c.text}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
                   </div>
                 ))}
                 {res.hits.length === 0 && <div className="text-[13px] text-[var(--color-muted)]">sem resultados.</div>}

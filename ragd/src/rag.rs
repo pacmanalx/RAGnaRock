@@ -524,6 +524,35 @@ impl RagBase {
         rerank_score(qt, weights, words, phonetic)
     }
 
+    /// Fração da query que a palavra `word` representa: peso do termo dela sobre a soma dos pesos
+    /// (mesma régua do rerank). 0 se a palavra não é termo-chave da query (ex.: monossílaba numa
+    /// query com palavras longas). Usada para pontuar um hit que entrou por TRADUÇÃO dessa palavra.
+    pub fn term_share(&self, qt: &QueryTerms, weights: Option<&[f64]>, word: &str) -> f64 {
+        let alvo: Vec<String> = syllabify(&word.to_lowercase()).iter().map(|s| normalize(s))
+            .filter(|s| !s.is_empty()).collect();
+        let idx = match qt.terms.iter().position(|t| *t == alvo) { Some(i) => i, None => return 0.0 };
+        let owned = if weights.is_none() { Some(self.term_weights(qt)) } else { None };
+        let w: &[f64] = weights.unwrap_or_else(|| owned.as_ref().unwrap());
+        let total: f64 = w.iter().sum();
+        if total <= 0.0 { return 1.0 / qt.terms.len().max(1) as f64; }
+        w.get(idx).copied().unwrap_or(0.0) / total
+    }
+
+    /// [#44] Cobertura/span de UMA query contra uma PASSAGEM: trechos consecutivos lidos como um
+    /// texto só. É o que fecha a co-ocorrência que cruza a fronteira do chunk ("Frodo" no fim de
+    /// um, o nome do lugar no começo do seguinte). Mesma régua do rerank (`rerank_score`).
+    pub fn score_passage(&self, qt: &QueryTerms, weights: Option<&[f64]>, chunk_ids: &[usize], phonetic: bool) -> (f64, usize) {
+        let mut words: Vec<Vec<String>> = vec![];
+        for &cid in chunk_ids {
+            let ch = match self.chunks.get(cid) { Some(c) => c, None => continue };
+            if !ch.words.is_empty() { words.extend(ch.words.iter().cloned()); }
+            else if let Some(t) = self.chunk_text(ch) { words.extend(chunk_words(t)); }
+        }
+        let owned = if weights.is_none() { Some(self.term_weights(qt)) } else { None };
+        let weights: &[f64] = weights.unwrap_or_else(|| owned.as_ref().unwrap());
+        rerank_score(qt, weights, &words, phonetic)
+    }
+
     /// Peso de cada termo da query = soma dos idf das suas sílabas presentes no vocab LOCAL.
     /// É o que torna a cobertura PONDERADA: termo raro (Elrond) pesa muito, termo comum
     /// (do/conselho) ou variante-função (to/for) quase nada. Sílaba OOV não soma. Usado como
@@ -910,6 +939,23 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(query_vec_unified(texto, &p).1.to_bits(), n0.to_bits());
         }
+    }
+
+    /// [#44] "frodo" num chunk e "sammath" no vizinho: cada um cobre metade da query; a passagem
+    /// dos dois cobre a query inteira.
+    #[test]
+    fn passagem_fecha_coocorrencia_entre_chunks() {
+        let mut b = mk_base(&["fro", "do", "sam", "math"], &[&[0, 1], &[2, 3]]);
+        b.chunks[0].text = Some("o hobbit frodo seguiu".into());
+        b.chunks[1].text = Some("ate sammath naur".into());
+        b.has_text = true;
+        b.idf = (0..4).map(|d| (d, 1.0)).collect();
+        let qt = prep_query("frodo sammath");
+        let (c0, _) = b.score_chunk(&qt, None, 0, false);
+        let (c1, _) = b.score_chunk(&qt, None, 1, false);
+        let (cp, _) = b.score_passage(&qt, None, &[0, 1], false);
+        assert!(c0 < 0.99 && c1 < 0.99, "{c0} {c1}");
+        assert!((cp - 1.0).abs() < 1e-9, "passagem cobriu {cp}");
     }
 
     #[test]

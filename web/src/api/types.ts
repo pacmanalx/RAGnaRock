@@ -371,6 +371,12 @@ export interface SearchResponse {
   // [#39] estágios efetivos: 'silabico' | 'phonetic' | 'literal' | 'literal_fallback' | 'dict' | 'cache' | 'llm'
   via?: string[]
   needles?: string[]
+  context_truncated?: boolean // [#45] o teto de caracteres cortou o contexto
+  // busca em páginas + trilha profunda (IA local): páginas 1–2 rápidas; a IA entra da 3 em diante
+  page?: number
+  k?: number
+  deep?: string // 'off' | 'pending' | 'ready' | 'failed: …'
+  deep_variants?: string[]
 }
 export interface Hit {
   collection: string
@@ -385,6 +391,9 @@ export interface Hit {
   snippet: string
   rank: number
   via?: string // busca expandida: qual variante casou ('original' | sinônimo | 'literal_fallback')
+  chunks?: number[] // [#44] passagem: trechos consecutivos que a compõem
+  deep?: boolean // veio de uma variante da IA local (página 3+)
+  context?: { before: { id: number; text: string }[]; after: { id: number; text: string }[] } // [#45]
 }
 
 // /search_expand — busca semântica (cascata 📚 dicionários → 📖 cache → 🧠 IA; two_phase=false força a inferência)

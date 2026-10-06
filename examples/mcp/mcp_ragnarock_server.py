@@ -10,7 +10,7 @@ tf-idf cosine recall, phonetic matched-filter rerank). It's a thin, dependency-
 light bridge you can copy and adapt.
 
 Tools exposed:
-    ragnarock_search(query, base, collection, k, rerank, recall_n, phonetic, expand)
+    ragnarock_search(query, base, collection, k, rerank, recall_n, phonetic, expand, context, merge_adjacent)
     ragnarock_chunk(base, id, collection, before, after)
     ragnarock_list(match, collection)
     ragnarock_ingest(path, collection, name, chunk, driver)
@@ -90,7 +90,8 @@ def _err(e: Exception) -> str:
 @mcp.tool()
 def ragnarock_search(query: str, base: str = "*", collection: str = "",
                      k: int = 5, rerank: bool = True, recall_n: int = 20,
-                     phonetic: bool = False, expand: bool = False) -> str:
+                     phonetic: bool = False, expand: bool = False,
+                     context: int = 0, merge_adjacent: bool = False) -> str:
     """Syllabic semantic search over RAGnaRock (tf-idf cosine recall + phonetic matched filter).
     Defaults to PRECISE search (no expansion) — best for LOOKUP (finding a file/identifier/name).
 
@@ -117,22 +118,35 @@ def ragnarock_search(query: str, base: str = "*", collection: str = "",
                  True: EXPANDED (synonyms via dictionary→cache→AI) — use ONLY for VAGUE/CONCEPTUAL
                  questions; common synonyms can dominate and pollute precise lookups. Falls back to
                  plain /search if expansion fails.
+    context    — 0 (default): hits only. N (1–5): each hit also brings `context.before/after` with
+                 N neighbouring chunks — the surroundings in ONE call, no follow-up `ragnarock_chunk`.
+                 Costs payload (~2 KB per chunk); ragd caps the total (context_max_chars, 20 000) and
+                 flags `context_truncated`. Use 1 when you need to read around a hit.
+    merge_adjacent — False (default). True: consecutive chunks of the same base that matched are
+                 fused into ONE passage (hit gains `chunks:[ids]`) and coverage is recomputed over
+                 the joined text — catches terms split across a chunk boundary ("Frodo" at the end of
+                 one chunk, the place at the start of the next). Not applied with expand=True.
 
-    Returns COMPACT {query, query_syllables, searched_bases (count), hits:[{collection, base, rank,
-    matchpoint, mf, span, cos, chunk, start, snippet}]}. (ragd's bulky per-base `searched`/`scope`
-    diagnostics are dropped here so they don't blow the agent's context.)
+    Returns COMPACT {query, query_syllables, via, searched_bases (count), hits:[{collection, base,
+    rank, matchpoint, coverage, span, cos, chunk, chunks?, start, snippet, context?}]}. `via` lists
+    the stages that actually ran (silabico, phonetic, literal_fallback, dict, cache, llm). (ragd's
+    bulky per-base `searched`/`scope` diagnostics are dropped so they don't blow the agent's context.)
     """
     payload = {"base": base, "query": query, "k": k, "rerank": rerank,
                "recall_n": recall_n, "phonetic": phonetic}
+    if context:
+        payload["context"] = max(0, min(int(context), 5))
+    if merge_adjacent:
+        payload["merge_adjacent"] = True
     if collection:
         payload["collection"] = collection
     try:
-        # expand=True uses /search_expand (dictionary→cache→AI cascade: expands the query by
+        # expand=True = /search with expand (dictionary→cache→AI cascade: expands the query by
         # synonyms before searching = better recall). Falls back to plain /search if expansion
         # errors (e.g. dict+cache miss with no AI provider configured → HTTP 400).
         if expand:
             try:
-                data = _post_json("/search_expand", payload)
+                data = _post_json("/search", {**payload, "expand": True})
             except urllib.error.HTTPError:
                 data = _post_json("/search", payload)
         else:
@@ -148,7 +162,7 @@ def ragnarock_search(query: str, base: str = "*", collection: str = "",
                 "searched_bases": len(data.get("searched", [])),
                 "hits": data.get("hits", []),
             }
-            for f in ("expansions", "source", "dropped", "absent"):
+            for f in ("via", "needles", "context_truncated", "expansions", "source", "dropped", "absent"):
                 if f in data:
                     compact[f] = data[f]
             data = compact

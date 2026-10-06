@@ -1,3 +1,5 @@
 # Python MCP SDK (provides mcp.server.fastmcp.FastMCP).
 # The bridge itself uses only the stdlib (urllib, json, socket) otherwise.
-mcp>=1.2.0
+# mcp 2.x renomeou FastMCP (mcp.server.fastmcp → mcp.server.mcpserver.MCPServer) e o servidor
+# não sobe com ele — medido em 05/out/2026. Fixado na série 1.x até migrar.
+mcp>=1.2.0,<2

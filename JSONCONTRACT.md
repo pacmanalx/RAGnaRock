@@ -94,7 +94,12 @@ Single search route (#39), with **opt-in** stages: the conservative default is p
   "phonetic": false,        // match by SOUND (SOUNDEX): "Aslan" finds "Aslam"
   "literal_fallback": true, // alphanumeric needles WITH a digit (OE-6016, M31May-23h28): literal grep,
                             // exact matches go first (#38); false turns it off
-  "expand": false           // true = dictionary → cache → AI cascade (same engine as /search_expand)
+  "expand": false,          // true = dictionary → cache → AI cascade (same engine as /search_expand)
+  "merge_adjacent": false,  // #44: consecutive candidate chunks of a base → ONE passage, coverage
+                            // recomputed over the joined text (needs rerank; not with expand)
+  "merge_max": 3,           // max chunks per passage (2–8)
+  "context": 0,             // #45: N (0–5) neighbouring chunks before/after each hit, inline
+  "context_max_chars": 20000// cap on the total context text; past it → "context_truncated": true
 }
 ```
 **Response** (`expand: false`):
@@ -120,7 +125,10 @@ Single search route (#39), with **opt-in** stages: the conservative default is p
 ```
 - Order: `coverage` ↓ · `span` ↑ · `cos` ↓ · recency (tie-break only); literal hits first, no repeated chunk.
 - `coverage`/`span` exist only with `rerank`. `recency` is a string, display only. Literal hits have `cos` 0.
-- With `expand: true`, the response is the `/search_expand` one (below), with `via`.
+- **Passages (#44):** a fused hit keeps `chunk` = first id and adds `chunks:[ids]`; `snippet` covers the joined text.
+- **Context (#45):** each hit gains `context:{before:[{id, text}], after:[{id, text}]}` (the passage's own chunks are
+  excluded); the response gains `context_truncated: true` when the cap cut it.
+- With `expand: true`, the response is the `/search_expand` one (below), with `via` (`merge_adjacent`/`context` don't apply).
 - 404 when no base matches the scope. Search is **deterministic**: same query, same response (#56).
 
 ### 1.4 Search with expansion — `POST /search_expand`
@@ -142,9 +150,33 @@ without expanding (`two_phase: false` forces the cascade); (3) cascade active di
 
 **Response (normal):** `{via, query, provider, source, expansions:[…], absent:false, dropped:[…], hits}` —
 hits carry the syllabic fields + `var_cov`; the hit's `via` = `"original"` or the variant that brought it.
+
+**Dictionaries:** active dictionaries are **interleaved** (each one contributes, in turn) and only variants present
+in the scope's vocabulary take the 12 slots (the rest go to `dropped`). Hits are rescored against the ORIGINAL query,
+except **translations**: a variant among the first 2 translations of a word in a cross-language dictionary (ENPT,
+PTEN, ESPT…) counts as the original and earns the share of the query that the translated word represents —
+`"sword"` → chunks with `"espada"` compete on merit; such hits carry `translated: true`. Same-language synonyms keep
+the original-query rule.
 **Absent** (neither the query nor any variant anchors in the vocabulary): `{…, absent:true, dropped, reason, did_you_mean, hits:[]}`.
 **Errors:** 400 with no dictionary, cache or AI provider (and the literal found nothing) · 502 AI failure.
 These responses carry no `query_syllables`, `scope` or `searched`.
+
+### 1.4.1 Pages and the deep track (local AI) — `page`, `deep`
+
+Opt-in on `/search` (without `page`/`deep` the response is unchanged). A page is `k` hits.
+
+| field | default | meaning |
+|---|---|---|
+| `page` | — | 1-based page. Pages **1–2** come from the fast track (the requested mode) and never wait for the AI; they stay fixed. |
+| `deep` | `false` | `"auto"`: a complex query (2+ content words, or a weak fast result) fires the AI provider **in the background** on the first call. `true`: always. |
+| `deep_wait_s` | `15` | how long page 3+ waits for the AI (max 60). |
+
+From **page 3** on, the AI's variants (whole-query translations and rephrasings in context — `"white whale"` →
+`"baleia branca"`, `"baleia de Moby Dick"`) join the rest of the fast track, never repeating pages 1–2. At equal
+coverage, sources are **interleaved** (1st of the query, 1st of each variant, 2nd of the query…). Pages 3–12 come
+from one list built once per query. One AI call at a time, capped at 200 tokens and 30 s.
+**Response adds:** `page`, `k`, `deep` (`"off"` · `"pending"` · `"ready"` · `"failed: …"` · `"end"` past page 12),
+`deep_variants` when ready, `rank` per hit; AI hits carry `deep: true` and `via` = the variant; `via` gains `"llm"`.
 
 ### 1.5 Chunks and diagnostics
 
