@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Testes dos drivers de ingestão de ARQUIVO (#50): csv, xlsx, docx, pptx, pdf e audio.
-Os de banco (mysql, postgres) ficam de fora por enquanto.
+Testes dos drivers de ingestão (#50): de ARQUIVO (csv, xlsx, docx, pptx, pdf, audio) e de BANCO
+(mysql, postgres — receita, recusas e sigilo da senha; a conexão viva fica no
+tools/e2e_ingest.sh --bancos, com containers descartáveis).
 
 Cada driver roda exatamente como o ragd o chama (`run_ingestor`): `python3 <driver>`, payload no
 stdin, `PYTHONSAFEPATH=1`, saída no stdout, motivo da recusa na última linha do stderr.
@@ -201,6 +202,102 @@ class TestAudio(unittest.TestCase):
         self.assertTrue(out.strip(), err)
         if esperado:
             self.assertIn(esperado.lower(), out.lower())
+
+
+def carrega_driver(nome):
+    """Importa o driver como módulo (para testar funções puras como parse_recipe). O import das
+    dependências pesadas fica dentro do main(), então isto não exige pymysql/psycopg2."""
+    spec = importlib.util.spec_from_file_location(f"driver_{nome}", os.path.join(INGESTORS, f"{nome}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+SENHA_TESTE = "s3nh4-que-nao-pode-vazar"
+
+
+def receita(host="127.0.0.1:1", db="vendas", user="leitor", senha=SENHA_TESTE, sql="SELECT 1;", sem=()):
+    d = {"host": host, "db": db, "user": user, "pass": senha}
+    linhas = [f"-- {k}: {v}" for k, v in d.items() if k not in sem]
+    return ("\n".join(linhas) + "\n" + sql + "\n").encode()
+
+
+class ReceitaDeBanco:
+    """mysql e postgres: mesma receita (diretivas `-- chave: valor` + SQL), mesmas recusas.
+    Nenhum destes testes precisa de banco: a conexão viva é do tools/e2e_ingest.sh --bancos."""
+    driver = None
+    modulo_dep = None
+    porta_padrao = None
+
+    def setUp(self):
+        self.mod = carrega_driver(self.driver)
+
+    def test_parse_recipe_separa_diretivas_do_sql(self):
+        d, sql = self.mod.parse_recipe(
+            "-- host: db.interno:3307\n-- DB: vendas\n--user:leitor\n-- pass: a:b:c\n"
+            "-- comentário comum do SQL some\nSELECT id,\n  nome FROM t;\n")
+        self.assertEqual(d, {"host": "db.interno:3307", "db": "vendas", "user": "leitor", "pass": "a:b:c"})
+        self.assertEqual(sql, "SELECT id,\n  nome FROM t;")
+
+    def test_parse_recipe_ignora_diretiva_desconhecida(self):
+        d, sql = self.mod.parse_recipe("-- host: h\n-- path: /etc/passwd\nSELECT 1")
+        self.assertEqual(d, {"host": "h"})
+        self.assertEqual(sql, "SELECT 1")
+
+    def test_entrada_vazia_recusada(self):
+        code, out, err = roda(self.driver, b"   \n")
+        self.assertEqual(code, 1 if tem(self.modulo_dep) else 3)
+        self.assertEqual(out, "")
+
+    def test_lixo_recusado_com_motivo(self):
+        if not tem(self.modulo_dep):
+            self.skipTest(f"{self.modulo_dep} ausente")
+        code, _, err = roda(self.driver, b"isto nao e uma receita")
+        self.assertEqual(code, 1)
+        self.assertIn("sem diretiva", err)
+
+    def test_recusas_da_receita(self):
+        if not tem(self.modulo_dep):
+            self.skipTest(f"{self.modulo_dep} ausente")
+        casos = [
+            (receita(sem=("pass",)), "-- pass"),
+            (receita(sem=("host", "db")), "-- host, -- db"),
+            (receita(sql=""), "sem SQL"),
+            (receita(host="db:porta"), "porta inválida"),
+        ]
+        for dados, motivo in casos:
+            with self.subTest(motivo=motivo):
+                code, out, err = roda(self.driver, dados)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn(motivo, err)
+
+    def test_falha_de_conexao_nao_vaza_a_senha(self):
+        if not tem(self.modulo_dep):
+            self.skipTest(f"{self.modulo_dep} ausente")
+        code, out, err = roda(self.driver, receita(host="127.0.0.1:1"), timeout=60)
+        self.assertEqual(code, 1)
+        self.assertIn("falha ao conectar em 127.0.0.1:1", err)
+        p = subprocess.run([sys.executable, os.path.join(INGESTORS, f"{self.driver}.py")],
+                           input=receita(host="127.0.0.1:1"), capture_output=True, timeout=60,
+                           env=dict(os.environ, PYTHONSAFEPATH="1"))
+        self.assertNotIn(SENHA_TESTE, (p.stdout + p.stderr).decode("utf-8", "replace"))
+
+    def test_porta_padrao(self):
+        # sem `:porta` no host, vale a porta padrão do banco (aparece na mensagem de falha)
+        if not tem(self.modulo_dep):
+            self.skipTest(f"{self.modulo_dep} ausente")
+        code, _, err = roda(self.driver, receita(host="127.0.0.254"), timeout=60)
+        self.assertEqual(code, 1)
+        self.assertIn(f"127.0.0.254:{self.porta_padrao}", err)
+
+
+class TestMysql(ReceitaDeBanco, unittest.TestCase):
+    driver, modulo_dep, porta_padrao = "mysql", "pymysql", 3306
+
+
+class TestPostgres(ReceitaDeBanco, unittest.TestCase):
+    driver, modulo_dep, porta_padrao = "postgres", "psycopg2", 5432
 
 
 if __name__ == "__main__":

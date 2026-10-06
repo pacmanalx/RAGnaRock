@@ -129,20 +129,22 @@ decisão de conteúdo, e ela fica no cabeçalho dele:
 
 ## Testes (#50)
 
-Três camadas, dos drivers de ARQUIVO (csv, xlsx, docx, pptx, pdf, audio). Os de banco ficam de fora por ora.
+Três camadas, para os drivers de ARQUIVO (csv, xlsx, docx, pptx, pdf, audio) e de BANCO (mysql, postgres).
 
 ```bash
 python3 -m unittest discover -s ingestors/tests -v   # 1. cada driver, como o ragd o chama
 cargo test --release testes_ingestao                 # 2. roteamento MIME/extensão → driver (em ragd/)
-tools/e2e_ingest.sh [--audio recado.m4a --audio-palavra X]   # 3. ponta a ponta, no servidor
+tools/e2e_ingest.sh [--bancos] [--audio recado.m4a --audio-palavra X]   # 3. ponta a ponta, no servidor
 ```
 
 1. **`ingestors/tests/`** — `python3 <driver>` com o payload no stdin e `PYTHONSAFEPATH=1`, igual ao
    `run_ingestor`. Os exemplos são **gerados em código** (`fixtures.py`, nada binário versionado): csv com
    `;` e BOM, xlsx com aba vazia, docx com tabela, pptx com ordem de slides, runs picados, tabela e nota,
    pdf com acentos e página sem texto. Cobre também as recusas (vazio, lixo, `.doc`/`.ppt` antigos, pdf só
-   de imagem, ffmpeg/whisper ausentes). Sem openpyxl/python-docx/pypdf/ffmpeg, o teste é **pulado** com o
-   motivo; no servidor, todos rodam. A transcrição de verdade roda com `RAG_TEST_AUDIO=<arquivo>`.
+   de imagem, ffmpeg/whisper ausentes). Nos de banco: a leitura da receita, as recusas (diretiva ou SQL
+   faltando, porta inválida), a porta padrão e que **a senha não aparece** no erro de conexão. Sem
+   openpyxl/python-docx/pypdf/pymysql/psycopg2/ffmpeg, o teste é **pulado** com o motivo; no servidor, todos
+   rodam. A transcrição de verdade roda com `RAG_TEST_AUDIO=<arquivo>`.
 2. **`testes_ingestao`** (ragd) — MIME decide os binários e vence a extensão; text/plain, octet-stream e
    MIME vazio caem na extensão; `.opus`/`.m4a` viram `audio`; `.txt`, `.doc` sem driver e vídeo não
    resolvem driver.
@@ -150,6 +152,10 @@ tools/e2e_ingest.sh [--audio recado.m4a --audio-palavra X]   # 3. ponta a ponta,
    produção é gravado), manda cada formato pelo `POST /ingest_any`, confere o `driver` da resposta e que a
    **busca acha a palavra-âncora** do arquivo na base criada. Derruba tudo no fim; exit ≠ 0 se algum caso
    falhar. Usa o binário e os drivers instalados em `/opt/ragnarock` (troque com `--ragd`/`--ingestors`).
+   Com **`--bancos`**, sobe MySQL e Postgres em **containers descartáveis** (`--rm`, só em 127.0.0.1, porta
+   aleatória, senha gerada na hora e nunca impressa), semeia uma tabela e manda as receitas; confere ainda
+   que uma senha errada é recusada **sem aparecer no erro** e que **nenhuma senha** ficou nas bases, no log
+   ou na saída do ragd. Nunca aponta para um banco real. Precisa de docker (o MySQL leva ~90 s para subir).
 
 ## Fronteira (não confundir)
 

@@ -50,6 +50,13 @@ def parse_recipe(text):
     return directives, "\n".join(sql_lines).strip()
 
 
+def _uma_linha(e):
+    """A mensagem da exceção numa linha só: o psycopg2 (e às vezes o pymysql) quebra o erro em
+    várias linhas, e o ragd mostra só a ÚLTIMA linha do stderr — sem isto, a recusa chegava como
+    "Is the server running on that host…", sem dizer qual driver nem qual host."""
+    return " ".join(str(e).split())
+
+
 def main():
     if sys.stdin.isatty():
         sys.stderr.write(
@@ -85,7 +92,7 @@ def main():
             user=directives["user"], password=directives["pass"],
             connect_timeout=15, read_timeout=120, charset="utf8mb4")
     except Exception as e:
-        sys.stderr.write(f"mysql: falha ao conectar em {host}:{port}: {e}\n")
+        sys.stderr.write(f"mysql: falha ao conectar em {host}:{port}: {_uma_linha(e)}\n")
         return 1
     try:
         with conn.cursor() as cur:
@@ -98,7 +105,7 @@ def main():
                 writer.writerow(["" if v is None else v for v in row])
                 n += 1
     except Exception as e:
-        sys.stderr.write(f"mysql: erro na query: {e}\n")
+        sys.stderr.write(f"mysql: erro na query: {_uma_linha(e)}\n")
         return 1
     finally:
         conn.close()
