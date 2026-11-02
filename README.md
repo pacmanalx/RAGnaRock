@@ -73,13 +73,17 @@ The same library (`sylkit`) exists in three incarnations that produce **field-by
 In Norse myth, **Níðhöggr** is the serpent that gnaws the roots of Yggdrasil. In RAGnaRock, `nidhoggd`
 is a (benevolent) *worm* that **digests the knowledge** of the collections and distills it into insight
 that **survives the deletion of the collection**. It's the project's **analytical layer**: **autonomous**
-(`ragd` never consumes it; the reader is the human), with four levels — from the **AI-free** index
-(level 0, where the RAG self-organizes) to the propositive **living document** (level 3, with AI).
+(`ragd` never consumes it; the reader is the human), with five levels (`0`–`4`): **`minerador`** (0, no AI
+— lexical index and cache digest), **`consciente`** (1, with AI — classifies into `{natureza, tipo}`,
+builds templates and extracts normalized records), **`estrutural`** (2, no AI — deterministic mention
+census, dimensions and navigable graph), **`estrutural-llm`** (3, with AI — distills relations from the
+densest scenes into the same graph) and **`propositivo`** (4, with AI — answers direct questions over the
+accumulated knowledge and logs each perspective shift on the timeline).
 
-> **Status: 🚧 partial.** Skeleton ready (separate process on port **11497**, API, level/cadence dials);
-> the per-level intelligence (1–3, **opt-in** and AI-powered) is under development. The full design
-> (level hierarchy, versioned artifacts, acceptance gate, AI graph, per-level prompt and open questions)
-> lives in [`ARCHITECTURE.md` §5](ARCHITECTURE.md#5-nidhoggd--níðhöggr--intelligence-layer-11497-partial).
+> **Status: 🚧 partial.** Separate daemon on port **11497**, API, level (`0`–`4`) and cadence dials,
+> backed by ClickHouse (levels 1, 3 and 4 are **opt-in** and AI-powered; levels 0 and 2 use no AI).
+> The full design lives in
+> [`ARCHITECTURE.md` §5](ARCHITECTURE.md#5-nidhoggd--níðhöggr--intelligence-layer-11497-partial).
 
 ---
 
@@ -142,12 +146,18 @@ in **[`specs/SYLLABLE.md`](specs/SYLLABLE.md)**.
 
 **New** project (born May 2026), under active development — treat it as **alpha**. The core works
 end to end: syllabic search (recall + rerank), daemon with API, ValHalla console, code drivers,
-query expansion, incremental ingestion and MCP integration.
+query expansion, incremental ingestion, concurrent searches that ingestion doesn't block, importers
+in [`ingestors/`](ingestors/) (PDF, DOCX, XLSX, PPTX, CSV, audio, MySQL and Postgres) and MCP integration.
 
-**On the radar:** repository ingestion with per-file update, more importers (PDF/DOCX/XLSX),
-concurrency (N searches in parallel) and a double-click Windows build. There is **no** formal test
-suite or CI yet — fidelity is checked manually (generate on one side, read/search on the other; the
-fields match exactly).
+**On the radar:** repository ingestion with per-file update and a `sync` client (#34), ingestion
+triggered by the user's AI (#10), an on-SSD inverted index to scale to millions of chunks (#43),
+SQL, GraphQL and MySQL-wire interfaces (#35, #36, #40) and a double-click Windows build (#11).
+
+**Tests:** `cargo test` in `ragd/` and `nidhoggd/`; `python3 -m unittest discover -s ingestors/tests -v`
+for the ingestion drivers (tests whose optional dependency is missing are skipped);
+`tools/e2e_ingest.sh [--bancos]` end to end against a throwaway `ragd` (and throwaway MySQL/Postgres
+containers). There is **no** CI yet, and fidelity between the three incarnations is still checked
+manually (generate on one side, read/search on the other; the fields match exactly).
 
 ---
 

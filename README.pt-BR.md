@@ -72,13 +72,16 @@ A mesma lib (`sylkit`) existe em três encarnações que produzem **resultados i
 No mito nórdico, **Níðhöggr** é a serpente que rói as raízes de Yggdrasil. No RAGnaRock, o `nidhoggd`
 é um *worm* (do bem) que **digere o conhecimento** das coleções e o destila num saber que **sobrevive
 à deleção da coleção**. É a **camada analítica** do projeto: **autônoma** (o `ragd` nunca a consome; o
-leitor é o humano), com quatro níveis — do índice **sem IA** (nível 0, o RAG se auto-organiza) ao
-**documento vivo** propositivo (nível 3, com IA).
+leitor é o humano), com cinco níveis (`0`–`4`): **`minerador`** (0, sem IA — índice léxico e digest do
+cache), **`consciente`** (1, com IA — classifica em `{natureza, tipo}`, gera moldes e extrai registros
+normalizados), **`estrutural`** (2, sem IA — censo determinístico de menções, dimensões e grafo
+navegável), **`estrutural-llm`** (3, com IA — destila relações nas cenas mais densas e grava no mesmo
+grafo) e **`propositivo`** (4, com IA — responde questões diretas sobre o conhecimento acumulado e
+registra cada mudança de perspectiva na timeline).
 
-> **Estado: 🚧 parcial.** Esqueleto pronto (processo separado na porta **11497**, API, dials de nível e
-> cadência); a inteligência por nível (1–3, **opt-in** e com IA) está em desenvolvimento. O desenho
-> completo (hierarquia dos níveis, artefatos versionados, gate de aceite, grafo de IAs, prompt por nível
-> e questões em aberto) está em
+> **Estado: 🚧 parcial.** Daemon separado na porta **11497**, API, dials de nível (`0`–`4`) e cadência,
+> com armazenamento analítico no ClickHouse (níveis 1, 3 e 4 **opt-in** e com IA; níveis 0 e 2 sem IA).
+> O desenho completo está em
 > [`ARCHITECTURE.pt-BR.md`](ARCHITECTURE.pt-BR.md#5-nidhoggd--níðhöggr--camada-de-inteligência-11497-parcial).
 
 ---
@@ -103,6 +106,12 @@ python3 python_concept/search_rag.py meu_corpus-tokenized.json "minha consulta" 
 > Convenção do projeto: **todo script/binário chamado sem argumentos mostra o help** — nunca roda
 > com defaults silenciosos.
 
+**Configuração:** o daemon lê um `ragnarock.cfg` opcional da pasta onde roda. Copie
+[`ragnarock.cfg.example`](ragnarock.cfg.example) para `ragnarock.cfg` e edite — toda chave é opcional
+e documentada na própria linha. O `ragnarock.cfg` de verdade está no gitignore (guarda a senha de admin
+e as chaves de API); **nunca faça commit dele**. Troque as credenciais padrão `admin/admin` antes de
+qualquer uso real — o daemon se recusa a abrir sessão com elas, a menos que suba com `--dev`.
+
 ---
 
 ## API do daemon (HTTP JSON)
@@ -123,18 +132,33 @@ Rotas principais: `GET /health · /bases · /collections · /profile · /stats` 
 Contrato formal das 3 APIs (ragd, ValHalla, nidhoggd): **[`JSONCONTRACT.pt-BR.md`](JSONCONTRACT.pt-BR.md)**.
 Exemplos executáveis `curl`: **[`ragd/json_samples/`](ragd/json_samples/)**.
 
+**Plugar num agente (MCP):** um servidor MCP de referência, que expõe o `ragd` como ferramentas nativas
+(busca, chunk, listagem, ingestão) para opencode, Claude Code e Kimi for Code, está em
+**[`examples/mcp/`](examples/mcp/)**.
+
+O silabificador — o algoritmo do token, com ~90 casos golden e um teste de conformidade — está
+especificado em **[`specs/SYLLABLE.md`](specs/SYLLABLE.md)**.
+
 ---
 
 ## Status
 
 Projeto **novo** (nasceu em maio/2026), em desenvolvimento ativo — encare como **alpha**. O núcleo
 funciona ponta a ponta: busca silábica (recall + rerank), daemon com API, console ValHalla, drivers
-de código, query expansion, ingestão incremental e integração via MCP.
+de código, query expansion, ingestão incremental, buscas concorrentes que a ingestão não trava,
+importadores em [`ingestors/`](ingestors/) (PDF, DOCX, XLSX, PPTX, CSV, áudio, MySQL e Postgres) e
+integração via MCP.
 
-**No radar:** ingestão de repositório com update por arquivo, mais importadores (PDF/DOCX/XLSX),
-concorrência (N buscas em paralelo) e build Windows de duplo-clique. Ainda **não** há suíte de
-testes formal nem CI — a verificação de fidelidade é manual (gerar por um lado, ler/buscar pelo
-outro; os campos batem exato).
+**No radar:** ingestão de repositório com update por arquivo e um cliente com `sync` (#34), ingestão
+disparada pela IA do usuário (#10), índice invertido no SSD para chegar a milhões de chunks (#43),
+interfaces SQL, GraphQL e compatível com o protocolo do MySQL (#35, #36, #40) e build Windows de
+duplo-clique (#11).
+
+**Testes:** `cargo test` em `ragd/` e `nidhoggd/`; `python3 -m unittest discover -s ingestors/tests -v`
+para os drivers de ingestão (os testes cuja dependência opcional falta são pulados);
+`tools/e2e_ingest.sh [--bancos]` ponta a ponta contra um `ragd` descartável (e containers MySQL/Postgres
+descartáveis). Ainda **não** há CI, e a fidelidade entre as três encarnações segue verificada à mão
+(gerar por um lado, ler/buscar pelo outro; os campos batem exato).
 
 ---
 
