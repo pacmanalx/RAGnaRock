@@ -246,21 +246,21 @@ O token é a **sílaba**, produzida por um silabador determinístico de PT-BR em
 |---|---|---|
 | GET | `/health` | `{status, bases, collections, drivers}` |
 | GET | `/bases` `?collection=&match=` | lista bases (com `corpus`, `n_chunks`...) |
+| GET | `/bases/{coll}/{name}` | metadados de 1 base sem buscar (#4) |
 | GET | `/collections` | resumo por coleção |
+| GET | `/profile` `?collection=&base=` | **perfil léxico** (`vocab_used`, `dims`, `top_idf[]`) que alimenta o nível 0 do Nidhogg (#1, §5.3) |
+| GET | `/stats` | agregado público (#3) |
 | GET | `/drivers` `?match=` | lista drivers |
 | GET | `/interpret` `?file=\|?ext=` | extensão → driver |
-| POST | `/search` | busca pura (recall+rerank) |
-| POST | `/search_expand` | busca com query expansion |
+| POST | `/search` | busca (recall+rerank) com estágios opt-in `expand`, `phonetic`, `literal_fallback` (#39) |
+| POST | `/search_expand` | atalho para `/search` com `expand: true` |
 | POST | `/ingest` · `/ingest_file` · `/ingest_upload` | ingestão (inclui `append=true`) |
+| POST | `/ingest_any` · `/transcribe` | ingestão por driver de `ingestors/` (MIME → extensão) · transcrição de áudio |
 | POST | `/chunk` | recupera chunk(s) inteiro(s) por id (`before`/`after`) |
 | DELETE | `/bases/{nome}` `?collection=` | remove base |
+| DELETE | `/collections/{nome}` | remove a coleção inteira |
 
 **A definir/faltam [FUTURO]:**
-- `DELETE /collections/{nome}` (remover coleção inteira).
-- `GET /stats` (agregado público; hoje só interno no console).
-- `GET /bases/{coll}/{name}` (metadados de 1 base sem buscar).
-- `GET /profile?collection=&base=` — **perfil léxico** (`vocab_used`, `dims`, `top_idf[]`) para alimentar
-  o **nível 0 do Nidhogg** sem sondar via `/search` (caro). Achado no ciclo de revisão (§5.3).
 - Ingestão **por arquivo dentro de um repo** (base = N arquivos; update incremental por `sha` de arquivo
   — ver §6). Hoje base = 1 arquivo.
 
@@ -368,16 +368,20 @@ todo local e offline (Laya base, pacotes e `SHA256SUMS` em `/dados/modelos/laya`
 
 - **Consumidor = o humano**, via ValHalla (e export): abre e **lê** os artefatos destilados.
 - **Artefatos de primeira classe** (entregáveis, não índice auxiliar de busca):
-  - **Documento vivo** (nível **propositivo**): cresce **indefinidamente** a cada ciclo. Caso de uso do
-    Pacman: *abrir depois de 15 dias e ler um resumo profundo de uma obra (ex.: O Senhor dos Anéis), com
-    nuances de detalhe, em estilos (moderno, arcaico…)* — um "companion" que aprofunda no tempo.
-  - **Árvore de conhecimento / mapa mental** (nível **estrutural**): navegável, partindo da obra — vale
-    pra **código-fonte, texto, livro, artigo**, qualquer ingestão da base.
-- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** serve esses artefatos (pra ValHalla e export).
+  - **Questões diretas & documento vivo** (nível **propositivo** — L4): questões (`tabular`, `oneshot`,
+    `vivo`) respondidas a cada ciclo sobre o conhecimento acumulado, onde cada mudança de perspectiva vira
+    etapa na timeline (`nidhogg.resposta`). Caso de uso do Pacman: *abrir depois de 15 dias e ler um
+    resumo profundo de uma obra (ex.: O Senhor dos Anéis), com nuances de detalhe, em estilos (moderno,
+    arcaico…)* — um "companion" que aprofunda no tempo.
+  - **Árvore de conhecimento / mapa mental** (níveis **estrutural** — L2, determinístico — e
+    **estrutural-llm** — L3, relações por IA): grafo navegável (`no_valor`, censo de menções, dimensões e
+    lacunas), partindo da obra — vale pra **código-fonte, texto, livro, artigo**, qualquer ingestão da base.
+- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** e as rotas analíticas (`/classes`, `/entities`,
+  `/tree`, `/relacoes`, `/dimensoes`, `/perguntas`, `/respostas`) servem esses artefatos (pra ValHalla e export).
 - O `ragd` **não lê nem injeta** isso na busca. Se um dia um agente quiser usar os artefatos como
   contexto, ele lê pela API do Nidhogg — **uso secundário e opcional**, não a razão de existir.
 
-### 5.3 `source_hash`, diff e incrementalidade [FUTURO]
+### 5.3 `source_hash`, diff e incrementalidade [FEITO]
 
 Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo, e digerir **só o que mudou**.
 
@@ -391,29 +395,43 @@ Kimi e Codex convergiram: detectar mudança real **barato**, sem falso-positivo,
 > ⚠️ **Furo de contrato achado (Kimi):** o `ragd` **não expõe hoje** `idf`/`dims`/vocabulário efetivo por
 > base num endpoint — o nível 0 teria que **sondar** via `/search` com sílabas-probe (caro). **Decisão:**
 > adicionar um endpoint de **perfil** no `ragd` → `GET /profile?collection=&base=` retornando
-> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Alimenta o nível 0 barato. **[FUTURO — contrato novo no ragd]**
+> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Alimenta o nível 0 barato. **[FEITO — #1, ver §3.7]**
 
-### 5.4 Os 4 níveis — algoritmos e schemas
+### 5.4 Os 5 níveis — algoritmos e schemas
 
 | nível | nome | IA? | produz | status |
 |---|---|---|---|---|
-| 0 | **minerador** | não | 3 pilares: RootIndex · CorpusDict · CacheDigest | [PARCIAL] |
-| 1 | **consciente** | sim | `Summary` por coleção (saber que sobrevive à deleção) | [FUTURO] |
-| 2 | **estrutural** | sim | **Árvore de conhecimento / mapa mental** da obra (`KnowledgeTree`) | [FUTURO] |
-| 3 | **propositivo** | sim | **Documento vivo incremental** (`LivingDocument`, cresce no tempo) + `Gap`/`Suggestion` | [FUTURO] |
+| 0 | **minerador** | não | 3 pilares: `RootIndex` · `CorpusDict` · `CacheDigest` | [FEITO] |
+| 1 | **consciente** | sim | Classificação `{natureza, tipo}` (`doc_class`, porteira Laya + LLM), moldes (`template`) e extração normalizada (`entidade`, medida por `NQI`) | [FEITO] |
+| 2 | **estrutural** | não | Grafo determinístico (`no_valor`, `KnowledgeTree`), censo de menções (`mencao`), co-ocorrência de cena, **dimensões** e lacunas (`gaps`) | [FEITO] |
+| 3 | **estrutural-llm** | sim | Relações por IA nas cenas densas do censo (`{a, rel, b, tema}`, com âncora determinística) gravadas no mesmo grafo (`no_valor`) | [FEITO] |
+| 4 | **propositivo** | sim | Questões diretas (`pergunta`: `tabular` · `oneshot` · `vivo`) sobre contexto determinístico (dump + pistas L3 + prova `/search`+`/chunk`), com analista + comparador e timeline (`resposta`) | [FEITO] |
 
-> 🏗️ **ESCALA (Hinode, milhões de docs) — decisão 09/ago/2026.** A tabela acima descreve o
-> desenho original. Para a escala real, os níveis 0 e 1 são **redefinidos**: o L0 vira o
-> **motor determinístico** que aplica templates aprendidos (zero-IA no caso comum) e o L1 vira
-> o **LLM que cria/mantém os templates** sob gatilho (não processa cada doc). A chave é o
-> **átomo de análise** (analisar o balanço, não a nota-a-nota) + um motor auto-adaptativo
-> medido pelo **NQI** (Normalization Quality Index). Design completo em
-> [`docs/2026-08-09_nidhogg-arquitetura-escala.md`](docs/2026-08-09_nidhogg-arquitetura-escala.md).
-> O `Summary` "1 LLM pesado por doc" descrito abaixo é **stopgap** (commit `d00a009`).
+> 🏗️ **ESCALA (Hinode, milhões de docs) — decisões 09/ago e 13/ago/2026.** Para a escala real, a régua foi
+> cravada em **5 níveis cumulativos (`0..4`)** apoiados no ClickHouse:
+> - **L0 (`minerador`, sem IA):** minera a estrutura léxica do corpus (`RootIndex`, `CorpusDict`, `CacheDigest`).
+> - **L1 (`consciente`, com IA):** classifica cada base em `{natureza, tipo}` com assinatura estrutural `forma`
+>   (via porteira Laya local sem LLM quando reconhecida com segurança, §5.1.3, ou LLM leve com vocabulário
+>   editável de `doctypes`), cria/mantém moldes regex (`template`) sob gatilho (cobertura ≥ 70% ou
+>   `POST /api/nidhogg/molde`) e extrai registros deterministicamente (`csv=1` tabular ou `csv=0` via molde,
+>   zero LLM linha-a-linha), pontuando cada registro pelo **NQI** (Normalization Quality Index).
+> - **L2 (`estrutural`, sem IA):** grafa as relações **deterministicamente** sobre o dado normalizado — censo de
+>   menções em prosa (`mencao`, no miolo 5%–95% da obra), nós de valor (`no_valor`), co-ocorrência de cena e
+>   eixos de **dimensões** (`/dimensoes`, `/dimensoes/gaps`).
+> - **L3 (`estrutural-llm`, com IA):** o mesmo grafo do L2, mas **100% LLM-bound** para o que o determinístico
+>   não alcança — toma as cenas mais densas do censo do L2, destila relações `{a, rel, b, tema}` via LLM e aplica
+>   **âncora determinística** (o censo veta pontas fora das entidades presentes na cena e verbos de ligação puros)
+>   antes de gravar no mesmo grafo (`no_valor`, com selo de origem).
+> - **L4 (`propositivo`, com IA):** responde às **questões diretas** cadastradas pelo operador (`tabular`,
+>   `oneshot`, `vivo`). É determinístico no ponto de inferência (`l4_contexto` monta agregados/amostra do dump +
+>   pistas do L3 + trechos inteiros de **prova** via `/search` e `/chunk`), o **analista** responde com `fontes`
+>   obrigatórias e sugere `proximas` perguntas-filhas, e nas questões `vivo` o **comparador** só grava nova etapa
+>   na timeline (`nidhogg.resposta`) quando a perspectiva muda (com gate de saturação por fingerprint `l4_visto`).
+> Design de escala em [`docs/2026-08-09_nidhogg-arquitetura-escala.md`](docs/2026-08-09_nidhogg-arquitetura-escala.md).
 
-**Nível 0 (sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
+**Nível 0 (`minerador`, sem IA) — os 3 pilares.** ⚠️ **Honestidade (Codex):** nível 0 é **navegação / índice /
 health-check** ("minha coleção está íntegra e navegável?"), **não "conhecimento"** — não vender como tal.
-Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e custa zero IA.
+Mesmo assim entrega valor sozinho (base pros níveis superiores + observabilidade) e custa zero IA.
 
 > 🌱 **A semente do Nidhogg (origem da ideia).** O nível 0 é o pedaço que devolve ao RAGnaRock **coleções
 > organizadas sobre as próprias coleções** — um **agente de auto-organização autônomo** do RAG sobre si
@@ -427,56 +445,57 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
 - **CacheDigest** — consolida o cache de query-expansion: sinônimos vistos ≥ N vezes que mapeiam os
   **mesmos** chunks viram clusters de equivalência. `content:{ entries:[{canonical, variants, shared_chunk_ids, hit_count}], hit_rate }`.
 
-**Níveis 1–3 (IA) — entrada, amostragem e saída:**
+**Níveis 1–4 — entrada, amostragem e saída:**
 
-| nível | entrada pro LLM | amostragem | saída (`type`) |
-|---|---|---|---|
-| 1 | chunks **novos/alterados** desde o `source_hash` + meta da base | até `MAX_CHUNKS_PER_LEVEL` (~100) espaçados + top-N por `idf`; se poucos, todos | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
-| 2 | `Summary` de nível 1 da obra/coleção (metadado — não amostra) | — | `KnowledgeTree {root, nodes[], edges[]}` — mapa mental navegável (hierarquia/encaixe de dimensões é a base) |
-| 3 | a obra + `KnowledgeTree` + `Summary` + a versão anterior do documento vivo | incremental: só o que entrou desde o último ciclo | `LivingDocument {sections[], style, version, grows:true}` (resumo profundo que cresce, variantes de estilo) + `Gap`/`Suggestion` |
+| nível | nome | entrada | amostragem / motor | saída (ClickHouse / API) |
+|---|---|---|---|---|
+| 1 | `consciente` (IA) | chunk 0 (1000 chars) + assinatura estrutural `forma` das bases novas/alteradas | Porteira Laya local (§5.1.3) ou LLM (`classificador`); moldes regex por `tipo@forma` (`modelador`, cobertura ≥ 70%); extração determinística | `doc_class {natureza, tipo, forma, csv, extraivel}` · `template` · `entidade` (`nqi`, `campos`) |
+| 2 | `estrutural` (sem IA) | registros de `entidade` (L1) + chunks de bases narrativas (miolo 5%–95%) | Determinístico (zero IA): censo de sintagmas nominais/técnicos + indexação reversa de valores e co-ocorrência por `(base, idx)` | `mencao` · `no_valor` (`KnowledgeTree`: `/tree`, `/suggest`, `/node`) · `dimensoes` e `/dimensoes/gaps` |
+| 3 | `estrutural-llm` (IA) | cenas mais densas do censo do L2 (chunks com mais entidades co-ocorrendo) | Até 4 janelas da base narrativa mais densa pendente por ciclo (`relacoes`) + filtro de âncora determinística | `entidade` (`tipo="relacao": {a, rel, b, tema}`) colada no mesmo grafo `no_valor` (`/relacoes`) |
+| 4 | `propositivo` (IA) | questão ativa (`pergunta`) + dump estruturado (L1) + pistas de relações (L3) + chunks de prova do `ragd` | Contexto montado por regra (`l4_contexto`) + gate de saturação (`l4_fingerprint`); LLM `analista` + LLM `comparador` (em questões `vivo`) | `resposta` (etapas versionadas na timeline com `fontes[]` obrigatórias e `proximas[]`) |
 
 - **Orçamento é DECISÃO DE QUEM RODA:** cadência = orçamento de **tempo** por ciclo; somar teto de
-  **tokens/ciclo** para os níveis IA. Nasce **OFF**, opt-in por coleção (§5.1), nível 0 cobre o sem-IA, e
+  **tokens/ciclo** para os níveis IA. Nasce **OFF**, opt-in por coleção (§5.1), níveis 0 e 2 são zero-IA, e
   **sem teto de gasto por default** — escolha consciente, com **disclaimer obrigatório ao ligar** (§4). O
-  grafo de IAs (dim. 3) multiplica o consumo (N IAs × N níveis) — é a camada $$$ por excelência.
+  grafo de IAs multiplica o consumo (N IAs × N níveis) — é a camada $$$ por excelência.
 - **Rate-limit = a própria configuração das dimensões (decisão Pacman):** não há rate-limiter à parte. O
-  dono define **quando cada dimensão dispara dentro do ciclo** (ex.: nível 1 a cada ciclo, nível 3 a cada
-  N ciclos) — *isso já é* o controle de vazão/custo. Soma-se a isso o teto opcional de tokens/ciclo. Assim,
-  "consumir muita IA" vira uma escolha explícita na config, não um acidente.
-- **Incremental:** nível 1 processa só chunks novos; nível 0 reprocessa a base alterada inteira (é barato).
-- **Ordem HIERÁRQUICA (1→2→3):** os níveis IA acontecem **em sequência** — não há nível 2 sem o 1, nem 3
-  sem o 2 (a dimensão do conhecimento é hierárquica por natureza). O **dial seleciona o nível-topo**; o
-  worker roda `1..N` em ordem dentro do ciclo. Nível 0 (sem IA) é sempre a base.
+  dono define **quando cada dimensão dispara dentro do ciclo** — *isso já é* o controle de vazão/custo. Soma-se a
+  isso o teto opcional de tokens/ciclo. Assim, "consumir muita IA" vira uma escolha explícita na config, não um acidente.
+- **Incremental:** cada camada rastreia seu checkpoint por `(state_hash, cfg_hash)` (incluindo `llm_tag` e hash do
+  prompt/vocabulário); o L4 só chama IA quando o fingerprint `(dump, corpus, pergunta, prompt, llm_tag)` muda.
+- **Ordem HIERÁRQUICA (`0 → 1 → 2 → 3 → 4`):** os níveis acontecem **em sequência cumulativa** — o L1 classifica
+  e normaliza sobre o L0; o L2 grafa deterministicamente sobre o L1; o L3 enriquece o grafo do L2 com relações
+  por IA; o L4 responde questões cruzando o dump (L1), as pistas (L3) e a prova bruta (`/search` + `/chunk`). O
+  **dial seleciona o nível-topo (`0..4`)**; o worker roda `0..N` em ordem dentro do ciclo.
 - **Aditivo, versionado + gate de aceite (decisão Pacman, ciclo 4):** o artefato de cada dimensão é
   **versionado** — toda re-derivação cria uma `version` nova e arquiva a anterior como `frozen_version`
   (§5.7); o conjunto de versões **só acumula** (aditivo), mesmo quando o corpo ativo é substituído. Entre
   uma dimensão e a seguinte há um **gate de aceite opcional, ligável POR DIMENSÃO** (`accept_gate` =
   conjunto de níveis com gate, no ValHalla) — **não** global e **não** por item gerado. Ligar o gate na
-  dimensão N significa: *o artefato de N só libera a dimensão N+1 depois de aprovado*. **Só há dois pontos
-  lógicos de gate: `accept_gate ⊆ {1, 2}`** (controlam 1→2 e 2→3):
+  dimensão N significa: *o artefato de N só libera a dimensão N+1 depois de aprovado*:
   - **0→1 nunca tem gate** — nível 0 é auto-organização autônoma do RAG sobre si mesmo (a semente do
     Nidhogg, ver acima); não há o que aprovar.
-  - **3 não tem gate** — é o nível-topo, não há dimensão seguinte pra liberar.
-  - **1→2 raramente fica ligado na prática** — a dim. 1 emite *muito* mais artefatos (um `Summary` por
-    coleção/base); aprovar tudo seria inviável. O gate em **2→3** é o palatável (bem menos artefatos).
+  - **4 não tem gate** — é o nível-topo, não há dimensão seguinte pra liberar.
+  - **1→2 raramente fica ligado na prática** — a dim. 1 emite *muito* mais artefatos (por base);
+    aprovar tudo seria inviável. O gate antes da camada propositiva é o mais palatável (bem menos artefatos).
   - **dimensão sem gate (default):** cascata automática — o artefato alimenta a dimensão seguinte no mesmo ciclo.
   - **dimensão com gate ON:** o artefato fica `pending` e **só libera a próxima dimensão após o aceite
-    humano** (botão no ValHalla). É o checkpoint de qualidade — ex.: com gate na dim. 2, o humano valida a
-    árvore **antes** de o documento vivo (dim. 3) nascer dela. O aceite é também o **sinal de utilidade**
+    humano** (botão no ValHalla). É o checkpoint de qualidade — o humano valida a árvore/grafo **antes** de a
+    camada propositiva (L4) derivar dela. O aceite é também o **sinal de utilidade**
     (fecha o feedback-loop apontado pelo Kimi) sem o `ragd` jamais consumir o artefato.
   - **Trade-off consciente (frisar):** ligar o gate **quebra o ciclo autônomo** (§5.2) e injeta
     **dependência humana** — o worm para e *espera* o aceite, deixa de andar sozinho. Isso pode ser
     aceitável (quero revisar antes de aprofundar) ou inaceitável (quero o worm 100% autônomo). Não há
     resposta certa: é por isso que é **feature opt-in**, uma troca *autonomia × controle* decidida caso a
     caso por quem opera — nunca imposta.
-- **Prompt por nível = o TOM (decisão Pacman):** cada nível IA (1, 2, 3) tem um **prompt configurável**
-  (editável no ValHalla / `nidhogg.cfg`: `prompt_consciente`, `prompt_estrutural`, `prompt_propositivo`)
-  — é como você dita o **tom/estilo** de cada extração (ex.: moderno vs arcaico no `LivingDocument`).
+- **Prompts por papel = o TOM (decisão Pacman):** cada papel de IA (`classificador`, `extrator`, `modelador`,
+  `relacoes`, `analista`, `comparador`) tem um **template de prompt configurável** em `prompts.json` (editável no
+  ValHalla via `/api/nidhogg/prompts/template`) — e o seu hash entra no checkpoint da camada correspondente.
 - **Cascata-delta — 3 modos de re-derivação (decisão Pacman, ciclo 4):** quando um nível inferior muda, o
   superior re-deriva pelo vínculo `derived_from`/`digestion_id`, mas **não assume crescimento monotônico**
   (a crítica do Kimi: rastrear proveniência ≠ rastrear impacto semântico). O artefato cresce, **encolhe ou
   é refeito**, em três modos:
-  - **aditivo** — anexa o delta (a obra ganhou conteúdo; o `LivingDocument` estende, a árvore ganha galho).
+  - **aditivo** — anexa o delta (a obra ganhou conteúdo; a timeline ganha etapa, a árvore ganha galho).
   - **substituição estrutural** — troca uma **seção / galho inteiro**, não só a ponta. É o caso comum em
     **código**: mudar uma linha estrutural reescreve a *linha de raciocínio* toda — *"a corda não só
     cresce; às vezes o trecho é trocado por completo"*.
@@ -486,58 +505,59 @@ Mesmo assim entrega valor sozinho (base pros níveis IA + observabilidade) e cus
   histórico — §5.7); o **corpo ativo** é sempre o atual. O gatilho do modo: mudança aditiva → local;
   *reframing* detectado no nível 1 → substituição/reescrita. (Mecanismo fino de impacto — assinatura
   semântica por galho pra decidir local vs. global — fica **[FUTURO — implementação]**.)
-- **Auto-melhoria embutida na camada propositiva (dispensa "Synthesis"):** a dim. 3 **lê a versão
-  anterior do documento e a aprimora** — refinar É a análise propositiva. Por isso **não há mecanismo de
-  consolidação à parte**: o risco que o Kimi levantou (documento vivo incha/repete/contradiz) se resolve
-  por construção, dentro do próprio nível 3, a cada ciclo.
-- **Grafo de IAs em confronto — exclusivo da camada propositiva (decisão Pacman, ciclo 4):** na dim. 3 o
-  artefato final **não precisa sair de uma única IA**. O operador monta no ValHalla um **grafo de
-  inferência**: nós = IAs disponíveis (providers plugáveis — Bedrock, Kimi, Codex, local…), arestas =
-  **quem confronta / alimenta quem**, em **N níveis** de confronto até *"o artefato que gera o artefato
-  final"*. É o padrão Side AI (gerador × crítico × árbitro) **institucionalizado dentro do Nidhogg**. Os
-  artefatos intermediários do grafo são **insumo**; só o nó-raiz emite o `LivingDocument` versionado.
-  - **Só vale para a dim. 3.** Dims 1 e 2 usam **IA direta** (1 chamada por extração) — confronto multi-IA
+- **Auto-melhoria embutida na camada propositiva (dispensa "Synthesis"):** no L4 (`vivo`), o **comparador** lê a
+  etapa anterior da resposta e confronta com a nova — só grava nova etapa quando a perspectiva realmente muda.
+  Por isso **não há mecanismo de consolidação à parte**: o risco que o Kimi levantou (documento vivo
+  incha/repete/contradiz) se resolve por construção, dentro do próprio nível 4, a cada ciclo.
+- **Grafo de IAs em confronto — exclusivo da camada propositiva (decisão Pacman, ciclo 4):** no L4 o
+  artefato final **não precisa sair de uma única IA** (hoje já opera com a dupla `analista` × `comparador`). O
+  operador monta no ValHalla um **grafo de inferência**: nós = IAs disponíveis (providers plugáveis — Bedrock,
+  Kimi, Codex, local…), arestas = **quem confronta / alimenta quem**, em **N níveis** de confronto até *"o
+  artefato que gera o artefato final"*. É o padrão Side AI (gerador × crítico × árbitro) **institucionalizado
+  dentro do Nidhogg**.
+  - **Só vale para o L4.** L1 e L3 usam **IA direta** (1 chamada por extração) — confronto multi-IA
     é custo que só a camada propositiva justifica.
   - O **provider** aqui deixa de ser "escolher 1 modelo" e vira "orquestrar vários num DAG de confronto"
     (plugáveis: Bedrock, escolha de modelo, round-robin). Config do grafo no `nidhogg.cfg`/ValHalla. **[FUTURO]**
 
-### 5.5 Ciclo do worker, arquivos e resumabilidade [FUTURO]
+### 5.5 Ciclo do worker, arquivos e resumabilidade [PARCIAL]
 
-**Layout por coleção** (em `dir/`), append-only para ser resumível:
+**Layout em disco e ClickHouse:** `<dir>/<coll>.knowledge.json` guarda os pilares do L0, procedência e
+`l0_diff`; `<dir>/prompts.json` guarda os templates de prompt; `<dir>/llm-ledger.jsonl` registra as chamadas de
+IA (§5.1.1); o ClickHouse (`nidhogg.*`) guarda `doc_class`, `doctype`, `template`, `entidade` (com a view
+`entidade_atual`), `no_valor`, `dimensao`, `pergunta` e `resposta`.
+
+**Fluxo real de um ciclo (`run_cycle`):**
+
+```
+para cada coleção HABILITADA:
+  nível 0 (sempre): RootIndex + CorpusDict → <coll>.knowledge.json
+  se nivel_topo >= 1:
+    reconcilia_bases (relink de renomeadas + poda após prune_grace_h — §5.1.2)
+    L1 (consciente): mine_classes (porteira Laya / LLM) → mine_templates (1 molde/ciclo) → mine_entities (NQI)
+  se nivel_topo >= 2:
+    L2 (estrutural, zero IA): mine_fichas (censo de menções em prosa) → mine_links (grafo no_valor)
+  se nivel_topo >= 3:
+    L3 (estrutural-llm): mine_relacoes (relações por IA nas cenas densas, com âncora) → mine_links
+global (uma vez por ciclo):
+  CacheDigest (/expansions do ragd) → _cachedigest.json
+  se nivel_topo >= 4:
+    L4 (propositivo): mine_respostas (contexto determinístico → analista → comparador → timeline)
+```
+
+**Design futuro de layout append-only por coleção** (em `dir/`), para resumabilidade fina:
 
 ```
 <dir>/
   <coll>.knowledge.jsonl    # 1 item de conhecimento por linha (escrita atômica, append)
   <coll>.checkpoint.json    # { base_name: state_hash } + última base processada
   <coll>.provenance.jsonl   # 1 digestão por linha
-  <coll>.config.json        # { enabled, level, cadence_s, last_run, accept_gate:[⊆{1,2}] }
+  <coll>.config.json        # { enabled, level, cadence_s, last_run, accept_gate:[...] }
 ```
 
-**Pseudo-fluxo de um ciclo** (sintetizado com Kimi):
-
-```
-para cada coleção HABILITADA:
-  bases_atuais = GET /bases?collection=coll
-  diff = compara(checkpoint_anterior, state_hash(bases_atuais))   # novas/alteradas/removidas
-  digestion_id = uuid()
-  nivel_topo = config[coll].level                       # dial = nível-topo (0..3)
-  nível 0 (sempre): RootIndex + CorpusDict + CacheDigest da coleção → append no .jsonl
-  para cada base ALTERADA: atualiza checkpoint[base] = state_hash
-  # níveis IA em sequência ESTRITA, sempre por coleção/obra (nunca cross-coleção).
-  # gate é POR DIMENSÃO: o nível N só roda se o N-1 não tem gate, ou sua versão está accepted:
-  liberado(N) = ((N-1) not in accept_gate) or (versao_atual(N-1).status == "accepted")
-  se nivel_topo >= 1 e liberado(1): Summary dos chunks NOVOS → nova version → append (pending|accepted)
-  se nivel_topo >= 2 e liberado(2): KnowledgeTree da obra ← Summary (re-deriva o galho) → version → append
-  se nivel_topo >= 3 e liberado(3): LivingDocument (anexa delta) + Gap/Suggestion
-                                    ← KnowledgeTree + Summary + versão anterior → version → append
-  grava provenance(digestion_id, inputs=bases_alteradas)
-  recomputa saturation ; marca órfãos (bases removidas)
-```
-
-**Resumabilidade:** se a IA falha no meio, o `.jsonl` já gravado é válido (append atômico) e o
-`checkpoint` aponta a última base concluída → o próximo ciclo **retoma** dali. Nunca append cego:
-dedup por `digestion_id`/`derived_from`. O `<coll>.knowledge.json` consolidado (§5.6) é uma **view**
-do `.jsonl`+checkpoint (ou o `.jsonl` vira o canônico e o `.json` é gerado). **[decisão de implementação]**
+**Resumabilidade:** no ClickHouse, cada etapa grava seu checkpoint (`state_hash` + `cfg_hash` + `llm_tag`),
+então se a IA falha no meio de um ciclo, o próximo ciclo **retoma** das bases/perguntas pendentes sem
+reprocessar o que já convergiu.
 
 ### 5.6 Schema do conhecimento consolidado — `<dir>/<coll>.knowledge.json`
 
@@ -579,15 +599,16 @@ knowledge[]}`). Forma-alvo:
 
 ### 5.8 API do módulo
 
-> Contrato detalhado em **[`JSONCONTRACT.pt-BR.md` §3](JSONCONTRACT.pt-BR.md#3-nidhoggd--inteligência-11497-parcial)**.
+> Contrato detalhado em **[`JSONCONTRACT.pt-BR.md` §3](JSONCONTRACT.pt-BR.md#3-nidhoggd--inteligência-11497)**.
 
-**[FEITO]** `GET /health` · `GET /api/nidhogg` (status: nível, cadência, keepalive do ragd, conhecimento) ·
-`GET /api/nidhogg/collections` (coleções + estado de digestão) · `POST /api/nidhogg`
-(`{on, level, cadence}`) · `POST /api/nidhogg/collection` (`{collection, enabled}`) ·
-`POST /api/nidhogg/run` (dispara ciclo — **stub**).
+**[FEITO]**
+- **Estado e controle (§3.1):** `GET /health` · `GET /api/nidhogg` (status, nível `0`–`4`, `levels[]`, cadência, keepalive do ragd e da IA) · `POST /api/nidhogg` (`{on, level, cadence}`) · `GET /api/nidhogg/collections` · `POST /api/nidhogg/collection` (`{collection, enabled}`) · `POST /api/nidhogg/run` (dispara ciclo assíncrono).
+- **Conhecimento e prompts (§3.2):** `GET /api/nidhogg/knowledge` · `GET /api/nidhogg/cachedigest` · `GET /api/nidhogg/prompts` · `POST /api/nidhogg/prompts/template` · `GET /api/nidhogg/llm_ledger`.
+- **Classificação, extração e grafo — L1/L2/L3 (§3.3):** `GET|POST /api/nidhogg/doctypes` · `GET /api/nidhogg/doctypes/uso` · `GET /api/nidhogg/classes` · `POST /api/nidhogg/reclass` · `POST /api/nidhogg/relink` · `POST /api/nidhogg/molde` · `GET /api/nidhogg/templates` · `GET /api/nidhogg/rejeitados` · `GET /api/nidhogg/entities` · `GET /api/nidhogg/relacoes` · `GET /api/nidhogg/tree` · `GET /api/nidhogg/suggest` · `GET /api/nidhogg/node`.
+- **Dimensões — L2 (§3.4):** `GET|POST /api/nidhogg/dimensoes` · `POST /api/nidhogg/dimensoes/upsert` · `POST /api/nidhogg/dimensoes/remover` · `GET /api/nidhogg/dimensao/valores` · `GET /api/nidhogg/dimensoes/gaps`.
+- **Perguntas e respostas — L4 (§3.5):** `GET|POST /api/nidhogg/perguntas` · `POST /api/nidhogg/perguntas/upsert` · `POST /api/nidhogg/perguntas/remover` · `POST /api/nidhogg/perguntar` · `GET /api/nidhogg/respostas` · `POST /api/nidhogg/respostas/limpar`.
 
-**[FUTURO]** `GET /api/nidhogg/knowledge?collection=&type=&level=` (consumo do saber destilado — §5.2) ·
-`POST /api/nidhogg/accept` (`{collection, type, level, version}` → marca `status:accepted`, libera o
+**[FUTURO]** `POST /api/nidhogg/accept` (`{collection, type, level, version}` → marca `status:accepted`, libera o
 nível seguinte quando `accept_gate=on` — §5.4).
 
 ### 5.9 Questões em aberto (pauta das próximas rodadas Side AI)
@@ -610,12 +631,20 @@ nível seguinte quando `accept_gate=on` — §5.4).
 - **Repo como base (não 1-arquivo-por-base) [FUTURO]:** schema de chunk ganha `file` + linhas; `meta`
   ganha mapa de arquivos com `sha`; `POST /ingest_file {base, file}` recomputa só aquele arquivo
   (remove os chunks antigos do `file`, insere os novos, atualiza `sha`); `POST /sync {base, path}` varre
-  e atualiza só o que mudou. É o coração do "RAG de código com update por arquivo".
-- **Ingestores acionados pela IA do usuário [FUTURO]:** o agente dispara ingestão (repo, diff de git,
+  e atualiza só o que mudou. É o coração do "RAG de código com update por arquivo". O cliente com
+  `.ragnarock/` + `sync` está na #34.
+- **Ingestores acionados pela IA do usuário [FUTURO] (#10):** o agente dispara ingestão (repo, diff de git,
   arquivos específicos) via MCP / CLIs.
-- **Importadores [FUTURO]:** PDF/DOCX/XLSX (extração no cliente vs sidecar no servidor).
-- **Build Windows [FUTURO]:** Rust puro deve compilar; cuidar `/dev/urandom` (entropia Windows) e
+- **Importadores [FEITO] (#9, #50):** PDF, DOCX, XLSX, PPTX, CSV, áudio, MySQL e Postgres, como sidecar no
+  servidor: o `ragd` chama o driver de `ingestors/` por shell (`POST /ingest_any`, roteamento MIME → extensão;
+  ver [`ingestors/README.md`](ingestors/README.md)). Testes em `ingestors/tests/` e `tools/e2e_ingest.sh`.
+- **Índice invertido no SSD [FUTURO] (#43):** postings por sílaba, para o recall escalar a milhões de chunks.
+- **Interfaces SQL, GraphQL e compatível com o protocolo do MySQL [FUTURO] (#35, #36, #40):** consultar o RAG
+  com `SELECT`, com GraphQL ou conectando um cliente MySQL (HeidiSQL, DBeaver) na porta 11500.
+- **Build Windows [FUTURO] (#11):** Rust puro deve compilar; cuidar `/dev/urandom` (entropia Windows) e
   `log_file` default.
+- **Testes [PARCIAL]:** `cargo test` em `ragd/` e `nidhoggd/`, `unittest` em `ingestors/tests/` e
+  `tools/e2e_ingest.sh` (ponta a ponta, com MySQL/Postgres descartáveis em `--bancos`). Falta CI.
 - **Deploy [FEITO]:** cross-compile (`cargo zigbuild --target {x86_64,aarch64}-unknown-linux-gnu.2.31`)
   + rsync do binário + launcher que sobe `ragd` + `nidhoggd` detached e redireciona stdout pro `log_file`.
 - **Segurança [PARCIAL]:** trocar `admin/admin`; chaves só no `cfg` (gitignored); CORS aberto na 11497
@@ -625,9 +654,10 @@ nível seguinte quando `accept_gate=on` — §5.4).
 
 ## 7. Apêndice — modos de falha
 
-**Óbvios:** JSON de base corrompido (gravar `.bak` antes do overwrite, validar no load) · OOM (usar
-`hybrid`, [FUTURO] tetos de bases/chunks) · IA fora (níveis ≥1 degradam pro nível 0) · ragd fora (o
-keepalive do Nidhogg degrada gracioso, status do cache).
+**Óbvios:** JSON de base corrompido (`.bak` gravado antes do overwrite; JSON inválido é pulado+logado no
+load, o boot nunca cai — #12) · OOM (usar `hybrid`; os tetos configuráveis `max_bases` /
+`max_chunks_per_base` recusam ingestões grandes demais — #13) · IA fora (níveis ≥1 degradam pro nível 0) ·
+ragd fora (o keepalive do Nidhogg degrada gracioso, status do cache).
 
 **Não-óbvios (Kimi/Codex):** silabificação divergente entre ingestão e busca (mesmo driver/vocab é
 obrigatório — append herda o driver da base) · starvation de writers no RwLock (usar lock justo) ·
@@ -642,10 +672,10 @@ inexistentes (confidence + auditoria humana).
 | decisão | gatilho | opções |
 |---|---|---|
 | mmap/on-disk | corpus > ~80% RAM | **texto: feito (#41, `storage = disk`)**; vetores/índice em disco seguem futuros |
-| `RwLock` + paralelismo inter-query | latência sob carga concorrente real | RwLock; depois lock por coleção |
+| `RwLock` + paralelismo inter-query | latência sob carga concorrente real | **feito: RwLock justo (#6) + fotografia das bases com travas curtas (#37)**; latência de cauda de buscas globais simultâneas segue em aberto (§3.5) |
 | base = repo (N arquivos) | usar como RAG de código a sério | `file`+`sha` no schema; `/sync` |
 | podar sinônimos idf-baixo no expand | expansão poluindo lookup | filtro por idf na cascata |
-| Nidhogg níveis 1–3 (IA) | decisão do dono (orçamento + cadência) | começa no nível 0; sobe por roadmap, gated por budget+disclaimer (§5.2/§5.4) — **não** por "esperar consumidor" |
+| Nidhogg níveis 1–4 (IA: 1, 3, 4; sem IA: 0, 2) | decisão do dono (orçamento + cadência) | começa no nível 0; sobe por dial (`0`–`4`), gated por budget+disclaimer (§5.2/§5.4) — **não** por "esperar consumidor" |
 
 ---
 

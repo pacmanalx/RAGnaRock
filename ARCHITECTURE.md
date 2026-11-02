@@ -246,21 +246,21 @@ The token is the **syllable**, produced by a deterministic PT-BR syllabifier in 
 |---|---|---|
 | GET | `/health` | `{status, bases, collections, drivers}` |
 | GET | `/bases` `?collection=&match=` | list bases (with `corpus`, `n_chunks`...) |
+| GET | `/bases/{coll}/{name}` | metadata of 1 base without searching (#4) |
 | GET | `/collections` | summary per collection |
+| GET | `/profile` `?collection=&base=` | **lexical profile** (`vocab_used`, `dims`, `top_idf[]`) that feeds Nidhogg's level 0 (#1, §5.3) |
+| GET | `/stats` | public aggregate (#3) |
 | GET | `/drivers` `?match=` | list drivers |
 | GET | `/interpret` `?file=\|?ext=` | extension → driver |
-| POST | `/search` | pure search (recall+rerank) |
-| POST | `/search_expand` | search with query expansion |
+| POST | `/search` | search (recall+rerank) with opt-in stages `expand`, `phonetic`, `literal_fallback` (#39) |
+| POST | `/search_expand` | preset for `/search` with `expand: true` |
 | POST | `/ingest` · `/ingest_file` · `/ingest_upload` | ingestion (includes `append=true`) |
+| POST | `/ingest_any` · `/transcribe` | ingestion through an `ingestors/` driver (MIME → extension) · audio transcription |
 | POST | `/chunk` | retrieve whole chunk(s) by id (`before`/`after`) |
 | DELETE | `/bases/{name}` `?collection=` | remove base |
+| DELETE | `/collections/{name}` | remove a whole collection |
 
 **To define/missing [FUTURE]:**
-- `DELETE /collections/{name}` (remove a whole collection).
-- `GET /stats` (public aggregate; today only internal in the console).
-- `GET /bases/{coll}/{name}` (metadata of 1 base without searching).
-- `GET /profile?collection=&base=` — **lexical profile** (`vocab_used`, `dims`, `top_idf[]`) to feed
-  Nidhogg's **level 0** without probing via `/search` (expensive). Found during the review cycle (§5.3).
 - Ingestion **by file inside a repo** (base = N files; incremental update by file `sha` — see §6). Today
   base = 1 file.
 
@@ -366,16 +366,20 @@ cron), fully local and offline (Laya base, packages and `SHA256SUMS` under `/dad
 
 - **Consumer = the human**, via ValHalla (and export): opens and **reads** the distilled artifacts.
 - **First-class artifacts** (deliverables, not an auxiliary search index):
-  - **Living document** (**propositive** level): grows **indefinitely** each cycle. Owner's use case:
-    *open it after 15 days and read a deep summary of a work (e.g. The Lord of the Rings), with nuance of
-    detail, in styles (modern, archaic…)* — a "companion" that deepens over time.
-  - **Knowledge tree / mind map** (**structural** level): navigable, starting from the work — valid for
-    **source code, text, book, article**, any ingestion of the base.
-- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** serves these artifacts (for ValHalla and export).
+  - **Direct questions & living document** (**propositive** level — L4): questions (`tabular`, `oneshot`,
+    `vivo`) answered every cycle over the accumulated knowledge, where each perspective shift becomes a stage
+    on the timeline (`nidhogg.resposta`). Owner's use case: *open it after 15 days and read a deep summary of
+    a work (e.g. The Lord of the Rings), with nuance of detail, in styles (modern, archaic…)* — a "companion"
+    that deepens over time.
+  - **Knowledge tree / mind map** (**structural** — L2, deterministic — and **structural-llm** — L3,
+    AI-distilled relations): navigable graph (`no_valor`, mention census, dimensions and gaps), starting from
+    the work — valid for **source code, text, book, article**, any ingestion of the base.
+- **`GET /api/nidhogg/knowledge?collection=&type=&level=`** and the analytical routes (`/classes`, `/entities`,
+  `/tree`, `/relacoes`, `/dimensoes`, `/perguntas`, `/respostas`) serve these artifacts (for ValHalla and export).
 - `ragd` **does not read or inject** this into search. If one day an agent wants to use the artifacts as
   context, it reads them via the Nidhogg API — **secondary, optional use**, not the reason to exist.
 
-### 5.3 `source_hash`, diff and incrementality [FUTURE]
+### 5.3 `source_hash`, diff and incrementality [DONE]
 
 Kimi and Codex converged: detect real change **cheaply**, no false positives, and digest **only what changed**.
 
@@ -390,20 +394,42 @@ Kimi and Codex converged: detect real change **cheaply**, no false positives, an
 > ⚠️ **Contract gap found (Kimi):** `ragd` **doesn't expose today** `idf`/`dims`/effective vocabulary per
 > base in an endpoint — level 0 would have to **probe** via `/search` with syllable probes (expensive).
 > **Decision:** add a **profile** endpoint to `ragd` → `GET /profile?collection=&base=` returning
-> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Feeds level 0 cheaply. **[FUTURE — new contract in ragd]**
+> `{vocab_size, vocab_used, dims, top_idf:[{dim,syllable,idf,df}]}`. Feeds level 0 cheaply. **[DONE — #1, see §3.7]**
 
-### 5.4 The 4 levels — algorithms and schemas
+### 5.4 The 5 levels — algorithms and schemas
 
 | level | name | AI? | produces | status |
 |---|---|---|---|---|
-| 0 | **miner** | no | 3 pillars: RootIndex · CorpusDict · CacheDigest | [PARTIAL] |
-| 1 | **conscious** | yes | `Summary` per collection (insight that survives deletion) | [FUTURE] |
-| 2 | **structural** | yes | **Knowledge tree / mind map** of the work (`KnowledgeTree`) | [FUTURE] |
-| 3 | **propositive** | yes | **Incremental living document** (`LivingDocument`, grows over time) + `Gap`/`Suggestion` | [FUTURE] |
+| 0 | **minerador** | no | 3 pillars: `RootIndex` · `CorpusDict` · `CacheDigest` | [DONE] |
+| 1 | **consciente** | yes | Classification `{natureza, tipo}` (`doc_class`, Laya gatekeeper + LLM), templates (`template`) and normalized extraction (`entidade`, scored by `NQI`) | [DONE] |
+| 2 | **estrutural** | no | Deterministic graph (`no_valor`, `KnowledgeTree`), mention census (`mencao`), scene co-occurrence, **dimensions** and gaps (`gaps`) | [DONE] |
+| 3 | **estrutural-llm** | yes | AI-distilled relations in the densest census scenes (`{a, rel, b, tema}`, with deterministic anchor) written to the same graph (`no_valor`) | [DONE] |
+| 4 | **propositivo** | yes | Direct questions (`pergunta`: `tabular` · `oneshot` · `vivo`) over deterministic context (dump + L3 clues + `/search`+`/chunk` evidence), with analyst + comparator and timeline (`resposta`) | [DONE] |
 
-**Level 0 (no AI) — the 3 pillars.** ⚠️ **Honesty (Codex):** level 0 is **navigation / index /
+> 🏗️ **SCALE (millions of docs) — decisions of 09/aug and 13/aug/2026.** For real-world scale, the ruler is set
+> to **5 cumulative levels (`0..4`)** backed by ClickHouse:
+> - **L0 (`minerador`, no AI):** mines the lexical structure of the corpus (`RootIndex`, `CorpusDict`, `CacheDigest`).
+> - **L1 (`consciente`, with AI):** classifies each base into `{natureza, tipo}` with structural signature `forma`
+>   (via the local Laya gatekeeper without LLM when safely recognized, §5.1.3, or a lightweight LLM over the
+>   editable `doctypes` vocabulary), creates/maintains regex templates (`template`) on trigger (coverage ≥ 70%
+>   or `POST /api/nidhogg/molde`) and extracts records deterministically (`csv=1` tabular or `csv=0` via template,
+>   zero row-by-row LLM), scoring each record with the **NQI** (Normalization Quality Index).
+> - **L2 (`estrutural`, no AI):** graphs relations **deterministically** over the normalized data — prose mention
+>   census (`mencao`, in the 5%–95% body of the work), value nodes (`no_valor`), scene co-occurrence and
+>   **dimension** axes (`/dimensoes`, `/dimensoes/gaps`).
+> - **L3 (`estrutural-llm`, with AI):** the same graph as L2, but **100% LLM-bound** for what deterministic rules
+>   cannot reach — takes the densest scenes from the L2 census, distills `{a, rel, b, tema}` relations via LLM and
+>   enforces a **deterministic anchor** (the census vetoes endpoints outside the entities present in the scene and
+>   pure linking verbs) before writing to the same graph (`no_valor`, with an origin seal).
+> - **L4 (`propositivo`, with AI):** answers **direct questions** registered by the operator (`tabular`, `oneshot`,
+>   `vivo`). Deterministic at the point of inference (`l4_contexto` assembles dump aggregates/samples + L3 relation
+>   clues + full **evidence** chunks via `/search` and `/chunk`), the **analyst** answers with mandatory `fontes`
+>   and suggests `proximas` follow-up questions, and on `vivo` questions the **comparator** only records a new stage
+>   on the timeline (`nidhogg.resposta`) when the perspective shifts (with a `l4_visto` fingerprint saturation gate).
+
+**Level 0 (`minerador`, no AI) — the 3 pillars.** ⚠️ **Honesty (Codex):** level 0 is **navigation / index /
 health-check** ("is my collection sound and navigable?"), **not "knowledge"** — don't sell it as such.
-Even so it delivers value on its own (base for the AI levels + observability) and costs zero AI.
+Even so it delivers value on its own (base for the upper levels + observability) and costs zero AI.
 
 > 🌱 **The seed of Nidhogg (origin of the idea).** Level 0 is the piece that gives RAGnaRock back
 > **collections organized about its own collections** — a **self-organization agent** of the RAG over
@@ -417,56 +443,58 @@ Even so it delivers value on its own (base for the AI levels + observability) an
 - **CacheDigest** — consolidates the query-expansion cache: synonyms seen ≥ N times that map to the **same**
   chunks become equivalence clusters. `content:{ entries:[{canonical, variants, shared_chunk_ids, hit_count}], hit_rate }`.
 
-**Levels 1–3 (AI) — input, sampling and output:**
+**Levels 1–4 — input, sampling and output:**
 
-| level | input to the LLM | sampling | output (`type`) |
-|---|---|---|---|
-| 1 | chunks **new/changed** since `source_hash` + base meta | up to `MAX_CHUNKS_PER_LEVEL` (~100) spaced + top-N by `idf`; if few, all | `Summary {themes, entities, key_chunks, abstract, chunk_range}` |
-| 2 | level-1 `Summary` of the work/collection (metadata — not a sample) | — | `KnowledgeTree {root, nodes[], edges[]}` — navigable mind map (dimension hierarchy/fit is the base) |
-| 3 | the work + `KnowledgeTree` + `Summary` + the previous version of the living document | incremental: only what came in since the last cycle | `LivingDocument {sections[], style, version, grows:true}` (deep summary that grows, style variants) + `Gap`/`Suggestion` |
+| level | name | input | sampling / engine | output (ClickHouse / API) |
+|---|---|---|---|---|
+| 1 | `consciente` (AI) | chunk 0 (1000 chars) + structural signature `forma` of new/changed bases | Local Laya gatekeeper (§5.1.3) or LLM (`classificador`); regex templates per `tipo@forma` (`modelador`, coverage ≥ 70%); deterministic extraction | `doc_class {natureza, tipo, forma, csv, extraivel}` · `template` · `entidade` (`nqi`, `campos`) |
+| 2 | `estrutural` (no AI) | `entidade` records (L1) + narrative base chunks (5%–95% body) | Deterministic (zero AI): proper-noun/technical-term census + reverse value indexing and scene co-occurrence by `(base, idx)` | `mencao` · `no_valor` (`KnowledgeTree`: `/tree`, `/suggest`, `/node`) · `dimensoes` and `/dimensoes/gaps` |
+| 3 | `estrutural-llm` (AI) | densest scenes from the L2 census (chunks with the most co-occurring entities) | Up to 4 windows of the densest pending narrative base per cycle (`relacoes`) + deterministic anchor filter | `entidade` (`tipo="relacao": {a, rel, b, tema}`) merged into the same `no_valor` graph (`/relacoes`) |
+| 4 | `propositivo` (AI) | active question (`pergunta`) + structured dump (L1) + relation clues (L3) + evidence chunks from `ragd` | Rule-assembled context (`l4_contexto`) + saturation gate (`l4_fingerprint`); `analista` LLM + `comparador` LLM (on `vivo` questions) | `resposta` (versioned timeline stages with mandatory `fontes[]` and `proximas[]`) |
 
 - **The budget is the RUNNER'S DECISION:** cadence = **time** budget per cycle; add a cap of **tokens/cycle**
-  for the AI levels. Starts **OFF**, opt-in per collection (§5.1), level 0 covers the no-AI case, and **no
+  for the AI levels. Starts **OFF**, opt-in per collection (§5.1), levels 0 and 2 use zero AI, and **no
   spending cap by default** — a conscious choice, with a **mandatory disclaimer on turn-on** (§4). The AI
-  graph (level 3) multiplies consumption (N AIs × N levels) — it's the $$$ layer par excellence.
+  graph multiplies consumption (N AIs × N levels) — it's the $$$ layer par excellence.
 - **Rate-limit = the dimension configuration itself (owner's decision):** there's no separate rate-limiter.
-  The owner defines **when each dimension fires within the cycle** (e.g. level 1 every cycle, level 3 every
-  N cycles) — *that already is* the throughput/cost control. Add the optional tokens/cycle cap on top. Thus
-  "consuming a lot of AI" becomes an explicit config choice, not an accident.
-- **Incremental:** level 1 processes only new chunks; level 0 reprocesses the whole changed base (it's cheap).
-- **HIERARCHICAL order (1→2→3):** the AI levels happen **in sequence** — there's no level 2 without 1, nor 3
-  without 2 (the knowledge dimension is hierarchical by nature). The **dial selects the top level**; the
-  worker runs `1..N` in order within the cycle. Level 0 (no AI) is always the base.
+  The owner defines **when each dimension fires within the cycle** — *that already is* the throughput/cost
+  control. Add the optional tokens/cycle cap on top. Thus "consuming a lot of AI" becomes an explicit config
+  choice, not an accident.
+- **Incremental:** each layer tracks its checkpoint by `(state_hash, cfg_hash)` (including `llm_tag` and the
+  prompt/vocabulary hash); L4 only calls AI when the `(dump, corpus, pergunta, prompt, llm_tag)` fingerprint changes.
+- **HIERARCHICAL order (`0 → 1 → 2 → 3 → 4`):** the levels run **in cumulative sequence** — L1 classifies and
+  normalizes on top of L0; L2 graphs deterministically on top of L1; L3 enriches the L2 graph with AI-distilled
+  relations; L4 answers questions by crossing the dump (L1), clues (L3) and raw evidence (`/search` + `/chunk`).
+  The **dial selects the top level (`0..4`)**; the worker runs `0..N` in order within the cycle.
 - **Additive, versioned + acceptance gate (owner's decision):** each dimension's artifact is **versioned** —
   every re-derivation creates a new `version` and archives the previous one as `frozen_version` (§5.7); the
   set of versions **only accumulates** (additive), even when the active body is replaced. Between one
   dimension and the next there's an **optional acceptance gate, switchable PER DIMENSION** (`accept_gate` =
   set of levels with a gate, in ValHalla) — **not** global and **not** per generated item. Turning the gate
-  on at dimension N means: *N's artifact only releases dimension N+1 after approval*. **There are only two
-  logical gate points: `accept_gate ⊆ {1, 2}`** (controlling 1→2 and 2→3):
+  on at dimension N means: *N's artifact only releases dimension N+1 after approval*:
   - **0→1 never has a gate** — level 0 is autonomous self-organization of the RAG over itself (the seed of
     Nidhogg, see above); there's nothing to approve.
-  - **3 has no gate** — it's the top level, there's no next dimension to release.
-  - **1→2 is rarely left on in practice** — dimension 1 emits *far* more artifacts (one `Summary` per
-    collection/base); approving them all would be unfeasible. The gate at **2→3** is the palatable one (far fewer artifacts).
+  - **4 has no gate** — it's the top level, there's no next dimension to release.
+  - **1→2 is rarely left on in practice** — dimension 1 emits *far* more artifacts (per base); approving them
+    all would be unfeasible. The gate before the propositive layer is the palatable one (far fewer artifacts).
   - **dimension without a gate (default):** automatic cascade — the artifact feeds the next dimension in the same cycle.
   - **dimension with gate ON:** the artifact stays `pending` and **only releases the next dimension after
-    human acceptance** (button in ValHalla). It's the quality checkpoint — e.g. with a gate on dim. 2, the
-    human validates the tree **before** the living document (dim. 3) is born from it. The acceptance is also
-    the **utility signal** (closes the feedback loop Kimi pointed out) without `ragd` ever consuming the artifact.
+    human acceptance** (button in ValHalla). It's the quality checkpoint — the human validates the tree/graph
+    **before** the propositive layer (L4) derives from it. The acceptance is also the **utility signal**
+    (closes the feedback loop Kimi pointed out) without `ragd` ever consuming the artifact.
   - **Conscious trade-off (to stress):** turning the gate on **breaks the autonomous cycle** (§5.2) and
     injects **human dependency** — the worm stops and *waits* for the acceptance, no longer running on its
     own. This may be acceptable (I want to review before going deeper) or unacceptable (I want the worm 100%
     autonomous). There's no right answer: that's why it's an **opt-in feature**, an *autonomy × control*
     trade-off decided case by case by whoever operates it — never imposed.
-- **Per-level prompt = the TONE (owner's decision):** each AI level (1, 2, 3) has a **configurable prompt**
-  (editable in ValHalla / `nidhogg.cfg`: `prompt_consciente`, `prompt_estrutural`, `prompt_propositivo`) —
-  it's how you dictate the **tone/style** of each extraction (e.g. modern vs archaic in the `LivingDocument`).
+- **Per-role prompts = the TONE (owner's decision):** each AI role (`classificador`, `extrator`, `modelador`,
+  `relacoes`, `analista`, `comparador`) has a **configurable prompt template** in `prompts.json` (editable in
+  ValHalla via `/api/nidhogg/prompts/template`) — and its hash enters the corresponding layer's checkpoint.
 - **Delta cascade — 3 re-derivation modes (owner's decision):** when a lower level changes, the upper one
   re-derives through the `derived_from`/`digestion_id` link, but **does not assume monotonic growth** (Kimi's
   critique: tracking provenance ≠ tracking semantic impact). The artifact grows, **shrinks or is remade**, in
   three modes:
-  - **additive** — appends the delta (the work gained content; the `LivingDocument` extends, the tree gains a branch).
+  - **additive** — appends the delta (the work gained content; the timeline gains a stage, the tree gains a branch).
   - **structural replacement** — swaps a **whole section / branch**, not just the tip. It's the common case in
     **code**: changing a structural line rewrites the whole *line of reasoning* — *"the rope doesn't just
     grow; sometimes the segment is swapped entirely"*.
@@ -476,58 +504,59 @@ Even so it delivers value on its own (base for the AI levels + observability) an
   `frozen_version` (preserves history — §5.7); the **active body** is always the current one. The mode
   trigger: additive change → local; *reframing* detected at level 1 → replacement/rewrite. (Fine impact
   mechanism — a semantic signature per branch to decide local vs. global — is **[FUTURE — implementation]**.)
-- **Self-improvement built into the propositive layer (dispenses with "Synthesis"):** dim. 3 **reads the
-  previous version of the document and improves it** — refining IS the propositive analysis. So there's **no
-  separate consolidation mechanism**: the risk Kimi raised (the living document bloats/repeats/contradicts)
-  resolves by construction, inside level 3 itself, every cycle.
-- **AI graph in confrontation — exclusive to the propositive layer (owner's decision):** at dim. 3 the final
-  artifact **need not come from a single AI**. The operator builds an **inference graph** in ValHalla: nodes =
-  available AIs (pluggable providers — Bedrock, Kimi, Codex, local…), edges = **who confronts / feeds whom**,
-  in **N levels** of confrontation until *"the artifact that generates the final artifact"*. It's the Side AI
-  pattern (generator × critic × arbiter) **institutionalized inside Nidhogg**. The graph's intermediate
-  artifacts are **input**; only the root node emits the versioned `LivingDocument`.
-  - **Only valid for dim. 3.** Dims 1 and 2 use **direct AI** (1 call per extraction) — multi-AI confrontation
+- **Self-improvement built into the propositive layer (dispenses with "Synthesis"):** in L4 (`vivo`), the
+  **comparator** reads the previous answer stage and confronts it with the new one — recording a new stage only
+  when the perspective actually shifts. So there's **no separate consolidation mechanism**: the risk Kimi raised
+  (the living document bloats/repeats/contradicts) resolves by construction, inside level 4 itself, every cycle.
+- **AI graph in confrontation — exclusive to the propositive layer (owner's decision):** at L4 the final
+  artifact **need not come from a single AI** (today it already operates with the `analista` × `comparador` pair).
+  The operator builds an **inference graph** in ValHalla: nodes = available AIs (pluggable providers — Bedrock,
+  Kimi, Codex, local…), edges = **who confronts / feeds whom**, in **N levels** of confrontation until *"the
+  artifact that generates the final artifact"*. It's the Side AI pattern (generator × critic × arbiter)
+  **institutionalized inside Nidhogg**.
+  - **Only valid for L4.** L1 and L3 use **direct AI** (1 call per extraction) — multi-AI confrontation
     is a cost only the propositive layer justifies.
   - The **provider** here stops being "pick 1 model" and becomes "orchestrate several in a confrontation DAG"
     (pluggable: Bedrock, model choice, round-robin). Graph config in `nidhogg.cfg`/ValHalla. **[FUTURE]**
 
-### 5.5 Worker cycle, files and resumability [FUTURE]
+### 5.5 Worker cycle, files and resumability [PARTIAL]
 
-**Per-collection layout** (in `dir/`), append-only to be resumable:
+**On-disk and ClickHouse layout:** `<dir>/<coll>.knowledge.json` holds the L0 pillars, provenance and
+`l0_diff`; `<dir>/prompts.json` holds the prompt templates; `<dir>/llm-ledger.jsonl` logs AI calls (§5.1.1);
+ClickHouse (`nidhogg.*`) stores `doc_class`, `doctype`, `template`, `entidade` (with the `entidade_atual`
+view), `no_valor`, `dimensao`, `pergunta` and `resposta`.
+
+**Actual cycle flow (`run_cycle`):**
+
+```
+for each ENABLED collection:
+  level 0 (always): RootIndex + CorpusDict → <coll>.knowledge.json
+  if top_level >= 1:
+    reconcilia_bases (relink renamed + prune after prune_grace_h — §5.1.2)
+    L1 (consciente): mine_classes (Laya gatekeeper / LLM) → mine_templates (1 template/cycle) → mine_entities (NQI)
+  if top_level >= 2:
+    L2 (estrutural, zero AI): mine_fichas (prose mention census) → mine_links (no_valor graph)
+  if top_level >= 3:
+    L3 (estrutural-llm): mine_relacoes (AI relations in dense scenes, with anchor) → mine_links
+global (once per cycle):
+  CacheDigest (/expansions from ragd) → _cachedigest.json
+  if top_level >= 4:
+    L4 (propositivo): mine_respostas (deterministic context → analyst → comparator → timeline)
+```
+
+**Target append-only layout per collection** (in `dir/`), for fine resumability:
 
 ```
 <dir>/
   <coll>.knowledge.jsonl    # 1 knowledge item per line (atomic write, append)
   <coll>.checkpoint.json    # { base_name: state_hash } + last base processed
   <coll>.provenance.jsonl   # 1 digestion per line
-  <coll>.config.json        # { enabled, level, cadence_s, last_run, accept_gate:[⊆{1,2}] }
+  <coll>.config.json        # { enabled, level, cadence_s, last_run, accept_gate:[...] }
 ```
 
-**Pseudo-flow of one cycle** (synthesized with Kimi):
-
-```
-for each ENABLED collection:
-  current_bases = GET /bases?collection=coll
-  diff = compare(previous_checkpoint, state_hash(current_bases))   # new/changed/removed
-  digestion_id = uuid()
-  top_level = config[coll].level                        # dial = top level (0..3)
-  level 0 (always): RootIndex + CorpusDict + CacheDigest of the collection → append to .jsonl
-  for each CHANGED base: update checkpoint[base] = state_hash
-  # AI levels in STRICT sequence, always per collection/work (never cross-collection).
-  # the gate is PER DIMENSION: level N only runs if N-1 has no gate, or its version is accepted:
-  released(N) = ((N-1) not in accept_gate) or (current_version(N-1).status == "accepted")
-  if top_level >= 1 and released(1): Summary of NEW chunks → new version → append (pending|accepted)
-  if top_level >= 2 and released(2): KnowledgeTree of the work ← Summary (re-derives the branch) → version → append
-  if top_level >= 3 and released(3): LivingDocument (appends delta) + Gap/Suggestion
-                                     ← KnowledgeTree + Summary + previous version → version → append
-  write provenance(digestion_id, inputs=changed_bases)
-  recompute saturation ; mark orphans (removed bases)
-```
-
-**Resumability:** if the AI fails midway, the already-written `.jsonl` is valid (atomic append) and the
-`checkpoint` points to the last completed base → the next cycle **resumes** from there. Never a blind append:
-dedup by `digestion_id`/`derived_from`. The consolidated `<coll>.knowledge.json` (§5.6) is a **view** of the
-`.jsonl`+checkpoint (or the `.jsonl` becomes canonical and the `.json` is generated). **[implementation decision]**
+**Resumability:** in ClickHouse, each step records its checkpoint (`state_hash` + `cfg_hash` + `llm_tag`), so if
+the AI fails midway through a cycle, the next cycle **resumes** from the pending bases/questions without
+reprocessing what already converged.
 
 ### 5.6 Consolidated knowledge schema — `<dir>/<coll>.knowledge.json`
 
@@ -569,15 +598,16 @@ knowledge[]}`). Target shape:
 
 ### 5.8 Module API
 
-> Detailed contract in **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--intelligence-11497-partial)**.
+> Detailed contract in **[`JSONCONTRACT.md` §3](JSONCONTRACT.md#3-nidhoggd--intelligence-11497)**.
 
-**[DONE]** `GET /health` · `GET /api/nidhogg` (status: level, cadence, ragd keepalive, knowledge) ·
-`GET /api/nidhogg/collections` (collections + digestion state) · `POST /api/nidhogg`
-(`{on, level, cadence}`) · `POST /api/nidhogg/collection` (`{collection, enabled}`) ·
-`POST /api/nidhogg/run` (triggers a cycle — **stub**).
+**[DONE]**
+- **State and control (§3.1):** `GET /health` · `GET /api/nidhogg` (status, level `0`–`4`, `levels[]`, cadence, ragd and AI keepalive) · `POST /api/nidhogg` (`{on, level, cadence}`) · `GET /api/nidhogg/collections` · `POST /api/nidhogg/collection` (`{collection, enabled}`) · `POST /api/nidhogg/run` (triggers async cycle).
+- **Knowledge and prompts (§3.2):** `GET /api/nidhogg/knowledge` · `GET /api/nidhogg/cachedigest` · `GET /api/nidhogg/prompts` · `POST /api/nidhogg/prompts/template` · `GET /api/nidhogg/llm_ledger`.
+- **Classification, extraction and graph — L1/L2/L3 (§3.3):** `GET|POST /api/nidhogg/doctypes` · `GET /api/nidhogg/doctypes/uso` · `GET /api/nidhogg/classes` · `POST /api/nidhogg/reclass` · `POST /api/nidhogg/relink` · `POST /api/nidhogg/molde` · `GET /api/nidhogg/templates` · `GET /api/nidhogg/rejeitados` · `GET /api/nidhogg/entities` · `GET /api/nidhogg/relacoes` · `GET /api/nidhogg/tree` · `GET /api/nidhogg/suggest` · `GET /api/nidhogg/node`.
+- **Dimensions — L2 (§3.4):** `GET|POST /api/nidhogg/dimensoes` · `POST /api/nidhogg/dimensoes/upsert` · `POST /api/nidhogg/dimensoes/remover` · `GET /api/nidhogg/dimensao/valores` · `GET /api/nidhogg/dimensoes/gaps`.
+- **Questions and answers — L4 (§3.5):** `GET|POST /api/nidhogg/perguntas` · `POST /api/nidhogg/perguntas/upsert` · `POST /api/nidhogg/perguntas/remover` · `POST /api/nidhogg/perguntar` · `GET /api/nidhogg/respostas` · `POST /api/nidhogg/respostas/limpar`.
 
-**[FUTURE]** `GET /api/nidhogg/knowledge?collection=&type=&level=` (consumption of the distilled insight — §5.2) ·
-`POST /api/nidhogg/accept` (`{collection, type, level, version}` → marks `status:accepted`, releases the next
+**[FUTURE]** `POST /api/nidhogg/accept` (`{collection, type, level, version}` → marks `status:accepted`, releases the next
 level when `accept_gate=on` — §5.4).
 
 ### 5.9 Open questions (agenda for the next Side AI rounds)
@@ -600,12 +630,19 @@ level when `accept_gate=on` — §5.4).
 - **Repo as a base (not 1-file-per-base) [FUTURE]:** the chunk schema gains `file` + lines; `meta` gains a
   file map with `sha`; `POST /ingest_file {base, file}` recomputes only that file (removes the file's old
   chunks, inserts the new ones, updates `sha`); `POST /sync {base, path}` scans and updates only what changed.
-  It's the heart of "code RAG with per-file update".
-- **Ingestors triggered by the user's AI [FUTURE]:** the agent triggers ingestion (repo, git diff, specific
-  files) via MCP / CLIs.
-- **Importers [FUTURE]:** PDF/DOCX/XLSX (client-side extraction vs server-side sidecar).
-- **Windows build [FUTURE]:** pure Rust should compile; mind `/dev/urandom` (Windows entropy) and the
+  It's the heart of "code RAG with per-file update". The client with `.ragnarock/` + `sync` is #34.
+- **Ingestors triggered by the user's AI [FUTURE] (#10):** the agent triggers ingestion (repo, git diff,
+  specific files) via MCP / CLIs.
+- **Importers [DONE] (#9, #50):** PDF, DOCX, XLSX, PPTX, CSV, audio, MySQL and Postgres, as a server-side
+  sidecar: `ragd` calls the `ingestors/` driver through the shell (`POST /ingest_any`, MIME → extension
+  routing; see [`ingestors/README.md`](ingestors/README.md)). Tests in `ingestors/tests/` and `tools/e2e_ingest.sh`.
+- **On-SSD inverted index [FUTURE] (#43):** postings per syllable, so recall scales to millions of chunks.
+- **SQL, GraphQL and MySQL-wire interfaces [FUTURE] (#35, #36, #40):** query the RAG with `SELECT`, with
+  GraphQL or by connecting a MySQL client (HeidiSQL, DBeaver) on port 11500.
+- **Windows build [FUTURE] (#11):** pure Rust should compile; mind `/dev/urandom` (Windows entropy) and the
   `log_file` default.
+- **Tests [PARTIAL]:** `cargo test` in `ragd/` and `nidhoggd/`, `unittest` in `ingestors/tests/` and
+  `tools/e2e_ingest.sh` (end to end, with throwaway MySQL/Postgres under `--bancos`). CI is missing.
 - **Deploy [DONE]:** cross-compile (`cargo zigbuild --target {x86_64,aarch64}-unknown-linux-gnu.2.31`) +
   rsync the binary + a launcher that brings up `ragd` + `nidhoggd` detached and redirects stdout to `log_file`.
 - **Security [PARTIAL]:** change `admin/admin`; keys only in `cfg` (gitignored); CORS open on 11497 (revisit
@@ -633,10 +670,10 @@ nonexistent gaps (confidence + human audit).
 | decision | trigger | options |
 |---|---|---|
 | mmap/on-disk | corpus > ~80% RAM | **text: done (#41, `storage = disk`)**; vectors/index on disk still future |
-| `RwLock` + inter-query parallelism | latency under real concurrent load | RwLock; then per-collection lock |
+| `RwLock` + inter-query parallelism | latency under real concurrent load | **done: fair RwLock (#6) + base snapshots with short locks (#37)**; tail latency of simultaneous global searches still open (§3.5) |
 | base = repo (N files) | use it as a serious code RAG | `file`+`sha` in the schema; `/sync` |
 | prune low-idf synonyms in expand | expansion polluting lookup | idf filter in the cascade |
-| Nidhogg levels 1–3 (AI) | owner's decision (budget + cadence) | start at level 0; rise per roadmap, gated by budget+disclaimer (§5.2/§5.4) — **not** by "waiting for a consumer" |
+| Nidhogg levels 1–4 (AI: 1, 3, 4; no AI: 0, 2) | owner's decision (budget + cadence) | start at level 0; rise via dial (`0`–`4`), gated by budget+disclaimer (§5.2/§5.4) — **not** by "waiting for a consumer" |
 
 ---
 
