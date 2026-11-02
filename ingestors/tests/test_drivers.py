@@ -82,6 +82,42 @@ class TestCsv(Comum, unittest.TestCase):
                          ["cidade,estado,habitantes", f"{F.ANCORAS['csv']},CE,80000", "Crateús,CE,75000"])
         self.assertIn("3 linha(s)", err)
 
+    def test_windows_1252_do_excel_preserva_acentos(self):
+        # CSV salvo pelo Excel em português (Windows-1252): os acentos sobrevivem
+        # e o stderr avisa qual codificação foi usada
+        dados = "cidade;estado\nCrateús;CE\nSão Paulo;SP\n".encode("cp1252")
+        p = subprocess.run([sys.executable, os.path.join(INGESTORS, "csv.py")],
+                           input=dados, capture_output=True, timeout=120,
+                           env=dict(os.environ, PYTHONSAFEPATH="1"))
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
+        self.assertEqual(p.stdout.decode().splitlines(),
+                         ["cidade,estado", "Crateús,CE", "São Paulo,SP"])
+        self.assertIn("Windows-1252", p.stderr.decode("utf-8", "replace"))
+
+    def test_byte_fora_do_windows_1252_recusado_sem_traceback(self):
+        # Mac Roman: "ç" é 0x8D, byte que o Windows-1252 não define
+        code, out, err = roda("csv", "nome;uf\nConceição;PB\n".encode("mac_roman"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("csv:") and "codificação" in err, err)
+
+    def test_binario_e_utf16_recusados(self):
+        for dados in ("cidade\tuf\nCrateús\tCE\n".encode("utf-16"), b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"):
+            code, out, err = roda("csv", dados)
+            self.assertEqual(code, 1, out)
+            self.assertTrue(err.startswith("csv:") and "NUL" in err, err)
+
+    def test_fim_de_linha_so_cr_do_mac(self):
+        code, out, err = roda("csv", b"a,b\r1,2\r3,4\r")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), ["a,b", "1,2", "3,4"])
+
+    def test_aspas_sem_fechar_estourando_o_limite_recusado_sem_traceback(self):
+        code, out, err = roda("csv", b'a,b\n"abre,1\n' + b"linha,2\n" * 30000)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("csv: CSV malformado"), err)
+
     def test_campo_com_virgula_sai_entre_aspas(self):
         code, out, _ = roda("csv", "nome;obs\nAna;chegou, enfim\n".encode())
         self.assertEqual(code, 0)

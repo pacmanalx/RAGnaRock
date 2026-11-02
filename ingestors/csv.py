@@ -23,7 +23,24 @@ def main():
     if sys.stdin.isatty():
         sys.stderr.write("uso: python3 csv.py < arquivo.csv   (a fonte vem pelo stdin)\n")
         return 2
-    text = sys.stdin.buffer.read().decode("utf-8-sig", errors="replace")  # utf-8-sig tira o BOM
+    dados = sys.stdin.buffer.read()
+    if b"\x00" in dados:
+        # texto não tem byte NUL: é binário ou UTF-16/32, que sairia como lixo com exit 0
+        sys.stderr.write("csv: não é texto (byte NUL: arquivo binário ou UTF-16?)\n")
+        return 1
+    try:
+        text = dados.decode("utf-8-sig")  # utf-8-sig tira o BOM
+    except UnicodeDecodeError:
+        # Excel em português salva em Windows-1252: em vez de engolir os acentos
+        # com U+FFFD, decodifica direito e avisa qual codificação entrou
+        try:
+            text = dados.decode("cp1252")
+        except UnicodeDecodeError:
+            # 0x81, 0x8D, 0x8F, 0x90 e 0x9D não existem no Windows-1252: binário ou outra
+            # codificação (Mac Roman, DOS 850...)
+            sys.stderr.write("csv: codificação não reconhecida (nem UTF-8 nem Windows-1252)\n")
+            return 1
+        sys.stderr.write("csv: codificação Windows-1252 detectada (não é UTF-8)\n")
     if not text.strip():
         sys.stderr.write("csv: entrada vazia\n")
         return 1
@@ -32,13 +49,19 @@ def main():
         dialect = csv.Sniffer().sniff(text[:8192], delimiters=",;\t|")
     except csv.Error:
         dialect = csv.excel
-    reader = csv.reader(io.StringIO(text), dialect)
+    # newline="" como pede a doc do csv: aceita fim de linha só CR (Excel de Mac antigo)
+    reader = csv.reader(io.StringIO(text, newline=""), dialect)
     out = io.StringIO()
     writer = csv.writer(out, delimiter=",", quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
     n = 0
-    for row in reader:
-        writer.writerow(row)
-        n += 1
+    try:
+        for row in reader:
+            writer.writerow(row)
+            n += 1
+    except csv.Error as e:
+        # ex.: campo acima do limite, quase sempre aspas sem fechar engolindo o resto do arquivo
+        sys.stderr.write(f"csv: CSV malformado (linha {reader.line_num}): {e}\n")
+        return 1
     if n == 0:
         sys.stderr.write("csv: nenhuma linha\n")
         return 1
